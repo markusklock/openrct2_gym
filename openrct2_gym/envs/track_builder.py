@@ -255,7 +255,7 @@ class TrackBuilder:
                 dx, dy = self.direction_vectors[current_direction]
                 new_position[0] += dx
                 new_position[1] += dy
-                # Z (height) decrease by 1
+                # Z (height) increase by 2
                 new_position[2] += 2
         elif action == 18:
             if not self.history:
