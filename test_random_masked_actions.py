@@ -92,24 +92,8 @@ def test_random_actions():
         print(f"[MASK] Valid action IDs: {valid_actions}")
         
         if not valid_actions:
-            print("[DEBUG] No valid actions from mask. Checking API directly...")
-            # Check what the API returns
-            api_resp = env.unwrapped.api_controller.get_valid_next_pieces()
-            print(f"[DEBUG] API success: {api_resp.get('success')}")
-            if api_resp.get("success"):
-                valid_pieces = api_resp["payload"]["validPieces"]
-                print(f"[DEBUG] Valid pieces from API: {valid_pieces}")
-                print(f"[DEBUG] Track builder action mapping:")
-                for action, track_type in env.unwrapped.track_builder.action_to_track_type.items():
-                    if track_type in valid_pieces:
-                        print(f"  Action {action} -> Track type {track_type} is valid")
-            else:
-                print(f"[DEBUG] API error: {api_resp.get('error')}")
-            
-            # Also check if history is populated
-            print(f"[DEBUG] Track builder history length: {len(env.unwrapped.track_builder.history)}")
-            
-            print("[ERROR] No valid actions available! Stopping test.")
+            print("[ERROR] No valid actions available! This shouldn't happen.")
+            print("[ERROR] Check the environment configuration.")
             break
         
         # Pick a random valid action

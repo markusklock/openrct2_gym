@@ -325,8 +325,6 @@ class OpenRCT2Env(gym.Env):
                 current_x, current_y, current_z,
                 current_dir, station_track_type
             )
-            
-            print(f"  Placed station piece {i} (type {station_track_type}) at [{current_x}, {current_y}, {current_z}]")
             if not resp.get("success"):
                 print(f"Failed to place station piece {i}: {resp.get('error')}")
                 return False
@@ -347,14 +345,6 @@ class OpenRCT2Env(gym.Env):
         
         print(f"Station built. Track starts at {self.station_start_position}, current position: {self.current_position}")
         print(f"Goal: Return to {self.goal_position} (first station piece)")
-        
-        # Test API to see if we can get valid pieces now
-        test_resp = self.api_controller.get_valid_next_pieces()
-        if test_resp.get("success"):
-            valid_pieces = test_resp["payload"]["validPieces"]
-            print(f"After station build, valid pieces from API: {valid_pieces[:10]}...")  # Show first 10
-        else:
-            print(f"Failed to get valid pieces after station: {test_resp.get('error')}")
         
         return True
 
