@@ -1,17 +1,28 @@
 import gymnasium as gym
 import numpy as np
-from .track_builder import TrackBuilder
-from .ui_controller import UIController
+import time
+from .api_track_builder import APITrackBuilder
+from .api_controller import APIController
 
 class OpenRCT2Env(gym.Env):
-    def __init__(self, render_mode=None):
+    def __init__(self, render_mode=None, host="localhost", port=8080):
         super(OpenRCT2Env, self).__init__()
         self.render_mode = render_mode
-        self.ui_controller = UIController()
-        self.track_builder = TrackBuilder(self.ui_controller)
+        self.api_controller = APIController(host, port)
+        self.track_builder = APITrackBuilder(self.api_controller)
         
-        # Define action and observation space
-        self.action_space = gym.spaces.Discrete(19)
+        # Connect to API server
+        if not self.api_controller.connect():
+            raise RuntimeError(f"Failed to connect to OpenRCT2 API server at {host}:{port}")
+        
+        # Define action and observation space (32 actions: 0-30 track pieces, 31 remove)
+        self.action_space = gym.spaces.Discrete(32)
+        
+        # Track collision and backtracking
+        self.collision_count = 0
+        self.consecutive_failures = 0
+        self.auto_backtrack_enabled = True
+        self.max_consecutive_failures = 3
 
         # Initialize state variables
         self.current_position = None
@@ -21,7 +32,7 @@ class OpenRCT2Env(gym.Env):
         self.track_length = 0
         self.max_track_length = 250
         self.max_steps = 256
-        self.station_length = self.ui_controller.station_length
+        self.station_length = self.api_controller.station_length
         self.steps = 0
         self.loop_completed = False
         self.last_piece_type = 0
@@ -31,18 +42,50 @@ class OpenRCT2Env(gym.Env):
 
         # Define observation space
         self.observation_space = gym.spaces.Dict({
-            'track_pieces': gym.spaces.Box(low=0, high=19, shape=(self.max_track_length,), dtype=np.int32),
+            'track_pieces': gym.spaces.Box(low=0, high=31, shape=(self.max_track_length,), dtype=np.int32),
             'current_position': gym.spaces.Box(low=-20, high=1000, shape=(3,), dtype=np.int32),
             'current_direction': gym.spaces.Discrete(4),
             'distance_to_start': gym.spaces.Box(low=0, high=np.sqrt(2000**2 + 2000**2), shape=(1,), dtype=np.float32),
             'track_length': gym.spaces.Discrete(self.max_track_length + 1),
-            'last_piece_type': gym.spaces.Discrete(19),
+            'last_piece_type': gym.spaces.Discrete(32),
         })
 
     def step(self, action):
+        # Store previous position for tracking
+        prev_position = self.current_position.copy()
+        original_action = action
+        auto_backtracked = False
+        
         success, new_position, new_direction = self.track_builder.take_action(action, self.current_position, self.current_direction)
+        
+        # Track collisions and failures
+        if not success and action != 18:  # Failed to place a piece (not a remove action)
+            self.consecutive_failures += 1
+            self.collision_count += 1
+            
+            # Auto-backtrack if enabled and too many consecutive failures
+            if self.auto_backtrack_enabled and self.consecutive_failures >= self.max_consecutive_failures:
+                if len(self.track_builder.history) > 0:
+                    print(f"Auto-backtracking after {self.consecutive_failures} consecutive failures")
+                    # Force a remove action instead of the failed action
+                    action = 31  # Change the action to remove
+                    auto_backtracked = True
+                    success, new_position, new_direction = self.track_builder.take_action(action, self.current_position, self.current_direction)
+                    self.consecutive_failures = 0
+        else:
+            self.consecutive_failures = 0
+        
+        # Check if the last placement completed the circuit
+        if success and len(self.track_builder.history) > 0:
+            last_entry = self.track_builder.history[-1]
+            if "is_complete" in last_entry:
+                self._last_placement_complete = last_entry["is_complete"]
+            else:
+                self._last_placement_complete = False
+        
+        # Update state based on the action that was actually executed
         if success:
-            if action == 18:  # Remove piece
+            if action == 31:  # Remove piece
                 if self.track_pieces:
                     self.track_pieces.pop()
                     self.track_length -= 1
@@ -59,7 +102,7 @@ class OpenRCT2Env(gym.Env):
         reward = self._calculate_reward(success)
 
         # Check for loop completion
-        self.loop_completed = self.ui_controller.is_loop_completed()
+        self.loop_completed = self._last_placement_complete
         if self.loop_completed:
             print(f"Loop has been completed, great success!")
         terminated = self.loop_completed
@@ -67,27 +110,62 @@ class OpenRCT2Env(gym.Env):
         # Check if episode was truncated
         truncated = self._is_trunkated()
         self.steps += 1
-        print("Current step: %s, Track length: %s, Current position: %s, Last action: %s, Distance to goal: %f, Chainlifts: %s, Direction: %s" % (self.steps, self.track_length, self.current_position, self.last_action, self._calculate_distance_to_start(), self.chain_lift_count, self.current_direction))
-        info = {}
+        
+        # Create info dict with additional debugging information
+        info = {
+            'auto_backtracked': auto_backtracked,
+            'original_action': original_action if auto_backtracked else action,
+            'collision_count': self.collision_count,
+            'consecutive_failures': self.consecutive_failures
+        }
+        
+        if self.steps % 10 == 0 or auto_backtracked:  # Log less frequently or when backtracking
+            print("Step: %s, Track: %s, Pos: %s, Action: %s%s, Dist: %.1f, Dir: %s" % 
+                  (self.steps, self.track_length, self.current_position, 
+                   self.last_action, " (auto-backtrack)" if auto_backtracked else "",
+                   self._calculate_distance_to_start()[0], self.current_direction))
 
         if terminated:
-            self.ui_controller._place_entrance_exit()
-            self.ui_controller.run_ride_evaluation()
+            # Set ride to testing mode and get ratings
+            self.api_controller.set_ride_status(1)  # 1 = Testing
+            time.sleep(5)  # Wait for testing to complete
             ride_rating = self.evaluate_ride()
             info['ride_rating'] = ride_rating
 
         return observation, reward, terminated, truncated, info
 
+    def valid_action_mask(self):
+        """
+        Returns a boolean mask of valid actions.
+        True = action is valid, False = action is invalid
+        """
+        mask = np.zeros(self.action_space.n, dtype=bool)
+        
+        # Get valid actions from the API
+        valid_actions = self.track_builder.get_valid_actions()
+        
+        # Always allow remove action if there are pieces to remove
+        if len(self.track_builder.history) > 0:
+            valid_actions.append(31)
+        
+        # Set valid actions to True
+        for action in valid_actions:
+            if 0 <= action < self.action_space.n:
+                mask[action] = True
+        
+        # If no valid actions, at least allow remove
+        if not mask.any() and len(self.track_builder.history) > 0:
+            mask[31] = True
+            
+        return mask
+    
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        self.ui_controller.demolish_rollercoaster()
-
-        # Set initial position (north end of the station)
-        self.current_position = [500, 500, 0]
-
-        # Set goal position (south end of the station)
-        self.goal_position = [500, 500 - self.station_length, 0]
-
+        
+        # Initialize all state variables FIRST
+        self.station_start_position = [67, 66, 14]  # Where the first station piece is
+        self.current_position = self.station_start_position.copy()
+        self.goal_position = self.station_start_position.copy()  # Track must return to the FIRST station piece
         self.current_direction = 0
         self.track_pieces = []
         self.track_length = 0
@@ -97,13 +175,24 @@ class OpenRCT2Env(gym.Env):
         self.chain_lift_count = 0
         self.last_action = None
         self.track_builder.history.clear()  # Clear the history when resetting the environment
-
-        # Build inital station
-        self.ui_controller.start_new_rollercoaster()
-
-        # Update our state to reflect the built station
-        self.track_length = self.station_length
-        self.track_pieces = [0] * self.station_length  # Assuming 0 is the action for a straight piece
+        self._last_placement_complete = False
+        self.collision_count = 0
+        self.consecutive_failures = 0
+        
+        # Demolish ALL rides to ensure clean state
+        # This is more reliable than just demolishing our tracked ride
+        self.api_controller.delete_all_rides()
+        time.sleep(0.5)  # Small delay to ensure cleanup completes
+        
+        # Create new ride
+        ride_id = self.api_controller.create_ride()
+        if ride_id is None:
+            raise RuntimeError("Failed to create new ride")
+        
+        # Build initial station (this will update current_position to end of station)
+        station_built = self._build_initial_station()
+        if not station_built:
+            raise RuntimeError("Failed to build initial station")
 
         observation = self._get_observation()
         info = {}
@@ -198,24 +287,80 @@ class OpenRCT2Env(gym.Env):
         return observation
 
     def evaluate_ride(self):
-    #TODO Fix run_ride_evaluation() and stop returning random values
-        excitement, intensity, nausea = self.ui_controller.run_ride_evaluation()
-        if excitement is None or intensity is None or nausea is None:
-            print("Failed to get ride ratings, using random values")
+        resp = self.api_controller.get_ride_ratings()
+        if resp.get("success"):
+            ratings = resp["payload"]
             return {
-                'excitement': np.random.randint(0, 100),
-                'intensity': np.random.randint(0, 100),
-                'nausea': np.random.randint(0, 100)
+                'excitement': ratings.get('excitement', 0),
+                'intensity': ratings.get('intensity', 0),
+                'nausea': ratings.get('nausea', 0)
             }
         else:
+            print("Failed to get ride ratings")
             return {
-                'excitement': excitement,
-                'intensity': intensity,
-                'nausea': nausea
+                'excitement': 0,
+                'intensity': 0,
+                'nausea': 0
             }
+    
+    def _build_initial_station(self):
+        # Build station pieces
+        current_x, current_y, current_z = self.station_start_position
+        current_dir = 0
+        
+        print(f"Building {self.station_length} station pieces starting at {self.station_start_position}")
+        
+        for i in range(self.station_length):
+            # Station configuration:
+            # Type 1 = EndStation, Type 2 = BeginStation, Type 3 = MiddleStation
+            # Proper station should be: BeginStation -> MiddleStation(s) -> EndStation
+            if i == 0:
+                station_track_type = 2  # BeginStation
+            elif i == self.station_length - 1:
+                station_track_type = 1  # EndStation (corrected!)
+            else:
+                station_track_type = 3  # MiddleStation (corrected!)
+            
+            resp = self.api_controller.place_track_piece(
+                current_x, current_y, current_z,
+                current_dir, station_track_type
+            )
+            
+            print(f"  Placed station piece {i} (type {station_track_type}) at [{current_x}, {current_y}, {current_z}]")
+            if not resp.get("success"):
+                print(f"Failed to place station piece {i}: {resp.get('error')}")
+                return False
+            
+            next_ep = resp["payload"]["nextEndpoint"]
+            current_x = next_ep["x"]
+            current_y = next_ep["y"]
+            current_z = next_ep["z"]
+            current_dir = next_ep["direction"]
+            
+            # Update track state
+            self.track_pieces.append(0)  # Station pieces as action 0
+            self.track_length += 1
+        
+        # Update current position to end of station
+        self.current_position = [current_x, current_y, current_z]
+        self.current_direction = current_dir
+        
+        print(f"Station built. Track starts at {self.station_start_position}, current position: {self.current_position}")
+        print(f"Goal: Return to {self.goal_position} (first station piece)")
+        
+        # Test API to see if we can get valid pieces now
+        test_resp = self.api_controller.get_valid_next_pieces()
+        if test_resp.get("success"):
+            valid_pieces = test_resp["payload"]["validPieces"]
+            print(f"After station build, valid pieces from API: {valid_pieces[:10]}...")  # Show first 10
+        else:
+            print(f"Failed to get valid pieces after station: {test_resp.get('error')}")
+        
+        return True
 
     def close(self):
-        pass
+        if self.api_controller:
+            self.api_controller.disconnect()
 
     def render(self):
         if self.render_mode == "human":
