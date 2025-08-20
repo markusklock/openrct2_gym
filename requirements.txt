@@ -1,0 +1,13 @@
+# Core dependencies for OpenRCT2 Gym environment
+gymnasium>=0.29.0
+numpy>=1.24.0
+
+# RL training dependencies
+stable-baselines3>=2.0.0,<2.8.0
+sb3-contrib>=2.0.0,<2.8.0
+tensorboard>=2.13.0
+
+# Development dependencies (optional, uncomment if needed)
+# pytest>=7.4.0
+# black>=23.0.0
+# flake8>=6.0.0
