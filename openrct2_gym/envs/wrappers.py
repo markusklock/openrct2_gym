@@ -45,6 +45,45 @@ class OpenRCT2Wrapper(gym.Wrapper):
         """Forward track_pieces property to the unwrapped environment."""
         return self.unwrapped.track_pieces
     
+    @property
+    def min_distance_reached(self) -> float:
+        """Forward min_distance_reached property to the unwrapped environment."""
+        return self.unwrapped.min_distance_reached
+    
+    @property
+    def max_height_reached(self) -> int:
+        """Forward max_height_reached property to the unwrapped environment."""
+        return self.unwrapped.max_height_reached
+    
+    @property
+    def chain_lift_count(self) -> int:
+        """Forward chain_lift_count property to the unwrapped environment."""
+        return self.unwrapped.chain_lift_count
+    
+    @property
+    def remove_count(self) -> int:
+        """Forward remove_count property to the unwrapped environment."""
+        return self.unwrapped.remove_count
+    
+    @property
+    def phase_rewards(self) -> dict:
+        """Forward phase_rewards property to the unwrapped environment."""
+        return self.unwrapped.phase_rewards
+    
+    @property
+    def current_phase(self) -> str:
+        """Forward current_phase property to the unwrapped environment."""
+        return self.unwrapped.current_phase
+    
+    @property
+    def loop_completed(self) -> bool:
+        """Forward loop_completed property to the unwrapped environment."""
+        return self.unwrapped.loop_completed
+    
+    def _calculate_distance_to_start(self) -> np.ndarray:
+        """Forward distance calculation to the unwrapped environment."""
+        return self.unwrapped._calculate_distance_to_start()
+    
     def delete_all_rides(self):
         """Forward delete_all_rides to the API controller."""
         return self.unwrapped.api_controller.delete_all_rides()

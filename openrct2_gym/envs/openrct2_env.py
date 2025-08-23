@@ -45,6 +45,15 @@ class OpenRCT2Env(gym.Env):
         self.chain_lift_positions = set()  # Track positions where chain lifts were placed
         self.action_history = deque(maxlen=10)  # Track recent actions for pattern detection
         self.remove_count = 0  # Track number of remove actions
+        
+        # Additional metrics tracking
+        self.min_distance_reached = float('inf')
+        self.max_height_reached = 0
+        self.unique_positions = set()
+        self.phase_rewards = {'building': 0, 'transition': 0, 'return': 0}
+        self.current_phase = 'building'
+        self.episode_rewards = []
+        
         self.direction_vectors = [
             (0, 1),   # North (0)
             (1, 0),   # East (1)
@@ -118,6 +127,24 @@ class OpenRCT2Env(gym.Env):
         self.action_history.append(action)  # Track action history
         observation = self._get_observation()
         reward = self._calculate_reward(success)
+        
+        # Track metrics
+        current_distance = self._calculate_distance_to_start()[0]
+        self.min_distance_reached = min(self.min_distance_reached, current_distance)
+        self.max_height_reached = max(self.max_height_reached, self.current_position[2])
+        self.unique_positions.add(tuple(self.current_position))
+        self.episode_rewards.append(reward)
+        
+        # Track phase-based rewards
+        if self.track_length <= 35:
+            self.current_phase = 'building'
+            self.phase_rewards['building'] += reward
+        elif self.track_length <= 60:
+            self.current_phase = 'transition'
+            self.phase_rewards['transition'] += reward
+        else:
+            self.current_phase = 'return'
+            self.phase_rewards['return'] += reward
 
         # Check for loop completion
         self.loop_completed = self._last_placement_complete
@@ -209,6 +236,12 @@ class OpenRCT2Env(gym.Env):
         self.chain_lift_positions = set()
         self.action_history = deque(maxlen=10)
         self.remove_count = 0
+        self.min_distance_reached = float('inf')
+        self.max_height_reached = 0
+        self.unique_positions = set()
+        self.phase_rewards = {'building': 0, 'transition': 0, 'return': 0}
+        self.current_phase = 'building'
+        self.episode_rewards = []
         
         # Demolish ALL rides to ensure clean state
         # This is more reliable than just demolishing our tracked ride
@@ -275,34 +308,75 @@ class OpenRCT2Env(gym.Env):
                 if self.chain_lift_count > 0:
                     reward += 10
             
-            # Progressive distance-based rewards
+            # Progressive distance-based rewards - STRENGTHENED
             if self.previous_distance is not None:
                 distance_delta = self.previous_distance - current_distance
                 
-                # Phase-based distance rewards
-                if self.track_length <= 35:
+                # Calculate angle to goal for direction rewards
+                goal_vector = np.array(self.goal_position[:2]) - np.array(self.current_position[:2])
+                goal_distance_2d = np.linalg.norm(goal_vector)
+                if goal_distance_2d > 0:
+                    goal_direction = goal_vector / goal_distance_2d
+                    current_dir_vector = np.array(self.direction_vectors[self.current_direction])
+                    angle_to_goal = np.arccos(np.clip(np.dot(current_dir_vector, goal_direction), -1, 1))
+                else:
+                    angle_to_goal = 0
+                
+                # Phase-based distance rewards with EARLIER and STRONGER return phase
+                if self.track_length <= 25:
                     # Building phase - allow exploration, reward height for chain lift
                     if self.current_position[2] > self.goal_position[2]:
                         reward += 0.2
-                    # Small reward for building outward
+                    # Small reward for building outward initially
                     if self.last_action not in [31]:
                         reward += 0.3
-                elif self.track_length <= 60:
-                    # Transition phase - gentle guidance back
-                    if distance_delta > 0:  # Moving closer
-                        reward += distance_delta * 0.3
-                else:
-                    # Return phase - strong pull back to station
+                elif self.track_length <= 35:
+                    # Early transition phase - start gentle guidance back
                     if distance_delta > 0:  # Moving closer
                         reward += distance_delta * 0.5
-                    else:  # Moving away
-                        reward -= abs(distance_delta) * 0.3
+                    # Reward for turning toward goal
+                    if angle_to_goal < np.pi/2:  # Facing somewhat toward goal
+                        reward += 0.3
+                else:
+                    # Return phase - MUCH stronger pull back to station
+                    if distance_delta > 0:  # Moving closer
+                        reward += distance_delta * 2.0  # Increased from 0.5
+                    else:  # Moving away - stronger penalty
+                        reward -= abs(distance_delta) * 1.0  # Increased from 0.3
                     
-                    # Extra rewards for getting very close
-                    if current_distance < 30:
-                        reward += (30 - current_distance) * 0.2
+                    # Direction-based rewards
+                    if angle_to_goal < np.pi/4:  # Facing toward goal (within 45 degrees)
+                        reward += 1.0
+                    elif angle_to_goal < np.pi/2:  # Somewhat toward goal (within 90 degrees)
+                        reward += 0.5
+                    else:  # Facing away from goal
+                        reward -= 0.5
+                    
+                    # Distance checkpoint rewards
+                    if current_distance < 50 and self.previous_distance >= 50:
+                        reward += 5  # Crossed 50-unit threshold
+                    if current_distance < 30 and self.previous_distance >= 30:
+                        reward += 10  # Crossed 30-unit threshold
+                    if current_distance < 20 and self.previous_distance >= 20:
+                        reward += 15  # Crossed 20-unit threshold
+                    if current_distance < 10 and self.previous_distance >= 10:
+                        reward += 20  # Crossed 10-unit threshold
+                    
+                    # Escalating proximity bonuses
+                    if current_distance < 40:
+                        reward += (40 - current_distance) * 0.3
+                    if current_distance < 20:
+                        reward += (20 - current_distance) * 0.5
                     if current_distance < 10:
-                        reward += 2
+                        reward += (10 - current_distance) * 1.0
+                    if current_distance < 5:
+                        reward += (5 - current_distance) * 2.0
+            
+            # Penalty for going too far (soft boundary)
+            if current_distance > 60:
+                reward -= (current_distance - 60) * 0.2
+            if current_distance > 80:
+                reward -= (current_distance - 80) * 0.5  # Stronger penalty for extreme distance
             
             # Track length milestone rewards
             if self.track_length == 30:
@@ -343,8 +417,20 @@ class OpenRCT2Env(gym.Env):
         return np.array([distance], dtype=np.float32)
 
     def _is_trunkated(self):
+        # Check for extreme distance termination
+        current_distance = self._calculate_distance_to_start()[0]
+        too_far = current_distance > 100  # Terminate if more than 100 units away
+        
+        # Check for stuck pattern (optional)
+        stuck = False
+        if len(self.action_history) >= 10:
+            # Check if last 10 actions have too many removes (exploitation)
+            if list(self.action_history).count(31) >= 5:
+                stuck = True
+        
         return (self.steps >= self.max_steps or 
-                self.track_length >= self.max_track_length)
+                self.track_length >= self.max_track_length or
+                too_far or stuck)
 
     def _get_observation(self):
         current_distance = self._calculate_distance_to_start()[0]
@@ -369,8 +455,12 @@ class OpenRCT2Env(gym.Env):
         else:
             distance_trend = 0.0
         
+        # Use the observation space's expected size, not the current max_track_length
+        # This ensures compatibility when curriculum learning changes max_track_length
+        expected_track_size = self.observation_space['track_pieces'].shape[0]
+        
         observation = {
-            'track_pieces': np.array(self.track_pieces + [0] * (self.max_track_length - len(self.track_pieces)), dtype=np.int32),
+            'track_pieces': np.array(self.track_pieces + [0] * (expected_track_size - len(self.track_pieces)), dtype=np.int32),
             'current_position': np.array(self.current_position, dtype=np.int32),
             'current_direction': self.current_direction,
             'distance_to_start': np.array([current_distance], dtype=np.float32),
