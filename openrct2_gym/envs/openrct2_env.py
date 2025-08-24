@@ -270,16 +270,17 @@ class OpenRCT2Env(gym.Env):
             # Base reward for successful action
             reward += 1
 
-            # FIX: Reward for placing chain lifts in the beginning (actions 9 and 10)
-            # But prevent exploitation by tracking positions
-            if self.track_length < 30 and self.last_action in [9, 10]:
+            # Reward for placing chain lifts early (actions 9 and 10), but at a
+            # reduced incentive so the agent still has pieces left to return to
+            # the station. Limit the reward to the first 15 pieces to avoid
+            # spending the entire budget on hills.
+            if self.track_length < 15 and self.last_action in [9, 10]:
                 position_key = tuple(self.current_position)
                 # Only reward if this is a NEW position for chain lift
-                if position_key not in self.chain_lift_positions:
-                    if self.chain_lift_count < self.max_chain_lifts:
-                        reward += 10  # Increased from 5
-                        self.chain_lift_count += 1
-                        self.chain_lift_positions.add(position_key)
+                if position_key not in self.chain_lift_positions and self.chain_lift_count < self.max_chain_lifts:
+                    reward += 5  # smaller bonus than before
+                    self.chain_lift_count += 1
+                    self.chain_lift_positions.add(position_key)
                 else:
                     # Penalty for rebuilding chain lift in same position
                     reward -= 3

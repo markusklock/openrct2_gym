@@ -161,8 +161,8 @@ def create_curriculum_masked_env(use_adaptive=False):
     if use_adaptive:
         env = AdaptiveCurriculumWrapper(
             base_env,
-            initial_max_length=30,
-            target_max_length=100,
+            initial_max_length=50,
+            target_max_length=120,
             success_threshold=0.2,  # 20% success to advance
             window_size=50,
             increase_step=10
@@ -170,8 +170,8 @@ def create_curriculum_masked_env(use_adaptive=False):
     else:
         env = CurriculumWrapper(
             base_env,
-            initial_max_length=30,
-            target_max_length=100,
+            initial_max_length=50,
+            target_max_length=120,
             success_threshold=0.2,
             window_size=50,
             increase_step=10
