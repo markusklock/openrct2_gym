@@ -1,5 +1,5 @@
 # openrct2_gym
-[Example output](https://github.com/user-attachments/assets/116cab1b-262a-4f88-a0dd-e8129195f03c)
+[Example output](https://github.com/user-attachments/assets/932124f9-4e22-404b-9d74-ceb89f81cfba)
 
 This is a custom environment for [Gymnasium](https://gymnasium.farama.org/) that aims to train a RL agent to build great rollercoasters in OpenRCT2.
 
