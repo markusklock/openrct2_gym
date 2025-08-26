@@ -66,14 +66,12 @@ class CurriculumMaskableCallback(BaseCallback):
         # Check for episode end
         if self.locals['dones'][0]:
             self.episode_count += 1
-            
+
             # Check success
             terminated = self.locals['infos'][0].get('terminal_observation') is not None
             if terminated:
                 self.loop_completed_count += 1
                 self.logger.record('success/loop_completed', 1.0)
-                if base_env and hasattr(base_env, 'track_length'):
-                    self.logger.record('success/completed_track_length', base_env.track_length)
             else:
                 self.logger.record('success/loop_completed', 0.0)
             
@@ -90,37 +88,33 @@ class CurriculumMaskableCallback(BaseCallback):
                 self.logger.record('curriculum/stage_success_rate', 
                                  self.locals['infos'][0]['curriculum_success_rate'])
             
-            # Log navigation metrics
-            if base_env:
-                if hasattr(base_env, 'min_distance_reached'):
-                    self.logger.record('navigation/min_distance', base_env.min_distance_reached)
-                
-                # Log phase rewards
-                if hasattr(base_env, 'phase_rewards'):
-                    for phase, reward in base_env.phase_rewards.items():
+            # Episode metrics provided via info dict before reset
+            info_metrics = self.locals['infos'][0].get('episode_metrics', {})
+            if info_metrics:
+                if 'track_length' in info_metrics and terminated:
+                    self.logger.record('success/completed_track_length', info_metrics['track_length'])
+                if 'min_distance' in info_metrics:
+                    self.logger.record('navigation/min_distance', info_metrics['min_distance'])
+                if 'phase_rewards' in info_metrics:
+                    for phase, reward in info_metrics['phase_rewards'].items():
                         self.logger.record(f'rewards/{phase}_total', reward)
-                
-                # Log chain lift usage
-                if hasattr(base_env, 'chain_lift_count'):
-                    self.logger.record('chain_lift/count', base_env.chain_lift_count)
-                
-                # Log remove actions
-                if hasattr(base_env, 'remove_count'):
-                    self.logger.record('behavior/remove_count', base_env.remove_count)
-            
+                if 'chain_lift_count' in info_metrics:
+                    self.logger.record('chain_lift/count', info_metrics['chain_lift_count'])
+                if 'remove_count' in info_metrics:
+                    self.logger.record('behavior/remove_count', info_metrics['remove_count'])
+
             # Print progress
             if self.episode_count % 10 == 0:
                 print(f"\n📊 Episode {self.episode_count}: "
                       f"Success rate: {loop_completion_rate:.1%} "
                       f"({self.loop_completed_count}/{self.episode_count})")
-                if base_env:
-                    track_info = []
-                    if hasattr(base_env, 'track_length'):
-                        track_info.append(f"{base_env.track_length} pieces")
-                    if hasattr(base_env, 'min_distance_reached'):
-                        track_info.append(f"Min dist: {base_env.min_distance_reached:.1f}")
-                    if track_info:
-                        print(f"   Last track: {', '.join(track_info)}")
+                track_info = []
+                if 'track_length' in info_metrics:
+                    track_info.append(f"{info_metrics['track_length']} pieces")
+                if 'min_distance' in info_metrics:
+                    track_info.append(f"Min dist: {info_metrics['min_distance']:.1f}")
+                if track_info:
+                    print(f"   Last track: {', '.join(track_info)}")
         
         return True
 

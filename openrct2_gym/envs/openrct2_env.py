@@ -185,6 +185,17 @@ class OpenRCT2Env(gym.Env):
             elif final_distance < 20:
                 reward += (20 - final_distance) * 0.5
 
+        # Store episode-level metrics before the environment resets
+        if terminated or truncated:
+            info['episode_metrics'] = {
+                'min_distance': self.min_distance_reached,
+                'chain_lift_count': self.chain_lift_count,
+                'remove_count': self.remove_count,
+                'track_length': self.track_length,
+                'phase_rewards': dict(self.phase_rewards),
+                'collision_count': self.collision_count,
+            }
+
         return observation, reward, terminated, truncated, info
 
     def valid_action_mask(self):
