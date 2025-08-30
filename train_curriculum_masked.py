@@ -68,8 +68,8 @@ class CurriculumMaskableCallback(BaseCallback):
             self.episode_count += 1
 
             # Check success
-            terminated = self.locals['infos'][0].get('terminal_observation') is not None
-            if terminated:
+            loop_completed = self.locals['infos'][0].get('loop_completed', False)
+            if loop_completed:
                 self.loop_completed_count += 1
                 self.logger.record('success/loop_completed', 1.0)
             else:
@@ -91,7 +91,7 @@ class CurriculumMaskableCallback(BaseCallback):
             # Episode metrics provided via info dict before reset
             info_metrics = self.locals['infos'][0].get('episode_metrics', {})
             if info_metrics:
-                if 'track_length' in info_metrics and terminated:
+                if 'track_length' in info_metrics and loop_completed:
                     self.logger.record('success/completed_track_length', info_metrics['track_length'])
                 if 'min_distance' in info_metrics:
                     self.logger.record('navigation/min_distance', info_metrics['min_distance'])
@@ -186,8 +186,8 @@ def train_curriculum_masked(total_timesteps, checkpoint_freq, eval_freq,
     print("="*60)
     print("🎓 CURRICULUM LEARNING + ACTION MASKING ENABLED")
     print("="*60)
-    print("Starting with short tracks (30 pieces)")
-    print("Will gradually increase to 100 pieces")
+    print("Starting with short tracks (50 pieces)")
+    print("Will gradually increase to 120 pieces")
     print("Using MaskablePPO to prevent invalid actions")
     print("="*60 + "\n")
     
@@ -250,7 +250,7 @@ def train_curriculum_masked(total_timesteps, checkpoint_freq, eval_freq,
     try:
         print("\n🚂 Starting training with curriculum learning AND action masking...")
         print("Features enabled:")
-        print("  ✓ Curriculum learning (30 → 100 pieces)")
+        print("  ✓ Curriculum learning (50 → 120 pieces)")
         print("  ✓ True action masking (invalid actions prevented)")
         print("  ✓ Stronger return rewards")
         print("  ✓ Distance checkpoints")

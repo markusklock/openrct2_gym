@@ -161,7 +161,8 @@ class OpenRCT2Env(gym.Env):
             'auto_backtracked': auto_backtracked,
             'original_action': original_action if auto_backtracked else action,
             'collision_count': self.collision_count,
-            'consecutive_failures': self.consecutive_failures
+            'consecutive_failures': self.consecutive_failures,
+            'loop_completed': self.loop_completed
         }
         
         if self.steps % 10 == 0 or auto_backtracked:  # Log less frequently or when backtracking
@@ -194,6 +195,7 @@ class OpenRCT2Env(gym.Env):
                 'track_length': self.track_length,
                 'phase_rewards': dict(self.phase_rewards),
                 'collision_count': self.collision_count,
+                'loop_completed': self.loop_completed
             }
 
         return observation, reward, terminated, truncated, info
@@ -227,7 +229,8 @@ class OpenRCT2Env(gym.Env):
         super().reset(seed=seed)
         
         # Initialize all state variables FIRST
-        self.station_start_position = [67, 66, 14]  # Where the first station piece is
+        # API hardcodes the station start at [61, 66, 14] - we must match this
+        self.station_start_position = [61, 66, 14]  # Where the first station piece is (matches API)
         self.current_position = self.station_start_position.copy()
         self.goal_position = self.station_start_position.copy()  # Track must return to the FIRST station piece
         self.current_direction = 0

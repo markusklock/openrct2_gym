@@ -152,7 +152,8 @@ class APITrackBuilder:
             })
             
             if is_complete:
-                print("Circuit complete!")
+                print(f"[API] Circuit complete detected! Track returned to station after {len(self.history)} pieces.")
+                print(f"[API] Final position: {new_position}, Direction: {new_direction}")
         
         return success, new_position, new_direction
     
