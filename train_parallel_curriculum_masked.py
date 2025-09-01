@@ -358,7 +358,10 @@ def train_parallel_curriculum_masked(
     )
     
     tensorboard_callback = ParallelCurriculumMaskableCallback(n_envs=n_envs)
-    
+
+    # Container for final curriculum statistics
+    stats = None
+
     # Train
     try:
         print(f"\n🚂 Starting parallel training on {n_envs} environments...")
@@ -399,45 +402,48 @@ def train_parallel_curriculum_masked(
         import traceback
         traceback.print_exc()
     finally:
-        # Clean up environments
+        # Retrieve final curriculum stats before closing the environment
+        if hasattr(env, 'envs') and len(env.envs) > 0:
+            env_instance = env.envs[0]
+            curriculum_env = None
+            temp_env = env_instance
+
+            # Navigate through wrappers to find CurriculumWrapper
+            while temp_env is not None:
+                if isinstance(temp_env, (CurriculumWrapper, AdaptiveCurriculumWrapper)):
+                    curriculum_env = temp_env
+                    break
+                if hasattr(temp_env, 'env'):
+                    temp_env = temp_env.env
+                else:
+                    break
+
+            if curriculum_env:
+                stats = curriculum_env.get_curriculum_stats()
+
+        # Clean up environments after collecting stats
         env.close()
-    
+
     # Save final model
     final_model_path = os.path.join(log_dir, "final_model")
     model.save(final_model_path)
     print(f"\n💾 Final model saved to {final_model_path}")
-    
-    # Get final curriculum stats from first environment
-    if hasattr(env, 'envs') and len(env.envs) > 0:
-        env_instance = env.envs[0]
-        curriculum_env = None
-        temp_env = env_instance
-        
-        # Navigate through wrappers to find CurriculumWrapper
-        while temp_env is not None:
-            if isinstance(temp_env, (CurriculumWrapper, AdaptiveCurriculumWrapper)):
-                curriculum_env = temp_env
-                break
-            if hasattr(temp_env, 'env'):
-                temp_env = temp_env.env
-            else:
-                break
-        
-        if curriculum_env:
-            stats = curriculum_env.get_curriculum_stats()
-            print("\n📊 Final Curriculum Stats:")
-            print(f"  Stage reached: {stats['current_stage']}")
-            print(f"  Max track length: {stats['max_track_length']}")
-            print(f"  Total episodes: {stats['total_episodes']}")
-            print(f"  Success rate: {stats['success_rate']:.1%}")
-            print(f"  Stages completed: {len(stats['stages_completed'])}")
-            
-            if stats['stages_completed']:
-                print("\n  Stage progression:")
-                for stage in stats['stages_completed']:
-                    print(f"    Stage {stage['stage']}: {stage['max_length']} pieces, "
-                          f"{stage['success_rate']:.1%} success rate")
-    
+
+    # Log final curriculum stats if available
+    if stats:
+        print("\n📊 Final Curriculum Stats:")
+        print(f"  Stage reached: {stats['current_stage']}")
+        print(f"  Max track length: {stats['max_track_length']}")
+        print(f"  Total episodes: {stats['total_episodes']}")
+        print(f"  Success rate: {stats['success_rate']:.1%}")
+        print(f"  Stages completed: {len(stats['stages_completed'])}")
+
+        if stats['stages_completed']:
+            print("\n  Stage progression:")
+            for stage in stats['stages_completed']:
+                print(f"    Stage {stage['stage']}: {stage['max_length']} pieces, "
+                      f"{stage['success_rate']:.1%} success rate")
+
     return model, env
 
 def main():
