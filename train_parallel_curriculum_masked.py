@@ -20,6 +20,7 @@ import argparse
 import time
 import math
 from typing import List, Callable
+from contextlib import ExitStack
 
 class ParallelCurriculumMaskableCallback(BaseCallback):
     """
@@ -392,7 +393,25 @@ def train_parallel_curriculum_masked(
             # Evaluate between chunks using the training env to avoid port conflicts
             if not disable_eval and eval_episodes > 0:
                 print(f"\n📈 Intermediate evaluation after {learned:,} timesteps...")
-                mean_reward, std_reward = evaluate_policy(model, env, n_eval_episodes=eval_episodes)
+
+                # Temporarily disable curriculum statistics during evaluation
+                curriculum_wrappers = []
+                if hasattr(env, 'envs'):
+                    for wrapped_env in env.envs:
+                        temp_env = wrapped_env
+                        while temp_env is not None:
+                            if isinstance(temp_env, (CurriculumWrapper, AdaptiveCurriculumWrapper)):
+                                curriculum_wrappers.append(temp_env)
+                                break
+                            if hasattr(temp_env, 'env'):
+                                temp_env = temp_env.env
+                            else:
+                                break
+
+                with ExitStack() as stack:
+                    for cw in curriculum_wrappers:
+                        stack.enter_context(cw.evaluation_mode())
+                    mean_reward, std_reward = evaluate_policy(model, env, n_eval_episodes=eval_episodes)
                 print(f"  Mean reward: {mean_reward:.2f} ± {std_reward:.2f}")
         
     except KeyboardInterrupt:

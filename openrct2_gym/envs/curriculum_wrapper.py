@@ -5,6 +5,7 @@ Gradually increases difficulty as agent improves
 import gymnasium as gym
 import numpy as np
 from collections import deque
+from contextlib import contextmanager
 
 class CurriculumWrapper(gym.Wrapper):
     """
@@ -35,12 +36,16 @@ class CurriculumWrapper(gym.Wrapper):
         self.current_max_length = initial_max_length
         self.success_threshold = success_threshold
         self.increase_step = increase_step
-        
+
         # Performance tracking
         self.episode_results = deque(maxlen=window_size)
         self.episode_count = 0
         self.current_stage = 1
         self.stages_completed = []
+
+        # Flag to control whether statistics should be updated. During
+        # evaluation we can disable this to prevent curriculum progression.
+        self._track_stats = True
         
         # Update environment's max track length
         self._update_difficulty()
@@ -66,13 +71,13 @@ class CurriculumWrapper(gym.Wrapper):
     def reset(self, **kwargs):
         """Reset environment and potentially adjust difficulty"""
         # Check if we should increase difficulty
-        if len(self.episode_results) >= 50:  # Need at least 50 episodes
+        if self._track_stats and len(self.episode_results) >= 50:  # Need at least 50 episodes
             success_rate = sum(self.episode_results) / len(self.episode_results)
-            
+
             # Check if we should advance to next stage
-            if (success_rate >= self.success_threshold and 
+            if (success_rate >= self.success_threshold and
                 self.current_max_length < self.target_max_length):
-                
+
                 # Record completion of current stage
                 self.stages_completed.append({
                     'stage': self.current_stage,
@@ -80,7 +85,7 @@ class CurriculumWrapper(gym.Wrapper):
                     'success_rate': success_rate,
                     'episodes': self.episode_count
                 })
-                
+
                 # Increase difficulty
                 self.current_max_length = min(
                     self.current_max_length + self.increase_step,
@@ -88,10 +93,10 @@ class CurriculumWrapper(gym.Wrapper):
                 )
                 self.current_stage += 1
                 self._update_difficulty()
-                
+
                 # Clear history for new stage
                 self.episode_results.clear()
-                
+
                 # Only print if base environment has verbose >= 1
                 base_env = self._get_base_env()
                 if hasattr(base_env, 'verbose') and base_env.verbose >= 1:
@@ -116,22 +121,22 @@ class CurriculumWrapper(gym.Wrapper):
         obs, reward, terminated, truncated, info = self.env.step(action)
         
         # Track episode completion
-        if terminated or truncated:
+        if terminated or truncated and self._track_stats:
             self.episode_count += 1
-            
+
             # Check if loop was completed
             base_env = self._get_base_env()
             success = base_env.loop_completed if hasattr(base_env, 'loop_completed') else False
             self.episode_results.append(success)
-            
+
             # Add curriculum info to episode info
             info['curriculum_success'] = success
             info['curriculum_stage'] = self.current_stage
             info['curriculum_success_rate'] = (
-                sum(self.episode_results) / len(self.episode_results) 
+                sum(self.episode_results) / len(self.episode_results)
                 if self.episode_results else 0
             )
-            
+
             # Provide curriculum feedback
             if self.episode_count % 10 == 0:
                 base_env = self._get_base_env()
@@ -148,6 +153,16 @@ class CurriculumWrapper(gym.Wrapper):
             reward += 20
         
         return obs, reward, terminated, truncated, info
+
+    @contextmanager
+    def evaluation_mode(self):
+        """Context manager to temporarily disable curriculum statistic updates."""
+        prev = self._track_stats
+        self._track_stats = False
+        try:
+            yield
+        finally:
+            self._track_stats = prev
     
     def get_curriculum_stats(self):
         """Get current curriculum learning statistics"""
