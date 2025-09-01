@@ -11,7 +11,6 @@ from sb3_contrib import MaskablePPO
 from sb3_contrib.common.maskable.policies import MaskableMultiInputActorCriticPolicy
 from sb3_contrib.common.wrappers import ActionMasker
 from sb3_contrib.common.maskable.evaluation import evaluate_policy
-from sb3_contrib.common.maskable.callbacks import MaskableEvalCallback
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback
 from stable_baselines3.common.monitor import Monitor
@@ -263,9 +262,17 @@ def make_env_factory(port: int, use_adaptive: bool = False, verbose: int = 0) ->
             raise
     return _init
 
-def train_parallel_curriculum_masked(ports: List[int], total_timesteps: int, checkpoint_freq: int, 
-                                    eval_freq: int, model_path: str = None, use_adaptive: bool = False,
-                                    verbose: int = 0):
+def train_parallel_curriculum_masked(
+    ports: List[int],
+    total_timesteps: int,
+    checkpoint_freq: int,
+    eval_freq: int,
+    model_path: str | None = None,
+    use_adaptive: bool = False,
+    verbose: int = 0,
+    eval_episodes: int = 10,
+    disable_eval: bool = False,
+):
     """Train agent with curriculum learning AND action masking on multiple parallel environments"""
     
     n_envs = len(ports)
@@ -294,12 +301,9 @@ def train_parallel_curriculum_masked(ports: List[int], total_timesteps: int, che
         env = DummyVecEnv(env_factories)
         print("✅ Created single environment using DummyVecEnv")
     
-    # Create evaluation environments (using same ports) - always verbose=0 for eval
-    eval_env_factories = [make_env_factory(port, use_adaptive, verbose=0) for port in ports[:min(2, n_envs)]]
-    if len(eval_env_factories) > 1:
-        eval_env = SubprocVecEnv(eval_env_factories)
-    else:
-        eval_env = DummyVecEnv(eval_env_factories)
+    # IMPORTANT: Do NOT create a separate eval env on the same ports.
+    # We will evaluate using the training env between learn chunks to avoid
+    # corrupting in-progress episodes on shared API ports.
     
     # Create or load model
     if model_path and os.path.exists(model_path):
@@ -311,9 +315,17 @@ def train_parallel_curriculum_masked(ports: List[int], total_timesteps: int, che
             net_arch=dict(pi=[256, 256], vf=[256, 256])
         )
         
-        # Adjust batch size and n_steps based on number of environments
-        batch_size = 64 * n_envs
-        n_steps = max(2048 // n_envs, 128)  # Ensure reasonable n_steps
+        # Adjust n_steps and batch_size ensuring train_batch_size % batch_size == 0
+        # Aim for rollout size around 2048, but keep n_steps >= 128
+        target_rollout = 2048
+        base = target_rollout // max(1, n_envs)
+        # Align to 64 for better batch divisibility and keep >= 128
+        n_steps = max(128, (base // 64) * 64 if base >= 64 else 128)
+        train_batch_size = n_envs * n_steps
+        # Start with a reasonable minibatch size and make it divide train_batch_size
+        batch_size = min(64 * n_envs, train_batch_size)
+        while batch_size > 32 and train_batch_size % batch_size != 0:
+            batch_size //= 2
         
         model = MaskablePPO(
             MaskableMultiInputActorCriticPolicy,
@@ -337,19 +349,9 @@ def train_parallel_curriculum_masked(ports: List[int], total_timesteps: int, che
     
     # Callbacks
     checkpoint_callback = CheckpointCallback(
-        save_freq=checkpoint_freq // n_envs,  # Adjust for multiple envs
+        save_freq=max(1, checkpoint_freq // max(1, n_envs)),  # Guard against zero
         save_path=log_dir,
         name_prefix=f"parallel_curriculum_masked_{n_envs}envs"
-    )
-    
-    # Use MaskableEvalCallback for proper evaluation with masking
-    eval_callback = MaskableEvalCallback(
-        eval_env,
-        best_model_save_path=log_dir,
-        log_path=log_dir,
-        eval_freq=eval_freq // n_envs,  # Adjust for multiple envs
-        deterministic=True,
-        render=False
     )
     
     tensorboard_callback = ParallelCurriculumMaskableCallback(n_envs=n_envs)
@@ -367,11 +369,25 @@ def train_parallel_curriculum_masked(ports: List[int], total_timesteps: int, che
         print("\nMonitor progress in Tensorboard:")
         print("  tensorboard --logdir ./parallel_curriculum_masked_tensorboard/\n")
         
-        model.learn(
-            total_timesteps=total_timesteps,
-            callback=[checkpoint_callback, eval_callback, tensorboard_callback],
-            reset_num_timesteps=False
-        )
+        # Train in chunks, evaluating with the SAME env in between chunks.
+        remaining = total_timesteps
+        chunk = max(1, eval_freq) if not disable_eval else remaining
+        learned = 0
+        while remaining > 0:
+            this_chunk = remaining if disable_eval else min(chunk, remaining)
+            model.learn(
+                total_timesteps=this_chunk,
+                callback=[checkpoint_callback, tensorboard_callback],
+                reset_num_timesteps=False,
+            )
+            learned += this_chunk
+            remaining -= this_chunk
+            
+            # Evaluate between chunks using the training env to avoid port conflicts
+            if not disable_eval and eval_episodes > 0:
+                print(f"\n📈 Intermediate evaluation after {learned:,} timesteps...")
+                mean_reward, std_reward = evaluate_policy(model, env, n_eval_episodes=eval_episodes)
+                print(f"  Mean reward: {mean_reward:.2f} ± {std_reward:.2f}")
         
     except KeyboardInterrupt:
         print("\n⚠️ Training interrupted by user")
@@ -382,7 +398,6 @@ def train_parallel_curriculum_masked(ports: List[int], total_timesteps: int, che
     finally:
         # Clean up environments
         env.close()
-        eval_env.close()
     
     # Save final model
     final_model_path = os.path.join(log_dir, "final_model")
@@ -430,8 +445,12 @@ def main():
                        help="Total timesteps to train (default: 1M)")
     parser.add_argument("--checkpoint-freq", type=int, default=10000,
                        help="Checkpoint frequency (in timesteps)")
-    parser.add_argument("--eval-freq", type=int, default=10000,
-                       help="Evaluation frequency (in timesteps)")
+    parser.add_argument("--eval-freq", type=int, default=100000,
+                       help="Evaluate between learn chunks every N timesteps using the training env; set 0 to disable")
+    parser.add_argument("--eval-episodes", type=int, default=10,
+                       help="Number of episodes per intermediate evaluation")
+    parser.add_argument("--disable-eval", action="store_true",
+                       help="Disable intermediate evaluation entirely (safer for maximum throughput)")
     parser.add_argument("--model-path", type=str,
                        help="Path to existing MaskablePPO model to continue training")
     parser.add_argument("--adaptive", action="store_true",
@@ -469,6 +488,8 @@ def main():
                 print(f"  ✅ Port {port}: Available")
             else:
                 print(f"  ⚠️ Port {port}: Cannot connect")
+            # Always disconnect the probe socket to avoid leaking the connection
+            controller.disconnect()
         except Exception as e:
             print(f"  ⚠️ Port {port}: Error - {e}")
     
@@ -498,15 +519,12 @@ def main():
         args.eval_freq,
         args.model_path,
         args.adaptive,
-        verbose
+        verbose,
+        args.eval_episodes,
+        args.disable_eval or args.eval_freq <= 0,
     )
-    
-    # Final evaluation using maskable evaluation
-    print("\n📈 Final evaluation with masking...")
-    mean_reward, std_reward = evaluate_policy(model, env, n_eval_episodes=20)
-    print(f"Mean reward: {mean_reward:.2f} ± {std_reward:.2f}")
-    
-    env.close()
+    # Training function already evaluates between chunks and closes env.
+    # No additional evaluation here to avoid interfering with API ports.
 
 if __name__ == "__main__":
     main()
