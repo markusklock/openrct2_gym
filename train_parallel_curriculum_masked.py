@@ -45,33 +45,36 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
         
         # Get environment through vectorized wrapper
         env = self.model.get_env()
-        
-        # Try to get base environments for each parallel env
-        if hasattr(env, 'envs') and len(env.envs) > 0:
-            for env_idx, wrapped_env in enumerate(env.envs):
-                # Navigate through wrappers to find base environment
-                temp_env = wrapped_env
-                base_env = None
-                while temp_env is not None:
-                    if hasattr(temp_env, 'track_length'):
-                        base_env = temp_env
-                        break
-                    if hasattr(temp_env, 'env'):
-                        temp_env = temp_env.env
-                    else:
-                        break
-                
-                # Log metrics if we found the base environment
-                if base_env and env_idx == 0:  # Log from first env to avoid clutter
-                    if hasattr(base_env, 'track_length'):
-                        self.logger.record('metrics/track_length', base_env.track_length)
-                    
-                    if hasattr(base_env, '_calculate_distance_to_start'):
-                        distance = base_env._calculate_distance_to_start()[0]
-                        self.logger.record('metrics/current_distance', distance)
-                    
-                    if hasattr(base_env, 'collision_count'):
-                        self.logger.record('metrics/collision_count', base_env.collision_count)
+
+        # Retrieve metrics from each subprocess using VecEnv helper methods
+        try:
+            track_lengths = env.get_attr('track_length')
+            if track_lengths and track_lengths[0] is not None:
+                # Log only from first env to reduce clutter
+                self.logger.record('metrics/track_length', track_lengths[0])
+        except (AttributeError, NotImplementedError):
+            if self.verbose:
+                print("Warning: track_length attribute not available in environments")
+
+        try:
+            distances = env.env_method('_calculate_distance_to_start')
+            if distances and distances[0] is not None:
+                dist = distances[0]
+                # Method may return tuple/list/array; extract numeric distance
+                if isinstance(dist, (list, tuple, np.ndarray)):
+                    dist = dist[0]
+                self.logger.record('metrics/current_distance', dist)
+        except (AttributeError, NotImplementedError):
+            if self.verbose:
+                print("Warning: _calculate_distance_to_start method not available in environments")
+
+        try:
+            collision_counts = env.get_attr('collision_count')
+            if collision_counts and collision_counts[0] is not None:
+                self.logger.record('metrics/collision_count', collision_counts[0])
+        except (AttributeError, NotImplementedError):
+            if self.verbose:
+                print("Warning: collision_count attribute not available in environments")
         
         self.total_actions += self.n_envs
         
