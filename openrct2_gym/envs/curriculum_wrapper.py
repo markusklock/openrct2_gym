@@ -92,11 +92,14 @@ class CurriculumWrapper(gym.Wrapper):
                 # Clear history for new stage
                 self.episode_results.clear()
                 
-                print(f"\n{'='*60}")
-                print(f"🎯 CURRICULUM: Advancing to Stage {self.current_stage}")
-                print(f"   Max track length: {self.current_max_length}")
-                print(f"   Success rate achieved: {success_rate:.1%}")
-                print(f"{'='*60}\n")
+                # Only print if base environment has verbose >= 1
+                base_env = self._get_base_env()
+                if hasattr(base_env, 'verbose') and base_env.verbose >= 1:
+                    print(f"\n{'='*60}")
+                    print(f"🎯 CURRICULUM: Advancing to Stage {self.current_stage}")
+                    print(f"   Max track length: {self.current_max_length}")
+                    print(f"   Success rate achieved: {success_rate:.1%}")
+                    print(f"{'='*60}\n")
         
         # Reset the environment
         obs, info = self.env.reset(**kwargs)
@@ -131,11 +134,13 @@ class CurriculumWrapper(gym.Wrapper):
             
             # Provide curriculum feedback
             if self.episode_count % 10 == 0:
-                success_rate = sum(self.episode_results) / len(self.episode_results) if self.episode_results else 0
-                print(f"📊 Curriculum Stage {self.current_stage}: "
-                      f"Success rate: {success_rate:.1%} "
-                      f"({sum(self.episode_results)}/{len(self.episode_results)}) "
-                      f"Max length: {self.current_max_length}")
+                base_env = self._get_base_env()
+                if hasattr(base_env, 'verbose') and base_env.verbose >= 1:
+                    success_rate = sum(self.episode_results) / len(self.episode_results) if self.episode_results else 0
+                    print(f"📊 Curriculum Stage {self.current_stage}: "
+                          f"Success rate: {success_rate:.1%} "
+                          f"({sum(self.episode_results)}/{len(self.episode_results)}) "
+                          f"Max length: {self.current_max_length}")
         
         # Add reward shaping based on curriculum stage
         if self.current_stage == 1 and terminated and info.get('curriculum_success'):

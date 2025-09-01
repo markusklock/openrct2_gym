@@ -6,9 +6,10 @@ from .api_track_builder import APITrackBuilder
 from .api_controller import APIController
 
 class OpenRCT2Env(gym.Env):
-    def __init__(self, render_mode=None, host="localhost", port=8080):
+    def __init__(self, render_mode=None, host="localhost", port=8080, verbose=1):
         super(OpenRCT2Env, self).__init__()
         self.render_mode = render_mode
+        self.verbose = verbose  # 0=silent, 1=important only, 2=detailed
         self.api_controller = APIController(host, port)
         self.track_builder = APITrackBuilder(self.api_controller)
         
@@ -90,7 +91,8 @@ class OpenRCT2Env(gym.Env):
             # Auto-backtrack if enabled and too many consecutive failures
             if self.auto_backtrack_enabled and self.consecutive_failures >= self.max_consecutive_failures:
                 if len(self.track_builder.history) > 0:
-                    print(f"Auto-backtracking after {self.consecutive_failures} consecutive failures")
+                    if self.verbose >= 2:
+                        print(f"Auto-backtracking after {self.consecutive_failures} consecutive failures")
                     # Force a remove action instead of the failed action
                     action = 31  # Change the action to remove
                     auto_backtracked = True
@@ -149,7 +151,8 @@ class OpenRCT2Env(gym.Env):
         # Check for loop completion
         self.loop_completed = self._last_placement_complete
         if self.loop_completed:
-            print(f"Loop has been completed, great success!")
+            if self.verbose >= 1:
+                print(f"Loop has been completed, great success!")
         terminated = self.loop_completed
         
         # Check if episode was truncated
@@ -165,7 +168,7 @@ class OpenRCT2Env(gym.Env):
             'loop_completed': self.loop_completed
         }
         
-        if self.steps % 10 == 0 or auto_backtracked:  # Log less frequently or when backtracking
+        if self.verbose >= 2 and (self.steps % 10 == 0 or auto_backtracked):  # Log less frequently or when backtracking
             print("Step: %s, Track: %s, Pos: %s, Action: %s%s, Dist: %.1f, Dir: %s" % 
                   (self.steps, self.track_length, self.current_position, 
                    self.last_action, " (auto-backtrack)" if auto_backtracked else "",
@@ -422,7 +425,8 @@ class OpenRCT2Env(gym.Env):
         # Update previous distance for next step
         self.previous_distance = current_distance
         
-        print("Reward was: %.2f (dist: %.1f, track: %d)" % (reward, current_distance, self.track_length))
+        if self.verbose >= 2:
+            print("Reward was: %.2f (dist: %.1f, track: %d)" % (reward, current_distance, self.track_length))
         return reward
 
     def _calculate_distance_to_start(self):
@@ -517,7 +521,8 @@ class OpenRCT2Env(gym.Env):
                 'nausea': ratings.get('nausea', 0)
             }
         else:
-            print("Failed to get ride ratings")
+            if self.verbose >= 1:
+                print("Failed to get ride ratings")
             return {
                 'excitement': 0,
                 'intensity': 0,
@@ -529,7 +534,8 @@ class OpenRCT2Env(gym.Env):
         current_x, current_y, current_z = self.station_start_position
         current_dir = 0
         
-        print(f"Building {self.station_length} station pieces starting at {self.station_start_position}")
+        if self.verbose >= 2:
+            print(f"Building {self.station_length} station pieces starting at {self.station_start_position}")
         
         for i in range(self.station_length):
             # Station configuration:
@@ -547,7 +553,8 @@ class OpenRCT2Env(gym.Env):
                 current_dir, station_track_type
             )
             if not resp.get("success"):
-                print(f"Failed to place station piece {i}: {resp.get('error')}")
+                if self.verbose >= 1:
+                    print(f"Failed to place station piece {i}: {resp.get('error')}")
                 return False
             
             next_ep = resp["payload"]["nextEndpoint"]
@@ -564,8 +571,9 @@ class OpenRCT2Env(gym.Env):
         self.current_position = [current_x, current_y, current_z]
         self.current_direction = current_dir
         
-        print(f"Station built. Track starts at {self.station_start_position}, current position: {self.current_position}")
-        print(f"Goal: Return to {self.goal_position} (first station piece)")
+        if self.verbose >= 2:
+            print(f"Station built. Track starts at {self.station_start_position}, current position: {self.current_position}")
+            print(f"Goal: Return to {self.goal_position} (first station piece)")
         
         return True
 

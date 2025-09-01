@@ -1,0 +1,512 @@
+#!/usr/bin/env python3
+"""
+Parallel training script with curriculum learning AND proper action masking using MaskablePPO
+Trains on multiple OpenRCT2 instances simultaneously for faster learning
+"""
+import gymnasium as gym
+import openrct2_gym
+from openrct2_gym.envs.curriculum_wrapper import CurriculumWrapper, AdaptiveCurriculumWrapper
+from openrct2_gym.envs.wrappers import OpenRCT2Wrapper
+from sb3_contrib import MaskablePPO
+from sb3_contrib.common.maskable.policies import MaskableMultiInputActorCriticPolicy
+from sb3_contrib.common.wrappers import ActionMasker
+from sb3_contrib.common.maskable.evaluation import evaluate_policy
+from sb3_contrib.common.maskable.callbacks import MaskableEvalCallback
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
+from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback
+from stable_baselines3.common.monitor import Monitor
+import numpy as np
+import os
+import argparse
+import time
+from typing import List, Callable
+
+class ParallelCurriculumMaskableCallback(BaseCallback):
+    """
+    Tensorboard callback that tracks both curriculum and masking metrics
+    across multiple parallel environments
+    """
+    def __init__(self, n_envs=1, verbose=0):
+        super().__init__(verbose)
+        self.n_envs = n_envs
+        self.episode_counts = [0] * n_envs
+        self.loop_completed_counts = [0] * n_envs
+        self.total_episode_count = 0
+        self.total_loop_completed = 0
+        self.invalid_action_count = 0
+        self.total_actions = 0
+        self.start_time = time.time()
+        self.total_steps = 0
+        self.last_dashboard_episode = 0  # Track last dashboard print to avoid repeats
+        
+    def _on_step(self) -> bool:
+        # Track total steps for throughput calculation
+        self.total_steps += self.n_envs
+        
+        # Get environment through vectorized wrapper
+        env = self.model.get_env()
+        
+        # Try to get base environments for each parallel env
+        if hasattr(env, 'envs') and len(env.envs) > 0:
+            for env_idx, wrapped_env in enumerate(env.envs):
+                # Navigate through wrappers to find base environment
+                temp_env = wrapped_env
+                base_env = None
+                while temp_env is not None:
+                    if hasattr(temp_env, 'track_length'):
+                        base_env = temp_env
+                        break
+                    if hasattr(temp_env, 'env'):
+                        temp_env = temp_env.env
+                    else:
+                        break
+                
+                # Log metrics if we found the base environment
+                if base_env and env_idx == 0:  # Log from first env to avoid clutter
+                    if hasattr(base_env, 'track_length'):
+                        self.logger.record('metrics/track_length', base_env.track_length)
+                    
+                    if hasattr(base_env, '_calculate_distance_to_start'):
+                        distance = base_env._calculate_distance_to_start()[0]
+                        self.logger.record('metrics/current_distance', distance)
+                    
+                    if hasattr(base_env, 'collision_count'):
+                        self.logger.record('metrics/collision_count', base_env.collision_count)
+        
+        self.total_actions += self.n_envs
+        
+        # Check for episode ends across all environments
+        for env_idx in range(self.n_envs):
+            if self.locals['dones'][env_idx]:
+                self.episode_counts[env_idx] += 1
+                self.total_episode_count += 1
+
+                # Check success
+                loop_completed = self.locals['infos'][env_idx].get('loop_completed', False)
+                if loop_completed:
+                    self.loop_completed_counts[env_idx] += 1
+                    self.total_loop_completed += 1
+                    self.logger.record(f'success/env_{env_idx}_loop_completed', 1.0)
+                else:
+                    self.logger.record(f'success/env_{env_idx}_loop_completed', 0.0)
+                
+                # Log overall success rate
+                if self.total_episode_count > 0:
+                    overall_success_rate = self.total_loop_completed / self.total_episode_count
+                    self.logger.record('success/overall_loop_completion_rate', overall_success_rate)
+                
+                # Log per-environment success rate
+                if self.episode_counts[env_idx] > 0:
+                    env_success_rate = self.loop_completed_counts[env_idx] / self.episode_counts[env_idx]
+                    self.logger.record(f'success/env_{env_idx}_completion_rate', env_success_rate)
+                
+                # Log curriculum info if available (from first env that completes)
+                if 'curriculum_stage' in self.locals['infos'][env_idx]:
+                    self.logger.record('curriculum/stage', self.locals['infos'][env_idx]['curriculum_stage'])
+                if 'max_track_length' in self.locals['infos'][env_idx]:
+                    self.logger.record('curriculum/max_length', self.locals['infos'][env_idx]['max_track_length'])
+                if 'curriculum_success_rate' in self.locals['infos'][env_idx]:
+                    self.logger.record('curriculum/stage_success_rate', 
+                                     self.locals['infos'][env_idx]['curriculum_success_rate'])
+                
+                # Episode metrics provided via info dict before reset
+                info_metrics = self.locals['infos'][env_idx].get('episode_metrics', {})
+                if info_metrics:
+                    if 'track_length' in info_metrics and loop_completed:
+                        self.logger.record(f'success/env_{env_idx}_completed_track_length', info_metrics['track_length'])
+                    if 'min_distance' in info_metrics:
+                        self.logger.record(f'navigation/env_{env_idx}_min_distance', info_metrics['min_distance'])
+                    if env_idx == 0:  # Log detailed metrics only from first env
+                        if 'phase_rewards' in info_metrics:
+                            for phase, reward in info_metrics['phase_rewards'].items():
+                                self.logger.record(f'rewards/{phase}_total', reward)
+                        if 'chain_lift_count' in info_metrics:
+                            self.logger.record('chain_lift/count', info_metrics['chain_lift_count'])
+                        if 'remove_count' in info_metrics:
+                            self.logger.record('behavior/remove_count', info_metrics['remove_count'])
+
+        # Calculate and log throughput
+        elapsed_time = time.time() - self.start_time
+        if elapsed_time > 0:
+            steps_per_second = self.total_steps / elapsed_time
+            self.logger.record('performance/steps_per_second', steps_per_second)
+            self.logger.record('performance/total_episodes', self.total_episode_count)
+            
+        # Print progress dashboard (only once per milestone)
+        dashboard_interval = 10 * self.n_envs
+        if (self.total_episode_count > 0 and 
+            self.total_episode_count >= self.last_dashboard_episode + dashboard_interval):
+            # Update last printed milestone
+            self.last_dashboard_episode = (self.total_episode_count // dashboard_interval) * dashboard_interval
+            
+            overall_success_rate = self.total_loop_completed / self.total_episode_count
+            episodes_per_second = self.total_episode_count / elapsed_time if elapsed_time > 0 else 0
+            
+            # Create a clean dashboard display
+            print("\n" + "┌" + "─" * 58 + "┐")
+            print(f"│ 🎮 Parallel Training Dashboard ({self.n_envs} environments)".ljust(59) + "│")
+            print("├" + "─" * 58 + "┤")
+            
+            # Environment status indicators
+            env_status = []
+            for i in range(self.n_envs):
+                if self.episode_counts[i] > 0:
+                    rate = self.loop_completed_counts[i] / self.episode_counts[i]
+                    if rate >= 0.3:
+                        env_status.append("🟢")  # Good performance
+                    elif rate >= 0.1:
+                        env_status.append("🟡")  # Learning
+                    else:
+                        env_status.append("🔴")  # Struggling
+                else:
+                    env_status.append("⚪")  # No episodes yet
+            
+            print(f"│ Environments: [{' '.join(env_status)}]".ljust(59) + "│")
+            print(f"│ Episodes: {self.total_episode_count:,} | Success: {overall_success_rate:.1%} ({self.total_loop_completed}/{self.total_episode_count})".ljust(59) + "│")
+            print(f"│ Throughput: {steps_per_second:.1f} steps/s | {episodes_per_second:.2f} eps/s".ljust(59) + "│")
+            
+            # Get curriculum info from first environment if available
+            if hasattr(env, 'envs') and len(env.envs) > 0:
+                wrapped_env = env.envs[0]
+                temp_env = wrapped_env
+                while temp_env is not None:
+                    if hasattr(temp_env, 'current_stage') and hasattr(temp_env, 'current_max_length'):
+                        print(f"│ Curriculum: Stage {temp_env.current_stage} | Max Length: {temp_env.current_max_length}".ljust(59) + "│")
+                        break
+                    if hasattr(temp_env, 'env'):
+                        temp_env = temp_env.env
+                    else:
+                        break
+            
+            print("└" + "─" * 58 + "┘")
+            
+            # Show detailed per-environment stats every 50 episodes
+            if self.total_episode_count % (50 * self.n_envs) == 0:
+                print("\n  Per-environment performance:")
+                for i in range(min(4, self.n_envs)):  # Show up to 4 envs
+                    if self.episode_counts[i] > 0:
+                        rate = self.loop_completed_counts[i] / self.episode_counts[i]
+                        print(f"    Env {i}: {rate:.1%} success ({self.loop_completed_counts[i]}/{self.episode_counts[i]} episodes)")
+        
+        return True
+
+def mask_fn(env: gym.Env) -> np.ndarray:
+    """
+    Returns the action mask for the current environment state.
+    Navigates through all wrappers to find the base environment.
+    """
+    # Navigate through wrappers to find the base OpenRCT2 environment
+    current_env = env
+    while current_env is not None:
+        # Check if this environment has the valid_action_mask method
+        if hasattr(current_env, 'valid_action_mask'):
+            return current_env.valid_action_mask()
+        
+        # Try to go deeper through the wrapper chain
+        if hasattr(current_env, 'env'):
+            current_env = current_env.env
+        elif hasattr(current_env, 'unwrapped'):
+            current_env = current_env.unwrapped
+        else:
+            break
+    
+    # Fallback - all actions valid (shouldn't reach here)
+    print("Warning: Could not find valid_action_mask method, allowing all actions")
+    return np.ones(env.action_space.n, dtype=bool)
+
+def create_curriculum_masked_env(port: int, use_adaptive: bool = False, verbose: int = 0) -> gym.Env:
+    """Create environment with curriculum wrapper and action masking for a specific port"""
+    # Base environment with specific port and verbosity
+    base_env = gym.make('OpenRCT2-v0', host='localhost', port=port, verbose=verbose)
+    
+    # Add OpenRCT2Wrapper to expose valid_action_mask method
+    # This is crucial for the mask_fn to work
+    base_env = OpenRCT2Wrapper(base_env)
+    
+    # Apply curriculum wrapper
+    if use_adaptive:
+        env = AdaptiveCurriculumWrapper(
+            base_env,
+            initial_max_length=50,
+            target_max_length=120,
+            success_threshold=0.2,  # 20% success to advance
+            window_size=50,
+            increase_step=10
+        )
+    else:
+        env = CurriculumWrapper(
+            base_env,
+            initial_max_length=50,
+            target_max_length=120,
+            success_threshold=0.2,
+            window_size=50,
+            increase_step=10
+        )
+    
+    # Add Monitor for logging
+    env = Monitor(env)
+    
+    # Add ActionMasker for MaskablePPO
+    env = ActionMasker(env, mask_fn)
+    
+    return env
+
+def make_env_factory(port: int, use_adaptive: bool = False, verbose: int = 0) -> Callable[[], gym.Env]:
+    """Create a factory function for an environment on a specific port"""
+    def _init() -> gym.Env:
+        try:
+            env = create_curriculum_masked_env(port, use_adaptive, verbose)
+            print(f"✅ Successfully connected to OpenRCT2 on port {port}")
+            return env
+        except Exception as e:
+            print(f"❌ Failed to connect to OpenRCT2 on port {port}: {e}")
+            raise
+    return _init
+
+def train_parallel_curriculum_masked(ports: List[int], total_timesteps: int, checkpoint_freq: int, 
+                                    eval_freq: int, model_path: str = None, use_adaptive: bool = False,
+                                    verbose: int = 0):
+    """Train agent with curriculum learning AND action masking on multiple parallel environments"""
+    
+    n_envs = len(ports)
+    
+    print("="*60)
+    print("🎓 PARALLEL CURRICULUM LEARNING + ACTION MASKING")
+    print("="*60)
+    print(f"Training on {n_envs} parallel OpenRCT2 instances")
+    print(f"Ports: {', '.join(map(str, ports))}")
+    print("Starting with short tracks (50 pieces)")
+    print("Will gradually increase to 120 pieces")
+    print("Using MaskablePPO to prevent invalid actions")
+    print("="*60 + "\n")
+    
+    # Create environment factories for each port
+    env_factories = [make_env_factory(port, use_adaptive, verbose) for port in ports]
+    
+    # Create parallel training environments
+    print(f"\n🔌 Connecting to {n_envs} OpenRCT2 instances...")
+    if n_envs > 1:
+        # Use SubprocVecEnv for true parallel execution
+        env = SubprocVecEnv(env_factories)
+        print(f"✅ Created {n_envs} parallel environments using SubprocVecEnv")
+    else:
+        # Fall back to DummyVecEnv for single environment
+        env = DummyVecEnv(env_factories)
+        print("✅ Created single environment using DummyVecEnv")
+    
+    # Create evaluation environments (using same ports) - always verbose=0 for eval
+    eval_env_factories = [make_env_factory(port, use_adaptive, verbose=0) for port in ports[:min(2, n_envs)]]
+    if len(eval_env_factories) > 1:
+        eval_env = SubprocVecEnv(eval_env_factories)
+    else:
+        eval_env = DummyVecEnv(eval_env_factories)
+    
+    # Create or load model
+    if model_path and os.path.exists(model_path):
+        print(f"Loading MaskablePPO model from {model_path}")
+        model = MaskablePPO.load(model_path, env=env)
+    else:
+        print(f"Creating new MaskablePPO model for {n_envs} parallel environments")
+        policy_kwargs = dict(
+            net_arch=dict(pi=[256, 256], vf=[256, 256])
+        )
+        
+        # Adjust batch size and n_steps based on number of environments
+        batch_size = 64 * n_envs
+        n_steps = max(2048 // n_envs, 128)  # Ensure reasonable n_steps
+        
+        model = MaskablePPO(
+            MaskableMultiInputActorCriticPolicy,
+            env,
+            policy_kwargs=policy_kwargs,
+            verbose=1,
+            tensorboard_log="./parallel_curriculum_masked_tensorboard/",
+            learning_rate=3e-4,
+            n_steps=n_steps,
+            batch_size=batch_size,
+            n_epochs=10,
+            gamma=0.99,
+            gae_lambda=0.95,
+            clip_range=0.2,
+            ent_coef=0.01,  # Exploration
+        )
+    
+    # Create log directory
+    log_dir = f"logs_parallel_curriculum_masked_{n_envs}envs"
+    os.makedirs(log_dir, exist_ok=True)
+    
+    # Callbacks
+    checkpoint_callback = CheckpointCallback(
+        save_freq=checkpoint_freq // n_envs,  # Adjust for multiple envs
+        save_path=log_dir,
+        name_prefix=f"parallel_curriculum_masked_{n_envs}envs"
+    )
+    
+    # Use MaskableEvalCallback for proper evaluation with masking
+    eval_callback = MaskableEvalCallback(
+        eval_env,
+        best_model_save_path=log_dir,
+        log_path=log_dir,
+        eval_freq=eval_freq // n_envs,  # Adjust for multiple envs
+        deterministic=True,
+        render=False
+    )
+    
+    tensorboard_callback = ParallelCurriculumMaskableCallback(n_envs=n_envs)
+    
+    # Train
+    try:
+        print(f"\n🚂 Starting parallel training on {n_envs} environments...")
+        print("Features enabled:")
+        print("  ✓ Curriculum learning (50 → 120 pieces)")
+        print("  ✓ True action masking (invalid actions prevented)")
+        print("  ✓ Stronger return rewards")
+        print("  ✓ Distance checkpoints")
+        print("  ✓ Chain lift incentives")
+        print(f"  ✓ {n_envs}x parallel environment execution")
+        print("\nMonitor progress in Tensorboard:")
+        print("  tensorboard --logdir ./parallel_curriculum_masked_tensorboard/\n")
+        
+        model.learn(
+            total_timesteps=total_timesteps,
+            callback=[checkpoint_callback, eval_callback, tensorboard_callback],
+            reset_num_timesteps=False
+        )
+        
+    except KeyboardInterrupt:
+        print("\n⚠️ Training interrupted by user")
+    except Exception as e:
+        print(f"\n❌ Error during training: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        # Clean up environments
+        env.close()
+        eval_env.close()
+    
+    # Save final model
+    final_model_path = os.path.join(log_dir, "final_model")
+    model.save(final_model_path)
+    print(f"\n💾 Final model saved to {final_model_path}")
+    
+    # Get final curriculum stats from first environment
+    if hasattr(env, 'envs') and len(env.envs) > 0:
+        env_instance = env.envs[0]
+        curriculum_env = None
+        temp_env = env_instance
+        
+        # Navigate through wrappers to find CurriculumWrapper
+        while temp_env is not None:
+            if isinstance(temp_env, (CurriculumWrapper, AdaptiveCurriculumWrapper)):
+                curriculum_env = temp_env
+                break
+            if hasattr(temp_env, 'env'):
+                temp_env = temp_env.env
+            else:
+                break
+        
+        if curriculum_env:
+            stats = curriculum_env.get_curriculum_stats()
+            print("\n📊 Final Curriculum Stats:")
+            print(f"  Stage reached: {stats['current_stage']}")
+            print(f"  Max track length: {stats['max_track_length']}")
+            print(f"  Total episodes: {stats['total_episodes']}")
+            print(f"  Success rate: {stats['success_rate']:.1%}")
+            print(f"  Stages completed: {len(stats['stages_completed'])}")
+            
+            if stats['stages_completed']:
+                print("\n  Stage progression:")
+                for stage in stats['stages_completed']:
+                    print(f"    Stage {stage['stage']}: {stage['max_length']} pieces, "
+                          f"{stage['success_rate']:.1%} success rate")
+    
+    return model, env
+
+def main():
+    parser = argparse.ArgumentParser(description="Parallel training with curriculum + masking")
+    parser.add_argument("--ports", type=str, default="8080",
+                       help="Comma-separated list of ports for OpenRCT2 API servers (e.g., 8080,8081,8082)")
+    parser.add_argument("--timesteps", type=int, default=1000000,
+                       help="Total timesteps to train (default: 1M)")
+    parser.add_argument("--checkpoint-freq", type=int, default=10000,
+                       help="Checkpoint frequency (in timesteps)")
+    parser.add_argument("--eval-freq", type=int, default=10000,
+                       help="Evaluation frequency (in timesteps)")
+    parser.add_argument("--model-path", type=str,
+                       help="Path to existing MaskablePPO model to continue training")
+    parser.add_argument("--adaptive", action="store_true",
+                       help="Use adaptive curriculum with dynamic reward scaling")
+    parser.add_argument("--verbose", type=int, default=None,
+                       help="Verbosity level: 0=silent, 1=important, 2=detailed (default: auto)")
+    args = parser.parse_args()
+    
+    # Parse ports
+    try:
+        ports = [int(port.strip()) for port in args.ports.split(',')]
+    except ValueError:
+        print("❌ Error: Invalid port format. Please provide comma-separated integers (e.g., 8080,8081)")
+        return
+    
+    print("\n" + "="*60)
+    print("🎢 OpenRCT2 Parallel Training: Curriculum + Action Masking")
+    print("="*60)
+    print("This combines the best approaches with parallel execution:")
+    print("  • Curriculum learning for gradual difficulty")
+    print("  • True action masking to prevent invalid moves")
+    print("  • All reward improvements for better navigation")
+    print(f"  • {len(ports)}x parallel environments for faster training")
+    print("="*60 + "\n")
+    
+    # Validate that we can connect to at least one server
+    print("🔍 Checking OpenRCT2 API server availability...")
+    available_ports = []
+    for port in ports:
+        try:
+            from openrct2_gym.envs.api_controller import APIController
+            controller = APIController('localhost', port)
+            if controller.connect():
+                available_ports.append(port)
+                print(f"  ✅ Port {port}: Available")
+            else:
+                print(f"  ⚠️ Port {port}: Cannot connect")
+        except Exception as e:
+            print(f"  ⚠️ Port {port}: Error - {e}")
+    
+    if not available_ports:
+        print("\n❌ Error: No OpenRCT2 API servers available on specified ports")
+        print("Please ensure OpenRCT2 is running with the API plugin on the specified ports")
+        return
+    
+    if len(available_ports) < len(ports):
+        print(f"\n⚠️ Warning: Only {len(available_ports)} out of {len(ports)} ports are available")
+        print(f"Continuing with available ports: {', '.join(map(str, available_ports))}")
+    
+    # Auto-determine verbosity if not specified
+    if args.verbose is None:
+        # Use verbose=0 for multiple environments, 1 for single
+        verbose = 0 if len(available_ports) > 1 else 1
+    else:
+        verbose = args.verbose
+    
+    if verbose == 0 and len(available_ports) > 1:
+        print("\n💡 Tip: Running in silent mode. Use --verbose 1 or 2 for more details")
+    
+    model, env = train_parallel_curriculum_masked(
+        available_ports,
+        args.timesteps,
+        args.checkpoint_freq,
+        args.eval_freq,
+        args.model_path,
+        args.adaptive,
+        verbose
+    )
+    
+    # Final evaluation using maskable evaluation
+    print("\n📈 Final evaluation with masking...")
+    mean_reward, std_reward = evaluate_policy(model, env, n_eval_episodes=20)
+    print(f"Mean reward: {mean_reward:.2f} ± {std_reward:.2f}")
+    
+    env.close()
+
+if __name__ == "__main__":
+    main()
