@@ -15,6 +15,7 @@ from sb3_contrib.common.maskable.callbacks import MaskableEvalCallback
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback
 from stable_baselines3.common.monitor import Monitor
+from contextlib import ExitStack
 import numpy as np
 import os
 import argparse
@@ -142,41 +143,47 @@ def mask_fn(env: gym.Env) -> np.ndarray:
     print("Warning: Could not find valid_action_mask method, allowing all actions")
     return np.ones(env.action_space.n, dtype=bool)
 
-def create_curriculum_masked_env(use_adaptive=False):
-    """Create environment with curriculum wrapper and action masking"""
+def create_curriculum_masked_env(use_adaptive=False, include_curriculum=True):
+    """Create environment with optional curriculum wrapper and action masking"""
     # Base environment
     base_env = gym.make('OpenRCT2-v0')
-    
+
     # Add OpenRCT2Wrapper to expose valid_action_mask method
     # This is crucial for the mask_fn to work
     base_env = OpenRCT2Wrapper(base_env)
-    
-    # Apply curriculum wrapper
-    if use_adaptive:
-        env = AdaptiveCurriculumWrapper(
-            base_env,
-            initial_max_length=50,
-            target_max_length=120,
-            success_threshold=0.2,  # 20% success to advance
-            window_size=50,
-            increase_step=10
-        )
+
+    env = base_env
+
+    # Apply curriculum wrapper only when training
+    if include_curriculum:
+        if use_adaptive:
+            env = AdaptiveCurriculumWrapper(
+                base_env,
+                initial_max_length=50,
+                target_max_length=120,
+                success_threshold=0.2,  # 20% success to advance
+                window_size=50,
+                increase_step=10
+            )
+        else:
+            env = CurriculumWrapper(
+                base_env,
+                initial_max_length=50,
+                target_max_length=120,
+                success_threshold=0.2,
+                window_size=50,
+                increase_step=10
+            )
     else:
-        env = CurriculumWrapper(
-            base_env,
-            initial_max_length=50,
-            target_max_length=120,
-            success_threshold=0.2,
-            window_size=50,
-            increase_step=10
-        )
-    
+        # When evaluating without curriculum, fix track length to target difficulty
+        base_env.max_track_length = 120
+
     # Add Monitor for logging
     env = Monitor(env)
-    
+
     # Add ActionMasker for MaskablePPO
     env = ActionMasker(env, mask_fn)
-    
+
     return env
 
 def train_curriculum_masked(total_timesteps, checkpoint_freq, eval_freq, 
@@ -192,10 +199,11 @@ def train_curriculum_masked(total_timesteps, checkpoint_freq, eval_freq,
     print("="*60 + "\n")
     
     # Create environments
-    env_fn = lambda: create_curriculum_masked_env(use_adaptive)
+    env_fn = lambda: create_curriculum_masked_env(use_adaptive, include_curriculum=True)
     env = DummyVecEnv([env_fn])
-    
-    eval_env_fn = lambda: create_curriculum_masked_env(use_adaptive)
+
+    # Evaluation environment without curriculum to avoid affecting statistics
+    eval_env_fn = lambda: create_curriculum_masked_env(use_adaptive, include_curriculum=False)
     eval_env = DummyVecEnv([eval_env_fn])
     
     # Create or load model
@@ -341,7 +349,19 @@ def main():
     
     # Final evaluation using maskable evaluation
     print("\n📈 Final evaluation with masking...")
-    mean_reward, std_reward = evaluate_policy(model, env, n_eval_episodes=20)
+    # Disable curriculum updates during evaluation
+    with ExitStack() as stack:
+        if hasattr(env, 'envs') and len(env.envs) > 0:
+            temp_env = env.envs[0]
+            while temp_env is not None:
+                if isinstance(temp_env, (CurriculumWrapper, AdaptiveCurriculumWrapper)):
+                    stack.enter_context(temp_env.evaluation_mode())
+                    break
+                if hasattr(temp_env, 'env'):
+                    temp_env = temp_env.env
+                else:
+                    break
+        mean_reward, std_reward = evaluate_policy(model, env, n_eval_episodes=20)
     print(f"Mean reward: {mean_reward:.2f} ± {std_reward:.2f}")
     
     env.close()
