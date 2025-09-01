@@ -18,6 +18,7 @@ import numpy as np
 import os
 import argparse
 import time
+import math
 from typing import List, Callable
 
 class ParallelCurriculumMaskableCallback(BaseCallback):
@@ -322,10 +323,12 @@ def train_parallel_curriculum_masked(
         # Align to 64 for better batch divisibility and keep >= 128
         n_steps = max(128, (base // 64) * 64 if base >= 64 else 128)
         train_batch_size = n_envs * n_steps
-        # Start with a reasonable minibatch size and make it divide train_batch_size
-        batch_size = min(64 * n_envs, train_batch_size)
-        while batch_size > 32 and train_batch_size % batch_size != 0:
-            batch_size //= 2
+        # Start with a reasonable minibatch size that divides train_batch_size
+        batch_size = math.gcd(train_batch_size, 64 * n_envs)
+        batch_size = max(32, batch_size)
+        assert train_batch_size % batch_size == 0, (
+            "train_batch_size must be divisible by batch_size"
+        )
         
         model = MaskablePPO(
             MaskableMultiInputActorCriticPolicy,
