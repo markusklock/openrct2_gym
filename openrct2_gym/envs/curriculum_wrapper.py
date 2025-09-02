@@ -49,6 +49,8 @@ class CurriculumWrapper(gym.Wrapper):
         
         # Update environment's max track length
         self._update_difficulty()
+        # Apply initial stage policy (reward focus / phase thresholds)
+        self._apply_stage_policy()
         
     def _update_difficulty(self):
         """Update the environment's maximum track length"""
@@ -67,6 +69,37 @@ class CurriculumWrapper(gym.Wrapper):
         while hasattr(env, 'env'):
             env = env.env
         return env
+
+    def _apply_stage_policy(self):
+        """Configure base env reward focus and phase thresholds by stage.
+
+        Stage 1: Return-to-station focus — emphasize navigation back, suppress
+                 length-building incentives, and start return phase early.
+        Stage 2-3: Balanced — restore default phase thresholds and balanced rewards.
+        Stage 4+: Length focus — encourage building longer tracks while keeping
+                  return incentives.
+        """
+        base_env = self._get_base_env()
+        # Only apply if the base env supports these knobs
+        if not hasattr(base_env, 'reward_focus'):
+            return
+
+        if self.current_stage <= 1:
+            # Early skill building: learn to get back
+            base_env.reward_focus = 'return'
+            # Start return phase earlier so distance shaping kicks in sooner
+            base_env.building_phase_max_len = 12
+            base_env.transition_phase_max_len = 18
+        elif self.current_stage <= 3:
+            # Restore balanced behavior
+            base_env.reward_focus = 'balanced'
+            base_env.building_phase_max_len = 35
+            base_env.transition_phase_max_len = 60
+        else:
+            # Later stages: push for longer tracks
+            base_env.reward_focus = 'length'
+            base_env.building_phase_max_len = 35
+            base_env.transition_phase_max_len = 60
     
     def reset(self, **kwargs):
         """Reset environment and potentially adjust difficulty"""
@@ -93,6 +126,8 @@ class CurriculumWrapper(gym.Wrapper):
                 )
                 self.current_stage += 1
                 self._update_difficulty()
+                # Adjust reward focus/phase thresholds for the new stage
+                self._apply_stage_policy()
 
                 # Clear history for new stage
                 self.episode_results.clear()

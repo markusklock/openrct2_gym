@@ -54,6 +54,14 @@ class OpenRCT2Env(gym.Env):
         self.phase_rewards = {'building': 0, 'transition': 0, 'return': 0}
         self.current_phase = 'building'
         self.episode_rewards = []
+
+        # Phase threshold and reward focus controls (tuned by curriculum)
+        # Defaults match previous hard-coded behavior (building<=35, transition<=60)
+        self.building_phase_max_len = 35
+        self.transition_phase_max_len = 60
+        # Reward focus: 'balanced' | 'return' | 'length'
+        # The curriculum can switch this per stage to emphasize specific skills
+        self.reward_focus = 'balanced'
         
         self.direction_vectors = [
             (0, 1),   # North (0)
@@ -138,10 +146,10 @@ class OpenRCT2Env(gym.Env):
         self.episode_rewards.append(reward)
         
         # Track phase-based rewards
-        if self.track_length <= 35:
+        if self.track_length <= self.building_phase_max_len:
             self.current_phase = 'building'
             self.phase_rewards['building'] += reward
-        elif self.track_length <= 60:
+        elif self.track_length <= self.transition_phase_max_len:
             self.current_phase = 'transition'
             self.phase_rewards['transition'] += reward
         else:
@@ -340,18 +348,22 @@ class OpenRCT2Env(gym.Env):
                 else:
                     angle_to_goal = 0
                 
-                # Phase-based distance rewards with EARLIER and STRONGER return phase
-                if self.track_length <= 25:
-                    # Building phase - allow exploration, reward height for chain lift
-                    if self.current_position[2] > self.goal_position[2]:
-                        reward += 0.2
-                    # Small reward for building outward initially
-                    if self.last_action not in [31]:
-                        reward += 0.3
-                elif self.track_length <= 35:
-                    # Early transition phase - start gentle guidance back
+                # Phase-based distance rewards with configurable thresholds
+                if self.track_length <= self.building_phase_max_len:
+                    # Building phase
+                    if self.reward_focus != 'return':
+                        # Allow exploration and small upward build encouragement when not return-focused
+                        if self.current_position[2] > self.goal_position[2]:
+                            reward += 0.2
+                        if self.last_action not in [31]:
+                            reward += 0.3
+                    # When return-focused, do not encourage outward/height during early building
+                elif self.track_length <= self.transition_phase_max_len:
+                    # Transition phase - gentle guidance back
                     if distance_delta > 0:  # Moving closer
-                        reward += distance_delta * 0.5
+                        # Slightly stronger when return-focused
+                        coef = 0.7 if self.reward_focus == 'return' else 0.5
+                        reward += distance_delta * coef
                     # Reward for turning toward goal
                     if angle_to_goal < np.pi/2:  # Facing somewhat toward goal
                         reward += 0.3
@@ -396,19 +408,21 @@ class OpenRCT2Env(gym.Env):
             if current_distance > 80:
                 reward -= (current_distance - 80) * 0.5  # Stronger penalty for extreme distance
             
-            # Track length milestone rewards
-            if self.track_length == 30:
-                reward += 5
-            elif self.track_length == 50:
-                reward += 10
-            elif self.track_length == 75:
-                reward += 15
-            elif self.track_length == 100:
-                reward += 20
+            # Track length milestone rewards (scaled by reward focus)
+            length_focus_scale = 0.0 if self.reward_focus == 'return' else (1.5 if self.reward_focus == 'length' else 1.0)
+            if length_focus_scale > 0:
+                if self.track_length == 30:
+                    reward += 5 * length_focus_scale
+                elif self.track_length == 50:
+                    reward += 10 * length_focus_scale
+                elif self.track_length == 75:
+                    reward += 15 * length_focus_scale
+                elif self.track_length == 100:
+                    reward += 20 * length_focus_scale
             
-            # Small continuous reward for building longer tracks
-            if self.track_length > 30:
-                reward += 0.1
+            # Small continuous reward for building longer tracks (scaled by focus)
+            if length_focus_scale > 0 and self.track_length > 30:
+                reward += 0.1 * length_focus_scale
             
             # Reward for continuous forward progress (no recent removes)
             if self.last_action not in [31] and 31 not in list(self.action_history)[-3:]:
@@ -584,4 +598,3 @@ class OpenRCT2Env(gym.Env):
     def render(self):
         if self.render_mode == "human":
             pass
-
