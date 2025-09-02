@@ -6,6 +6,7 @@ Trains on multiple OpenRCT2 instances simultaneously for faster learning
 import gymnasium as gym
 import openrct2_gym
 from openrct2_gym.envs.curriculum_wrapper import CurriculumWrapper, AdaptiveCurriculumWrapper
+from openrct2_gym.envs.phased_curriculum_wrapper import PhasedCurriculumWrapper
 from openrct2_gym.envs.wrappers import OpenRCT2Wrapper
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.maskable.policies import MaskableMultiInputActorCriticPolicy
@@ -218,7 +219,7 @@ def mask_fn(env: gym.Env) -> np.ndarray:
     print("Warning: Could not find valid_action_mask method, allowing all actions")
     return np.ones(env.action_space.n, dtype=bool)
 
-def create_curriculum_masked_env(port: int, use_adaptive: bool = False, verbose: int = 0) -> gym.Env:
+def create_curriculum_masked_env(port: int, use_adaptive: bool = False, use_phased: bool = False, verbose: int = 0) -> gym.Env:
     """Create environment with curriculum wrapper and action masking for a specific port"""
     # Base environment with specific port and verbosity
     base_env = gym.make('OpenRCT2-v0', host='localhost', port=port, verbose=verbose)
@@ -228,7 +229,22 @@ def create_curriculum_masked_env(port: int, use_adaptive: bool = False, verbose:
     base_env = OpenRCT2Wrapper(base_env)
     
     # Apply curriculum wrapper
-    if use_adaptive:
+    if use_phased:
+        # Use new phased curriculum that focuses on station return first
+        env = PhasedCurriculumWrapper(
+            base_env,
+            phase1_success_threshold=0.5,  # 50% success to advance from phase 1
+            phase2_success_threshold=0.4,  # 40% success to advance from phase 2
+            window_size=50,
+            phase1_max_length=30,  # Short tracks for learning to return
+            phase2_max_length=60,  # Medium tracks
+            phase3_initial_length=60,
+            phase3_target_length=120,
+            phase3_increase_step=10,
+            phase3_success_threshold=0.3,
+            verbose=verbose
+        )
+    elif use_adaptive:
         env = AdaptiveCurriculumWrapper(
             base_env,
             initial_max_length=50,
@@ -255,11 +271,11 @@ def create_curriculum_masked_env(port: int, use_adaptive: bool = False, verbose:
     
     return env
 
-def make_env_factory(port: int, use_adaptive: bool = False, verbose: int = 0) -> Callable[[], gym.Env]:
+def make_env_factory(port: int, use_adaptive: bool = False, use_phased: bool = False, verbose: int = 0) -> Callable[[], gym.Env]:
     """Create a factory function for an environment on a specific port"""
     def _init() -> gym.Env:
         try:
-            env = create_curriculum_masked_env(port, use_adaptive, verbose)
+            env = create_curriculum_masked_env(port, use_adaptive, use_phased, verbose)
             print(f"✅ Successfully connected to OpenRCT2 on port {port}")
             return env
         except Exception as e:
@@ -274,6 +290,7 @@ def train_parallel_curriculum_masked(
     eval_freq: int,
     model_path: str | None = None,
     use_adaptive: bool = False,
+    use_phased: bool = False,
     verbose: int = 0,
     eval_episodes: int = 10,
     disable_eval: bool = False,
@@ -287,13 +304,21 @@ def train_parallel_curriculum_masked(
     print("="*60)
     print(f"Training on {n_envs} parallel OpenRCT2 instances")
     print(f"Ports: {', '.join(map(str, ports))}")
-    print("Starting with short tracks (50 pieces)")
-    print("Will gradually increase to 120 pieces")
+    if use_phased:
+        print("Using PHASED curriculum learning:")
+        print("  Phase 1: Learn to return to station (30 pieces max)")
+        print("  Phase 2: Explore while returning (60 pieces max)")
+        print("  Phase 3: Build quality tracks (60-120 pieces)")
+    elif use_adaptive:
+        print("Using adaptive curriculum (50-120 pieces)")
+    else:
+        print("Starting with short tracks (50 pieces)")
+        print("Will gradually increase to 120 pieces")
     print("Using MaskablePPO to prevent invalid actions")
     print("="*60 + "\n")
     
     # Create environment factories for each port
-    env_factories = [make_env_factory(port, use_adaptive, verbose) for port in ports]
+    env_factories = [make_env_factory(port, use_adaptive, use_phased, verbose) for port in ports]
     
     # Create parallel training environments
     print(f"\n🔌 Connecting to {n_envs} OpenRCT2 instances...")
@@ -403,7 +428,7 @@ def train_parallel_curriculum_masked(
                     for wrapped_env in env.envs:
                         temp_env = wrapped_env
                         while temp_env is not None:
-                            if isinstance(temp_env, (CurriculumWrapper, AdaptiveCurriculumWrapper)):
+                            if hasattr(temp_env, 'evaluation_mode'):
                                 curriculum_wrappers.append(temp_env)
                                 break
                             if hasattr(temp_env, 'env'):
@@ -432,7 +457,7 @@ def train_parallel_curriculum_masked(
 
             # Navigate through wrappers to find CurriculumWrapper
             while temp_env is not None:
-                if isinstance(temp_env, (CurriculumWrapper, AdaptiveCurriculumWrapper)):
+                if hasattr(temp_env, 'get_curriculum_stats') or hasattr(temp_env, 'get_phase_stats'):
                     curriculum_env = temp_env
                     break
                 if hasattr(temp_env, 'env'):
@@ -441,7 +466,11 @@ def train_parallel_curriculum_masked(
                     break
 
             if curriculum_env:
-                stats = curriculum_env.get_curriculum_stats()
+                # Check if it's a phased curriculum wrapper
+                if hasattr(curriculum_env, 'get_phase_stats'):
+                    stats = curriculum_env.get_phase_stats()
+                else:
+                    stats = curriculum_env.get_curriculum_stats()
 
         # Clean up environments after collecting stats
         env.close()
@@ -453,18 +482,36 @@ def train_parallel_curriculum_masked(
 
     # Log final curriculum stats if available
     if stats:
-        print("\n📊 Final Curriculum Stats:")
-        print(f"  Stage reached: {stats['current_stage']}")
-        print(f"  Max track length: {stats['max_track_length']}")
-        print(f"  Total episodes: {stats['total_episodes']}")
-        print(f"  Success rate: {stats['success_rate']:.1%}")
-        print(f"  Stages completed: {len(stats['stages_completed'])}")
+        if 'current_phase' in stats:  # Phased curriculum stats
+            print("\n📊 Final Phased Curriculum Stats:")
+            print(f"  Current phase: {stats['current_phase']}")
+            if stats['current_phase'] == 3 and stats['phase3_stage']:
+                print(f"  Phase 3 stage: {stats['phase3_stage']}")
+            print(f"  Max track length: {stats['current_max_length']}")
+            print(f"  Total episodes: {stats['total_episodes']}")
+            print(f"  Success rate: {stats['success_rate']:.1%}")
+            print(f"  Total loops completed: {stats['total_loops_completed']}")
+            
+            if stats['phases_completed']:
+                print("\n  Phase progression:")
+                for phase in stats['phases_completed']:
+                    if 'phase' in phase:
+                        print(f"    Phase {phase['phase']}: "
+                              f"{phase['success_rate']:.1%} success rate, "
+                              f"{phase.get('episodes', 0)} episodes")
+        else:  # Regular curriculum stats
+            print("\n📊 Final Curriculum Stats:")
+            print(f"  Stage reached: {stats['current_stage']}")
+            print(f"  Max track length: {stats.get('max_track_length', stats.get('current_max_length', 'N/A'))}")
+            print(f"  Total episodes: {stats['total_episodes']}")
+            print(f"  Success rate: {stats['success_rate']:.1%}")
+            print(f"  Stages completed: {len(stats.get('stages_completed', []))}")
 
-        if stats['stages_completed']:
-            print("\n  Stage progression:")
-            for stage in stats['stages_completed']:
-                print(f"    Stage {stage['stage']}: {stage['max_length']} pieces, "
-                      f"{stage['success_rate']:.1%} success rate")
+            if stats.get('stages_completed'):
+                print("\n  Stage progression:")
+                for stage in stats['stages_completed']:
+                    print(f"    Stage {stage['stage']}: {stage['max_length']} pieces, "
+                          f"{stage['success_rate']:.1%} success rate")
 
     return model, env
 
@@ -486,6 +533,8 @@ def main():
                        help="Path to existing MaskablePPO model to continue training")
     parser.add_argument("--adaptive", action="store_true",
                        help="Use adaptive curriculum with dynamic reward scaling")
+    parser.add_argument("--phased", action="store_true",
+                       help="Use phased curriculum focusing on station return first")
     parser.add_argument("--verbose", type=int, default=None,
                        help="Verbosity level: 0=silent, 1=important, 2=detailed (default: auto)")
     args = parser.parse_args()
@@ -550,6 +599,7 @@ def main():
         args.eval_freq,
         args.model_path,
         args.adaptive,
+        args.phased,
         verbose,
         args.eval_episodes,
         args.disable_eval or args.eval_freq <= 0,
