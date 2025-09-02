@@ -51,8 +51,8 @@ class OpenRCT2Env(gym.Env):
         self.min_distance_reached = float('inf')
         self.max_height_reached = 0
         self.unique_positions = set()
-        self.phase_rewards = {'building': 0, 'transition': 0, 'return': 0}
-        self.current_phase = 'building'
+        self.phase_rewards = {'homing': 0, 'expansion': 0, 'final_approach': 0}
+        self.current_phase = 'homing'
         self.episode_rewards = []
         
         self.direction_vectors = [
@@ -138,15 +138,8 @@ class OpenRCT2Env(gym.Env):
         self.episode_rewards.append(reward)
         
         # Track phase-based rewards
-        if self.track_length <= 35:
-            self.current_phase = 'building'
-            self.phase_rewards['building'] += reward
-        elif self.track_length <= 60:
-            self.current_phase = 'transition'
-            self.phase_rewards['transition'] += reward
-        else:
-            self.current_phase = 'return'
-            self.phase_rewards['return'] += reward
+        if self.current_phase in self.phase_rewards:
+            self.phase_rewards[self.current_phase] += reward
 
         # Check for loop completion
         self.loop_completed = self._last_placement_complete
@@ -256,8 +249,8 @@ class OpenRCT2Env(gym.Env):
         self.min_distance_reached = float('inf')
         self.max_height_reached = 0
         self.unique_positions = set()
-        self.phase_rewards = {'building': 0, 'transition': 0, 'return': 0}
-        self.current_phase = 'building'
+        self.phase_rewards = {'homing': 0, 'expansion': 0, 'final_approach': 0}
+        self.current_phase = 'homing'
         self.episode_rewards = []
         
         # Demolish ALL rides to ensure clean state
@@ -340,35 +333,55 @@ class OpenRCT2Env(gym.Env):
                 else:
                     angle_to_goal = 0
                 
-                # Phase-based distance rewards with EARLIER and STRONGER return phase
-                if self.track_length <= 25:
-                    # Building phase - allow exploration, reward height for chain lift
-                    if self.current_position[2] > self.goal_position[2]:
-                        reward += 0.2
-                    # Small reward for building outward initially
-                    if self.last_action not in [31]:
-                        reward += 0.3
-                elif self.track_length <= 35:
-                    # Early transition phase - start gentle guidance back
-                    if distance_delta > 0:  # Moving closer
-                        reward += distance_delta * 0.5
-                    # Reward for turning toward goal
-                    if angle_to_goal < np.pi/2:  # Facing somewhat toward goal
-                        reward += 0.3
-                else:
-                    # Return phase - MUCH stronger pull back to station
-                    if distance_delta > 0:  # Moving closer
-                        reward += distance_delta * 2.0  # Increased from 0.5
-                    else:  # Moving away - stronger penalty
-                        reward -= abs(distance_delta) * 1.0  # Increased from 0.3
+                # Phase-based rewards redesign
+                # Phase 1: Homing (early game, learn to return)
+                if self.track_length <= 30:
+                    self.current_phase = 'homing'
+                    # Strong incentive to get closer, strong penalty for moving away
+                    if distance_delta > 0: # moving closer
+                        reward += distance_delta * 2.5 # Strong reward
+                    else: # moving away
+                        reward -= abs(distance_delta) * 1.5 # Strong penalty
                     
-                    # Direction-based rewards
-                    if angle_to_goal < np.pi/4:  # Facing toward goal (within 45 degrees)
-                        reward += 1.0
-                    elif angle_to_goal < np.pi/2:  # Somewhat toward goal (within 90 degrees)
-                        reward += 0.5
-                    else:  # Facing away from goal
-                        reward -= 0.5
+                    # Directional guidance
+                    if angle_to_goal < np.pi / 4: # 45 degrees
+                        reward += 1.5
+                    elif angle_to_goal < np.pi / 2: # 90 degrees
+                        reward += 0.75
+
+                    # Less penalty for collisions in this phase to encourage exploration of what works
+                    if not success:
+                        reward += 0.1 # offset the -0.2 penalty a bit
+
+                # Phase 2: Expansion (mid-game, build a real coaster)
+                elif self.track_length > 30:
+                    self.current_phase = 'expansion'
+                    # Encourage building longer tracks now that it knows how to get home
+                    reward += 0.2 # reward for each piece
+                    
+                    # Reward height gain
+                    if self.current_position[2] > self.max_height_reached:
+                        reward += 0.3
+                        self.max_height_reached = self.current_position[2]
+
+                    # Still provide a gentle pull home
+                    if distance_delta > 0:
+                        reward += distance_delta * 0.5
+                    else:
+                        reward -= abs(distance_delta) * 0.2
+
+                # Phase 3: Final Approach (close to goal, guide it in)
+                if current_distance < 20:
+                    self.current_phase = 'final_approach'
+                    # Very strong guidance when close
+                    if distance_delta > 0:
+                        reward += distance_delta * 3.0
+                    else:
+                        reward -= abs(distance_delta) * 2.0
+                    
+                    # Strong directional reward
+                    if angle_to_goal < np.pi / 4:
+                        reward += 2.0
                     
                     # Distance checkpoint rewards
                     if current_distance < 50 and self.previous_distance >= 50:
