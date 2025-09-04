@@ -176,6 +176,15 @@ class OpenRCT2Env(gym.Env):
 
         if terminated:
             # Additional completion bonuses are already in _calculate_reward
+            # Place entrance and exit before testing
+            entrance_result = self.api_controller.place_entrance_exit()
+            if entrance_result.get("success"):
+                if self.verbose >= 1:
+                    print("✅ Entrance and exit placed successfully")
+            else:
+                if self.verbose >= 1:
+                    print(f"⚠️ Failed to place entrance/exit: {entrance_result.get('error', 'Unknown error')}")
+            
             # Set ride to testing mode and get ratings
             self.api_controller.set_ride_status(1)  # 1 = Testing
             time.sleep(5)  # Wait for testing to complete
@@ -235,7 +244,13 @@ class OpenRCT2Env(gym.Env):
         # API hardcodes the station start at [61, 66, 14] - we must match this
         self.station_start_position = [61, 66, 14]  # Where the first station piece is (matches API)
         self.current_position = self.station_start_position.copy()
-        self.goal_position = self.station_start_position.copy()  # Track must return to the FIRST station piece
+        # Set goal one tile south of station start to guide proper connection
+        # Agent needs to place a piece at this position to connect to BeginStation
+        self.goal_position = [
+            self.station_start_position[0],     # Same X
+            self.station_start_position[1] - 1,  # Y - 1 (one tile south)
+            self.station_start_position[2]       # Same Z
+        ]
         self.current_direction = 0
         self.track_pieces = []
         self.track_length = 0
@@ -573,7 +588,7 @@ class OpenRCT2Env(gym.Env):
         
         if self.verbose >= 2:
             print(f"Station built. Track starts at {self.station_start_position}, current position: {self.current_position}")
-            print(f"Goal: Return to {self.goal_position} (first station piece)")
+            print(f"Goal: Place track at {self.goal_position} to connect to BeginStation at {self.station_start_position}")
         
         return True
 

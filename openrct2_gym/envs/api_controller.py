@@ -200,3 +200,15 @@ class APIController:
             }
         }
         return self.send_request(req)
+    
+    def place_entrance_exit(self):
+        if self.ride_id is None:
+            return {"success": False, "error": "No ride created"}
+            
+        req = {
+            "endpoint": "placeEntranceExit",
+            "params": {
+                "rideId": self.ride_id
+            }
+        }
+        return self.send_request(req)

@@ -81,6 +81,10 @@ class PhasedCurriculumWrapper(gym.Wrapper):
         # Verbosity
         self.verbose = verbose
         
+        # Exploit prevention: track repetitive actions
+        self.recent_action_positions = deque(maxlen=10)
+        self.repetition_penalty_count = 0
+        
         # Store original reward calculation method
         self._get_base_env()._original_calculate_reward = self._get_base_env()._calculate_reward
         
@@ -126,6 +130,28 @@ class PhasedCurriculumWrapper(gym.Wrapper):
         if success:
             reward += 0.5  # Small reward for valid placement
             
+            # Track action position for repetition detection
+            current_pos_tuple = tuple(base_env.current_position)
+            action_type = 'remove' if base_env.last_action == base_env.action_space.n - 1 else 'place'
+            
+            # Check for repetitive place/remove pattern at same position
+            if len(self.recent_action_positions) >= 4:
+                # Check if we're doing remove-place-remove-place at same position
+                recent = list(self.recent_action_positions)[-4:]
+                if (len(recent) == 4 and 
+                    recent[0] == (current_pos_tuple, 'place') and
+                    recent[1] == (current_pos_tuple, 'remove') and
+                    recent[2] == (current_pos_tuple, 'place') and
+                    action_type == 'remove'):
+                    # Heavy penalty for exploitative pattern
+                    self.repetition_penalty_count += 1
+                    reward -= 10 * self.repetition_penalty_count  # Escalating penalty
+                    if self.verbose >= 1:
+                        print(f"⚠️ Repetitive action detected! Penalty: {-10 * self.repetition_penalty_count}")
+            
+            # Add current action to history
+            self.recent_action_positions.append((current_pos_tuple, action_type))
+            
             # Check if this is a removal action
             if base_env.last_action == base_env.action_space.n - 1:
                 # Small penalty for removal to discourage excessive backtracking
@@ -144,25 +170,35 @@ class PhasedCurriculumWrapper(gym.Wrapper):
                     if distance_delta > 0:
                         reward += distance_delta * 3.0  # Strong multiplier
                         
-                        # Extra bonus for getting very close
-                        if current_distance < 10:
-                            reward += (10 - current_distance) * 2.0
-                        elif current_distance < 20:
-                            reward += (20 - current_distance) * 0.5
+                        # Extra bonus for getting very close - but only if it's a NEW minimum
+                        if not hasattr(base_env, 'min_distance_reached'):
+                            base_env.min_distance_reached = float('inf')
+                        
+                        if current_distance < base_env.min_distance_reached:
+                            if current_distance < 10:
+                                reward += (10 - current_distance) * 2.0
+                            elif current_distance < 20:
+                                reward += (20 - current_distance) * 0.5
                     else:
                         # Penalty for moving away
                         reward += distance_delta * 0.5  # Gentle penalty
                 
                 # Distance checkpoint rewards
-                if current_distance < base_env.min_distance_achieved:
-                    base_env.min_distance_achieved = current_distance
-                    if current_distance < 50 and base_env.min_distance_achieved >= 50:
+                if not hasattr(base_env, 'min_distance_reached'):
+                    base_env.min_distance_reached = float('inf')
+                    
+                if current_distance < base_env.min_distance_reached:
+                    prev_min = base_env.min_distance_reached
+                    base_env.min_distance_reached = current_distance
+                    
+                    # Checkpoint rewards for crossing distance thresholds
+                    if current_distance < 50 and prev_min >= 50:
                         reward += 10
-                    if current_distance < 30 and base_env.min_distance_achieved >= 30:
+                    if current_distance < 30 and prev_min >= 30:
                         reward += 15
-                    if current_distance < 20 and base_env.min_distance_achieved >= 20:
+                    if current_distance < 20 and prev_min >= 20:
                         reward += 20
-                    if current_distance < 10 and base_env.min_distance_achieved >= 10:
+                    if current_distance < 10 and prev_min >= 10:
                         reward += 30
                 
                 # HUGE reward for completing the loop
@@ -191,6 +227,23 @@ class PhasedCurriculumWrapper(gym.Wrapper):
         if success:
             reward += 0.5
             
+            # Track action position for repetition detection
+            current_pos_tuple = tuple(base_env.current_position)
+            action_type = 'remove' if base_env.last_action == base_env.action_space.n - 1 else 'place'
+            
+            # Check for repetitive pattern
+            if len(self.recent_action_positions) >= 4:
+                recent = list(self.recent_action_positions)[-4:]
+                if (len(recent) == 4 and 
+                    recent[0] == (current_pos_tuple, 'place') and
+                    recent[1] == (current_pos_tuple, 'remove') and
+                    recent[2] == (current_pos_tuple, 'place') and
+                    action_type == 'remove'):
+                    self.repetition_penalty_count += 1
+                    reward -= 8 * self.repetition_penalty_count  # Slightly less harsh in phase 2
+            
+            self.recent_action_positions.append((current_pos_tuple, action_type))
+            
             if base_env.last_action == base_env.action_space.n - 1:
                 reward -= 1
             else:
@@ -217,13 +270,19 @@ class PhasedCurriculumWrapper(gym.Wrapper):
                     reward += 0.5
                 
                 # Distance checkpoints
-                if current_distance < base_env.min_distance_achieved:
-                    base_env.min_distance_achieved = current_distance
-                    if current_distance < 30:
+                if not hasattr(base_env, 'min_distance_reached'):
+                    base_env.min_distance_reached = float('inf')
+                    
+                if current_distance < base_env.min_distance_reached:
+                    prev_min = base_env.min_distance_reached
+                    base_env.min_distance_reached = current_distance
+                    
+                    # Checkpoint rewards for first time reaching thresholds
+                    if current_distance < 30 and prev_min >= 30:
                         reward += 10
-                    if current_distance < 20:
+                    if current_distance < 20 and prev_min >= 20:
                         reward += 15
-                    if current_distance < 10:
+                    if current_distance < 10 and prev_min >= 10:
                         reward += 20
                 
                 # Loop completion (still important)
@@ -337,6 +396,10 @@ class PhasedCurriculumWrapper(gym.Wrapper):
         """Reset environment and check for phase advancement"""
         # Check phase advancement before reset
         self._check_phase_advancement()
+        
+        # Reset repetition tracking
+        self.recent_action_positions.clear()
+        self.repetition_penalty_count = 0
         
         # Reset the environment
         obs, info = self.env.reset(**kwargs)
