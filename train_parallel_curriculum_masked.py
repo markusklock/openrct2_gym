@@ -28,9 +28,10 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
     Tensorboard callback that tracks both curriculum and masking metrics
     across multiple parallel environments
     """
-    def __init__(self, n_envs=1, verbose=0):
+    def __init__(self, n_envs=1, verbose=0, training_verbose=0):
         super().__init__(verbose)
         self.n_envs = n_envs
+        self.training_verbose = training_verbose  # Store the training verbosity level
         self.episode_counts = [0] * n_envs
         self.loop_completed_counts = [0] * n_envs
         self.total_episode_count = 0
@@ -95,6 +96,27 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
                 else:
                     self.logger.record(f'success/env_{env_idx}_loop_completed', 0.0)
                 
+                # Print episode details in verbose mode
+                if self.training_verbose >= 1:
+                    # Get episode metrics from info dict
+                    info = self.locals['infos'][env_idx]
+                    episode_metrics = info.get('episode_metrics', {})
+                    
+                    # Determine if truncated (max steps/length) or terminated (loop completed)
+                    termination_type = "completed" if loop_completed else "truncated"
+                    
+                    # Get final reward (from the episode return)
+                    final_reward = self.locals.get('episode_returns', [0] * self.n_envs)[env_idx] if 'episode_returns' in self.locals else 0
+                    
+                    # Get track length from episode metrics
+                    track_length = episode_metrics.get('track_length', 0)
+                    
+                    print(f"Episode {self.episode_counts[env_idx]} (Env {env_idx}): "
+                          f"Reward={final_reward:.1f}, "
+                          f"Track={track_length} pieces, "
+                          f"Loop={'✓' if loop_completed else '✗'}, "
+                          f"Status={termination_type}")
+                
                 # Log overall success rate
                 if self.total_episode_count > 0:
                     overall_success_rate = self.total_loop_completed / self.total_episode_count
@@ -147,28 +169,46 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
             overall_success_rate = self.total_loop_completed / self.total_episode_count
             episodes_per_second = self.total_episode_count / elapsed_time if elapsed_time > 0 else 0
             
+            # Calculate dynamic dashboard width based on number of environments
+            # Minimum 58, but expand if needed for environment status
+            env_status_str_len = 16 + (self.n_envs * 2) + 2  # "Environments: [" + emojis + spaces + "]"
+            dashboard_width = max(58, env_status_str_len + 2)  # +2 for padding
+            
             # Create a clean dashboard display
-            print("\n" + "┌" + "─" * 58 + "┐")
-            print(f"│ 🎮 Parallel Training Dashboard ({self.n_envs} environments)".ljust(59) + "│")
-            print("├" + "─" * 58 + "┤")
+            print("\n" + "┌" + "─" * dashboard_width + "┐")
+            header = f"│ 🎮 Parallel Training Dashboard ({self.n_envs} environments)"
+            print(header.ljust(dashboard_width + 1) + "│")
+            print("├" + "─" * dashboard_width + "┤")
             
             # Environment status indicators
             env_status = []
+            status_counts = {"🟢": 0, "🟡": 0, "🔴": 0, "⚪": 0}
             for i in range(self.n_envs):
                 if self.episode_counts[i] > 0:
                     rate = self.loop_completed_counts[i] / self.episode_counts[i]
                     if rate >= 0.3:
                         env_status.append("🟢")  # Good performance
+                        status_counts["🟢"] += 1
                     elif rate >= 0.1:
                         env_status.append("🟡")  # Learning
+                        status_counts["🟡"] += 1
                     else:
                         env_status.append("🔴")  # Struggling
+                        status_counts["🔴"] += 1
                 else:
                     env_status.append("⚪")  # No episodes yet
+                    status_counts["⚪"] += 1
             
-            print(f"│ Environments: [{' '.join(env_status)}]".ljust(59) + "│")
-            print(f"│ Episodes: {self.total_episode_count:,} | Success: {overall_success_rate:.1%} ({self.total_loop_completed}/{self.total_episode_count})".ljust(59) + "│")
-            print(f"│ Throughput: {steps_per_second:.1f} steps/s | {episodes_per_second:.2f} eps/s".ljust(59) + "│")
+            # Display environment status based on count
+            if self.n_envs <= 20:
+                # Show individual status for up to 20 environments
+                print(f"│ Environments: [{' '.join(env_status)}]".ljust(dashboard_width + 1) + "│")
+            else:
+                # Show summary for many environments
+                summary = f"🟢×{status_counts['🟢']} 🟡×{status_counts['🟡']} 🔴×{status_counts['🔴']} ⚪×{status_counts['⚪']}"
+                print(f"│ Environments ({self.n_envs}): {summary}".ljust(dashboard_width + 1) + "│")
+            print(f"│ Episodes: {self.total_episode_count:,} | Success: {overall_success_rate:.1%} ({self.total_loop_completed}/{self.total_episode_count})".ljust(dashboard_width + 1) + "│")
+            print(f"│ Throughput: {steps_per_second:.1f} steps/s | {episodes_per_second:.2f} eps/s".ljust(dashboard_width + 1) + "│")
             
             # Get curriculum info from first environment if available
             if hasattr(env, 'envs') and len(env.envs) > 0:
@@ -176,22 +216,35 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
                 temp_env = wrapped_env
                 while temp_env is not None:
                     if hasattr(temp_env, 'current_stage') and hasattr(temp_env, 'current_max_length'):
-                        print(f"│ Curriculum: Stage {temp_env.current_stage} | Max Length: {temp_env.current_max_length}".ljust(59) + "│")
+                        print(f"│ Curriculum: Stage {temp_env.current_stage} | Max Length: {temp_env.current_max_length}".ljust(dashboard_width + 1) + "│")
                         break
                     if hasattr(temp_env, 'env'):
                         temp_env = temp_env.env
                     else:
                         break
             
-            print("└" + "─" * 58 + "┘")
+            print("└" + "─" * dashboard_width + "┘")
             
             # Show detailed per-environment stats every 50 episodes
             if self.total_episode_count % (50 * self.n_envs) == 0:
                 print("\n  Per-environment performance:")
-                for i in range(min(4, self.n_envs)):  # Show up to 4 envs
-                    if self.episode_counts[i] > 0:
-                        rate = self.loop_completed_counts[i] / self.episode_counts[i]
-                        print(f"    Env {i}: {rate:.1%} success ({self.loop_completed_counts[i]}/{self.episode_counts[i]} episodes)")
+                # Show all environments, but format differently for many environments
+                if self.n_envs <= 8:
+                    # Show detailed stats for up to 8 environments
+                    for i in range(self.n_envs):
+                        if self.episode_counts[i] > 0:
+                            rate = self.loop_completed_counts[i] / self.episode_counts[i]
+                            print(f"    Env {i}: {rate:.1%} success ({self.loop_completed_counts[i]}/{self.episode_counts[i]} episodes)")
+                else:
+                    # For many environments, show in a more compact format
+                    print("    ", end="")
+                    for i in range(self.n_envs):
+                        if self.episode_counts[i] > 0:
+                            rate = self.loop_completed_counts[i] / self.episode_counts[i]
+                            print(f"E{i}:{rate:.0%} ", end="")
+                            if (i + 1) % 8 == 0 and i < self.n_envs - 1:
+                                print("\n    ", end="")
+                    print()  # Final newline
         
         return True
 
@@ -236,7 +289,7 @@ def create_curriculum_masked_env(port: int, use_adaptive: bool = False, use_phas
             phase1_success_threshold=0.5,  # 50% success to advance from phase 1
             phase2_success_threshold=0.4,  # 40% success to advance from phase 2
             window_size=50,
-            phase1_max_length=30,  # Short tracks for learning to return
+            phase1_max_length=40,  # More room for exploration while learning to return
             phase2_max_length=60,  # Medium tracks
             phase3_initial_length=60,
             phase3_target_length=120,
@@ -306,7 +359,7 @@ def train_parallel_curriculum_masked(
     print(f"Ports: {', '.join(map(str, ports))}")
     if use_phased:
         print("Using PHASED curriculum learning:")
-        print("  Phase 1: Learn to return to station (30 pieces max)")
+        print("  Phase 1: Learn to return to station (40 pieces max)")
         print("  Phase 2: Explore while returning (60 pieces max)")
         print("  Phase 3: Build quality tracks (60-120 pieces)")
     elif use_adaptive:
@@ -386,7 +439,7 @@ def train_parallel_curriculum_masked(
         name_prefix=f"parallel_curriculum_masked_{n_envs}envs"
     )
     
-    tensorboard_callback = ParallelCurriculumMaskableCallback(n_envs=n_envs)
+    tensorboard_callback = ParallelCurriculumMaskableCallback(n_envs=n_envs, training_verbose=verbose)
 
     # Container for final curriculum statistics
     stats = None
@@ -562,7 +615,7 @@ def main():
     for port in ports:
         try:
             from openrct2_gym.envs.api_controller import APIController
-            controller = APIController('localhost', port)
+            controller = APIController('localhost', port, verbose=0)  # Silent for connection check
             if controller.connect():
                 available_ports.append(port)
                 print(f"  ✅ Port {port}: Available")
@@ -581,6 +634,22 @@ def main():
     if len(available_ports) < len(ports):
         print(f"\n⚠️ Warning: Only {len(available_ports)} out of {len(ports)} ports are available")
         print(f"Continuing with available ports: {', '.join(map(str, available_ports))}")
+    
+    # Clean up any leftover rides from previous training sessions
+    print("\n🧹 Cleaning up leftover rides from previous sessions...")
+    for port in available_ports:
+        try:
+            controller = APIController('localhost', port, verbose=0)  # Silent for connection check
+            if controller.connect():
+                result = controller.delete_all_rides()
+                if result.get("success"):
+                    print(f"  ✅ Port {port}: Cleaned up all rides")
+                else:
+                    print(f"  ⚠️ Port {port}: Cleanup failed - {result.get('error', 'Unknown error')}")
+                controller.disconnect()
+        except Exception as e:
+            print(f"  ⚠️ Port {port}: Error during cleanup - {e}")
+    print("Cleanup complete!\n")
     
     # Auto-determine verbosity if not specified
     if args.verbose is None:

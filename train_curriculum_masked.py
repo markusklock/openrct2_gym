@@ -143,10 +143,10 @@ def mask_fn(env: gym.Env) -> np.ndarray:
     print("Warning: Could not find valid_action_mask method, allowing all actions")
     return np.ones(env.action_space.n, dtype=bool)
 
-def create_curriculum_masked_env(use_adaptive=False, include_curriculum=True):
+def create_curriculum_masked_env(use_adaptive=False, include_curriculum=True, port=8080):
     """Create environment with optional curriculum wrapper and action masking"""
     # Base environment
-    base_env = gym.make('OpenRCT2-v0')
+    base_env = gym.make('OpenRCT2-v0', port=port)
 
     # Add OpenRCT2Wrapper to expose valid_action_mask method
     # This is crucial for the mask_fn to work
@@ -187,7 +187,7 @@ def create_curriculum_masked_env(use_adaptive=False, include_curriculum=True):
     return env
 
 def train_curriculum_masked(total_timesteps, checkpoint_freq, eval_freq, 
-                           model_path=None, use_adaptive=False):
+                           model_path=None, use_adaptive=False, port=8080):
     """Train agent with curriculum learning AND action masking"""
     
     print("="*60)
@@ -199,11 +199,11 @@ def train_curriculum_masked(total_timesteps, checkpoint_freq, eval_freq,
     print("="*60 + "\n")
     
     # Create environments
-    env_fn = lambda: create_curriculum_masked_env(use_adaptive, include_curriculum=True)
+    env_fn = lambda: create_curriculum_masked_env(use_adaptive, include_curriculum=True, port=port)
     env = DummyVecEnv([env_fn])
 
     # Evaluation environment without curriculum to avoid affecting statistics
-    eval_env_fn = lambda: create_curriculum_masked_env(use_adaptive, include_curriculum=False)
+    eval_env_fn = lambda: create_curriculum_masked_env(use_adaptive, include_curriculum=False, port=port)
     eval_env = DummyVecEnv([eval_env_fn])
     
     # Create or load model
@@ -328,6 +328,8 @@ def main():
                        help="Path to existing MaskablePPO model to continue training")
     parser.add_argument("--adaptive", action="store_true",
                        help="Use adaptive curriculum with dynamic reward scaling")
+    parser.add_argument("--port", type=int, default=8080,
+                       help="Port for OpenRCT2 API server (default: 8080)")
     args = parser.parse_args()
     
     print("\n" + "="*60)
@@ -339,12 +341,44 @@ def main():
     print("  • All reward improvements for better navigation")
     print("="*60 + "\n")
     
+    # Check OpenRCT2 API server availability and clean up leftover rides
+    print("🔍 Checking OpenRCT2 API server availability...")
+    from openrct2_gym.envs.api_controller import APIController
+    port = args.port
+    
+    try:
+        controller = APIController('localhost', port, verbose=0)  # Silent for connection check
+        if controller.connect():
+            print(f"  ✅ Port {port}: Available")
+            
+            # Clean up any leftover rides from previous training sessions
+            print("\n🧹 Cleaning up leftover rides from previous sessions...")
+            result = controller.delete_all_rides()
+            if result.get("success"):
+                print(f"  ✅ Cleaned up all rides on port {port}")
+            else:
+                print(f"  ⚠️ Cleanup failed - {result.get('error', 'Unknown error')}")
+            
+            controller.disconnect()
+            print("Ready to start training!\n")
+        else:
+            print(f"  ❌ Port {port}: Cannot connect")
+            print("\n❌ Error: Cannot connect to OpenRCT2 API server")
+            print(f"Please ensure OpenRCT2 is running with the API plugin on port {port}")
+            return
+    except Exception as e:
+        print(f"  ❌ Port {port}: Error - {e}")
+        print("\n❌ Error: Failed to connect to OpenRCT2 API server")
+        print(f"Please ensure OpenRCT2 is running with the API plugin on port {port}")
+        return
+    
     model, env = train_curriculum_masked(
         args.timesteps,
         args.checkpoint_freq,
         args.eval_freq,
         args.model_path,
-        args.adaptive
+        args.adaptive,
+        port
     )
     
     # Final evaluation using maskable evaluation

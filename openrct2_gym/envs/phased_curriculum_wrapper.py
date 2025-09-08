@@ -25,7 +25,7 @@ class PhasedCurriculumWrapper(gym.Wrapper):
                  phase2_success_threshold=0.4,  # 40% success rate to advance from phase 2
                  window_size=100,
                  # Track length curriculum
-                 phase1_max_length=30,  # Short tracks for learning to return
+                 phase1_max_length=40,  # More room for exploration while learning to return
                  phase2_max_length=60,  # Medium tracks
                  phase3_initial_length=60,
                  phase3_target_length=120,
@@ -39,7 +39,7 @@ class PhasedCurriculumWrapper(gym.Wrapper):
             phase1_success_threshold: Success rate needed to advance from phase 1
             phase2_success_threshold: Success rate needed to advance from phase 2
             window_size: Number of episodes to consider for success rate
-            phase1_max_length: Maximum track length in phase 1
+            phase1_max_length: Maximum track length in phase 1 (default: 40)
             phase2_max_length: Maximum track length in phase 2
             phase3_initial_length: Starting max length for phase 3
             phase3_target_length: Final maximum track length in phase 3
@@ -106,15 +106,21 @@ class PhasedCurriculumWrapper(gym.Wrapper):
             base_env.max_track_length = self.phase1_max_length
             # Override reward calculation for phase 1
             base_env._calculate_reward = self._phase1_reward
+            # Skip ride testing in phase 1 - just learning to build circuits
+            base_env.skip_ride_testing = True
         elif self.current_phase == 2:
             base_env.max_track_length = self.phase2_max_length
             base_env._calculate_reward = self._phase2_reward
+            # Skip ride testing in phase 2 - still learning basic track building
+            base_env.skip_ride_testing = True
         else:  # Phase 3
             base_env.max_track_length = self.phase3_current_length
             base_env._calculate_reward = self._phase3_reward
+            # Enable ride testing in phase 3 - now building proper coasters
+            base_env.skip_ride_testing = False
         
         if self.verbose >= 1:
-            print(f"📚 Phase {self.current_phase} settings applied: max_length={base_env.max_track_length}")
+            print(f"📚 Phase {self.current_phase} settings applied: max_length={base_env.max_track_length}, skip_testing={base_env.skip_ride_testing}")
     
     def _phase1_reward(self, success):
         """

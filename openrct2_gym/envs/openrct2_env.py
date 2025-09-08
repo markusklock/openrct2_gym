@@ -10,8 +10,9 @@ class OpenRCT2Env(gym.Env):
         super(OpenRCT2Env, self).__init__()
         self.render_mode = render_mode
         self.verbose = verbose  # 0=silent, 1=important only, 2=detailed
-        self.api_controller = APIController(host, port)
+        self.api_controller = APIController(host, port, verbose)
         self.track_builder = APITrackBuilder(self.api_controller)
+        self.skip_ride_testing = False  # Can be set by wrappers to skip entrance/exit and testing
         
         # Connect to API server
         if not self.api_controller.connect():
@@ -176,20 +177,27 @@ class OpenRCT2Env(gym.Env):
 
         if terminated:
             # Additional completion bonuses are already in _calculate_reward
-            # Place entrance and exit before testing
-            entrance_result = self.api_controller.place_entrance_exit()
-            if entrance_result.get("success"):
-                if self.verbose >= 1:
-                    print("✅ Entrance and exit placed successfully")
+            # Only place entrance/exit and test ride if not in early learning phases
+            if not self.skip_ride_testing:
+                # Place entrance and exit before testing
+                entrance_result = self.api_controller.place_entrance_exit()
+                if entrance_result.get("success"):
+                    if self.verbose >= 1:
+                        print("✅ Entrance and exit placed successfully")
+                else:
+                    if self.verbose >= 1:
+                        print(f"⚠️ Failed to place entrance/exit: {entrance_result.get('error', 'Unknown error')}")
+                
+                # Set ride to testing mode and get ratings
+                self.api_controller.set_ride_status(1)  # 1 = Testing
+                time.sleep(5)  # Wait for testing to complete
+                ride_rating = self.evaluate_ride()
+                info['ride_rating'] = ride_rating
             else:
+                # Skip testing in early phases - agent is just learning to build circuits
                 if self.verbose >= 1:
-                    print(f"⚠️ Failed to place entrance/exit: {entrance_result.get('error', 'Unknown error')}")
-            
-            # Set ride to testing mode and get ratings
-            self.api_controller.set_ride_status(1)  # 1 = Testing
-            time.sleep(5)  # Wait for testing to complete
-            ride_rating = self.evaluate_ride()
-            info['ride_rating'] = ride_rating
+                    print("🎯 Loop completed! (Skipping ride testing in learning phase)")
+                info['ride_rating'] = {"excitement": 0, "intensity": 0, "nausea": 0}
         elif truncated:
             # Partial credit for getting close even if not completed
             final_distance = self._calculate_distance_to_start()[0]
@@ -244,11 +252,11 @@ class OpenRCT2Env(gym.Env):
         # API hardcodes the station start at [61, 66, 14] - we must match this
         self.station_start_position = [61, 66, 14]  # Where the first station piece is (matches API)
         self.current_position = self.station_start_position.copy()
-        # Set goal one tile south of station start to guide proper connection
+        # Set goal one tile east of station start to guide proper connection
         # Agent needs to place a piece at this position to connect to BeginStation
         self.goal_position = [
-            self.station_start_position[0],     # Same X
-            self.station_start_position[1] - 1,  # Y - 1 (one tile south)
+            self.station_start_position[0] + 1,     # X + 1 (one tile east)
+            self.station_start_position[1],      # Same Y 
             self.station_start_position[2]       # Same Z
         ]
         self.current_direction = 0
@@ -278,7 +286,6 @@ class OpenRCT2Env(gym.Env):
         # Demolish ALL rides to ensure clean state
         # This is more reliable than just demolishing our tracked ride
         self.api_controller.delete_all_rides()
-        time.sleep(0.5)  # Small delay to ensure cleanup completes
         
         # Create new ride
         ride_id = self.api_controller.create_ride()
@@ -345,16 +352,6 @@ class OpenRCT2Env(gym.Env):
             if self.previous_distance is not None:
                 distance_delta = self.previous_distance - current_distance
                 
-                # Calculate angle to goal for direction rewards
-                goal_vector = np.array(self.goal_position[:2]) - np.array(self.current_position[:2])
-                goal_distance_2d = np.linalg.norm(goal_vector)
-                if goal_distance_2d > 0:
-                    goal_direction = goal_vector / goal_distance_2d
-                    current_dir_vector = np.array(self.direction_vectors[self.current_direction])
-                    angle_to_goal = np.arccos(np.clip(np.dot(current_dir_vector, goal_direction), -1, 1))
-                else:
-                    angle_to_goal = 0
-                
                 # Phase-based distance rewards with EARLIER and STRONGER return phase
                 if self.track_length <= 25:
                     # Building phase - allow exploration, reward height for chain lift
@@ -367,23 +364,12 @@ class OpenRCT2Env(gym.Env):
                     # Early transition phase - start gentle guidance back
                     if distance_delta > 0:  # Moving closer
                         reward += distance_delta * 0.5
-                    # Reward for turning toward goal
-                    if angle_to_goal < np.pi/2:  # Facing somewhat toward goal
-                        reward += 0.3
                 else:
                     # Return phase - MUCH stronger pull back to station
                     if distance_delta > 0:  # Moving closer
                         reward += distance_delta * 2.0  # Increased from 0.5
                     else:  # Moving away - stronger penalty
                         reward -= abs(distance_delta) * 1.0  # Increased from 0.3
-                    
-                    # Direction-based rewards
-                    if angle_to_goal < np.pi/4:  # Facing toward goal (within 45 degrees)
-                        reward += 1.0
-                    elif angle_to_goal < np.pi/2:  # Somewhat toward goal (within 90 degrees)
-                        reward += 0.5
-                    else:  # Facing away from goal
-                        reward -= 0.5
                     
                     # Distance checkpoint rewards
                     if current_distance < 50 and self.previous_distance >= 50:
@@ -428,6 +414,12 @@ class OpenRCT2Env(gym.Env):
             # Reward for continuous forward progress (no recent removes)
             if self.last_action not in [31] and 31 not in list(self.action_history)[-3:]:
                 reward += 0.2  # Bonus for sustained building
+                
+            # Reset remove_count after sustained building (5+ pieces without removes)
+            # This allows recovery from exploration mistakes
+            if len(self.action_history) >= 5 and 31 not in list(self.action_history)[-5:]:
+                if self.remove_count > 0:
+                    self.remove_count = 0  # Reset penalty accumulation
             
             # Adjusted height penalty (only after building phase)
             if self.track_length > 35 and self.current_position[2] > 25:
@@ -580,7 +572,7 @@ class OpenRCT2Env(gym.Env):
             
             # Update track state
             self.track_pieces.append(0)  # Station pieces as action 0
-            self.track_length += 1
+            # Don't increment track_length for station pieces - they're not part of the actual track
         
         # Update current position to end of station
         self.current_position = [current_x, current_y, current_z]

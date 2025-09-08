@@ -4,9 +4,10 @@ import random
 import time
 
 class APIController:
-    def __init__(self, host="localhost", port=8080):
+    def __init__(self, host="localhost", port=8080, verbose=1):
         self.host = host
         self.port = port
+        self.verbose = verbose  # 0=silent, 1=important only, 2=detailed
         self.sock = None
         self.ride_id = None
         self.station_length = 6
@@ -15,7 +16,8 @@ class APIController:
         try:
             self.sock = socket.create_connection((self.host, self.port), timeout=5.0)
             self.sock.settimeout(2.0)  # Set timeout for all socket operations
-            print(f"Connected to OpenRCT2 API server at {self.host}:{self.port}")
+            if self.verbose >= 1:  # Print for important or detailed mode
+                print(f"Connected to OpenRCT2 API server at {self.host}:{self.port}")
             return True
         except Exception as e:
             print(f"Failed to connect to API server at {self.host}:{self.port}: {e}")
@@ -62,7 +64,8 @@ class APIController:
         resp = self.send_request(req)
         if resp.get("success"):
             self.ride_id = resp["payload"]["rideId"]
-            print(f"Created ride with rideId: {self.ride_id}")
+            if self.verbose >= 2:  # Only print in detailed mode
+                print(f"Created ride with rideId: {self.ride_id}")
             return self.ride_id
         else:
             print(f"createRide failed: {resp}")
