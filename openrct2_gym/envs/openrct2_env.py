@@ -24,6 +24,7 @@ class OpenRCT2Env(gym.Env):
         # Track collision and backtracking
         self.collision_count = 0
         self.consecutive_failures = 0
+        self.steps_since_collision = 0  # Track steps since last collision for remove masking
         self.auto_backtrack_enabled = True
         self.max_consecutive_failures = 3
 
@@ -85,9 +86,10 @@ class OpenRCT2Env(gym.Env):
         success, new_position, new_direction = self.track_builder.take_action(action, self.current_position, self.current_direction)
         
         # Track collisions and failures
-        if not success and action != 18:  # Failed to place a piece (not a remove action)
+        if not success and action != 31:  # Failed to place a piece (not a remove action)
             self.consecutive_failures += 1
             self.collision_count += 1
+            self.steps_since_collision = 0  # Reset collision window
             
             # Auto-backtrack if enabled and too many consecutive failures
             if self.auto_backtrack_enabled and self.consecutive_failures >= self.max_consecutive_failures:
@@ -101,6 +103,9 @@ class OpenRCT2Env(gym.Env):
                     self.consecutive_failures = 0
         else:
             self.consecutive_failures = 0
+            # Increment steps since collision on successful actions
+            if success:
+                self.steps_since_collision += 1
         
         # Check if the last placement completed the circuit
         if success and len(self.track_builder.history) > 0:
@@ -230,9 +235,12 @@ class OpenRCT2Env(gym.Env):
         # Get valid actions from the API
         valid_actions = self.track_builder.get_valid_actions()
         
-        # Always allow remove action if there are pieces to remove
+        # Only allow remove action when needed (recent collision or stuck)
+        # This prevents unnecessary remove-loops
         if len(self.track_builder.history) > 0:
-            valid_actions.append(31)
+            # Allow remove if: just had a collision OR within 3 steps of collision
+            if self.consecutive_failures > 0 or self.steps_since_collision <= 3:
+                valid_actions.append(31)
         
         # Set valid actions to True
         for action in valid_actions:
@@ -271,6 +279,7 @@ class OpenRCT2Env(gym.Env):
         self._last_placement_complete = False
         self.collision_count = 0
         self.consecutive_failures = 0
+        self.steps_since_collision = 0
         self.previous_distance = None
         self.position_history = deque(maxlen=5)
         self.chain_lift_positions = set()
@@ -367,9 +376,8 @@ class OpenRCT2Env(gym.Env):
                 else:
                     # Return phase - MUCH stronger pull back to station
                     if distance_delta > 0:  # Moving closer
-                        reward += distance_delta * 2.0  # Increased from 0.5
-                    else:  # Moving away - stronger penalty
-                        reward -= abs(distance_delta) * 1.0  # Increased from 0.3
+                        reward += distance_delta * 2.0  # Strong reward for progress
+                    # No penalty for moving away - let the agent explore
                     
                     # Distance checkpoint rewards
                     if current_distance < 50 and self.previous_distance >= 50:
@@ -381,21 +389,18 @@ class OpenRCT2Env(gym.Env):
                     if current_distance < 10 and self.previous_distance >= 10:
                         reward += 20  # Crossed 10-unit threshold
                     
-                    # Escalating proximity bonuses
-                    if current_distance < 40:
-                        reward += (40 - current_distance) * 0.3
-                    if current_distance < 20:
-                        reward += (20 - current_distance) * 0.5
-                    if current_distance < 10:
-                        reward += (10 - current_distance) * 1.0
-                    if current_distance < 5:
-                        reward += (5 - current_distance) * 2.0
-            
-            # Penalty for going too far (soft boundary)
-            if current_distance > 60:
-                reward -= (current_distance - 60) * 0.2
-            if current_distance > 80:
-                reward -= (current_distance - 80) * 0.5  # Stronger penalty for extreme distance
+                    # Escalating proximity bonuses - only from valid approach directions
+                    # Goal is at X+1 from station, so we need X >= goal_X to approach from the correct side
+                    if self.current_position[0] >= self.goal_position[0]:
+                        # Agent is approaching from east/correct side - give proximity bonuses
+                        if current_distance < 40:
+                            reward += (40 - current_distance) * 0.3
+                        if current_distance < 20:
+                            reward += (20 - current_distance) * 0.5
+                        if current_distance < 10:
+                            reward += (10 - current_distance) * 1.0
+                        if current_distance < 5:
+                            reward += (5 - current_distance) * 2.0
             
             # Track length milestone rewards
             if self.track_length == 30:
