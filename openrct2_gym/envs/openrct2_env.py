@@ -133,6 +133,15 @@ class OpenRCT2Env(gym.Env):
         
         self.last_action = action
         self.action_history.append(action)  # Track action history
+        
+        # Check for loop completion BEFORE calculating reward
+        self.loop_completed = self._last_placement_complete
+        if self.loop_completed:
+            if self.verbose >= 1:
+                print(f"Loop has been completed, great success!")
+        terminated = self.loop_completed
+        
+        # Now calculate reward (with correct loop_completed status)
         observation = self._get_observation()
         reward = self._calculate_reward(success)
         
@@ -144,22 +153,15 @@ class OpenRCT2Env(gym.Env):
         self.episode_rewards.append(reward)
         
         # Track phase-based rewards
-        if self.track_length <= 35:
+        if self.track_length <= 25:
             self.current_phase = 'building'
             self.phase_rewards['building'] += reward
-        elif self.track_length <= 60:
+        elif self.track_length <= 40:
             self.current_phase = 'transition'
             self.phase_rewards['transition'] += reward
         else:
             self.current_phase = 'return'
             self.phase_rewards['return'] += reward
-
-        # Check for loop completion
-        self.loop_completed = self._last_placement_complete
-        if self.loop_completed:
-            if self.verbose >= 1:
-                print(f"Loop has been completed, great success!")
-        terminated = self.loop_completed
         
         # Check if episode was truncated
         truncated = self._is_trunkated()
@@ -349,7 +351,7 @@ class OpenRCT2Env(gym.Env):
 
             # Big reward for completing the loop
             if self.loop_completed:
-                reward += 100
+                reward += 250
                 # Length bonus for longer completed tracks
                 if self.track_length > 50:
                     reward += (self.track_length - 50) * 0.5
@@ -369,8 +371,8 @@ class OpenRCT2Env(gym.Env):
                     # Small reward for building outward initially
                     if self.last_action not in [31]:
                         reward += 0.3
-                elif self.track_length <= 35:
-                    # Early transition phase - start gentle guidance back
+                elif self.track_length <= 40:
+                    # Transition phase - start gentle guidance back
                     if distance_delta > 0:  # Moving closer
                         reward += distance_delta * 0.5
                 else:
@@ -380,14 +382,14 @@ class OpenRCT2Env(gym.Env):
                     # No penalty for moving away - let the agent explore
                     
                     # Distance checkpoint rewards
-                    if current_distance < 50 and self.previous_distance >= 50:
-                        reward += 5  # Crossed 50-unit threshold
-                    if current_distance < 30 and self.previous_distance >= 30:
-                        reward += 10  # Crossed 30-unit threshold
-                    if current_distance < 20 and self.previous_distance >= 20:
-                        reward += 15  # Crossed 20-unit threshold
-                    if current_distance < 10 and self.previous_distance >= 10:
-                        reward += 20  # Crossed 10-unit threshold
+                        #if current_distance < 50 and self.previous_distance >= 50:
+                        #    reward += 5  # Crossed 50-unit threshold
+                        #if current_distance < 30 and self.previous_distance >= 30:
+                        #    reward += 10  # Crossed 30-unit threshold
+                        #if current_distance < 20 and self.previous_distance >= 20:
+                        #    reward += 15  # Crossed 20-unit threshold
+                        #if current_distance < 10 and self.previous_distance >= 10:
+                        #    reward += 20  # Crossed 10-unit threshold
                     
                     # Escalating proximity bonuses - only from valid approach directions
                     # Goal is at X+1 from station, so we need X >= goal_X to approach from the correct side
@@ -426,8 +428,8 @@ class OpenRCT2Env(gym.Env):
                 if self.remove_count > 0:
                     self.remove_count = 0  # Reset penalty accumulation
             
-            # Adjusted height penalty (only after building phase)
-            if self.track_length > 35 and self.current_position[2] > 25:
+            # Adjusted height penalty (only after transition phase)
+            if self.track_length > 40 and self.current_position[2] > 25:
                 reward -= 0.2
                 
         else:

@@ -105,8 +105,8 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
                     # Determine if truncated (max steps/length) or terminated (loop completed)
                     termination_type = "completed" if loop_completed else "truncated"
                     
-                    # Get final reward (from the episode return)
-                    final_reward = self.locals.get('episode_returns', [0] * self.n_envs)[env_idx] if 'episode_returns' in self.locals else 0
+                    # Get final reward from the Monitor wrapper's episode info
+                    final_reward = info.get('episode', {}).get('r', 0)
                     
                     # Get track length from episode metrics
                     track_length = episode_metrics.get('track_length', 0)
