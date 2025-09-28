@@ -122,7 +122,7 @@ class PhasedCurriculumWrapper(gym.Wrapper):
         if self.verbose >= 1:
             print(f"📚 Phase {self.current_phase} settings applied: max_length={base_env.max_track_length}, skip_testing={base_env.skip_ride_testing}")
     
-    def _phase1_reward(self, success):
+    def _phase1_reward(self, success, action):
         """
         Phase 1: Focus entirely on finding way back to station
         - Strong distance-based rewards
@@ -130,6 +130,19 @@ class PhasedCurriculumWrapper(gym.Wrapper):
         - No rewards for track length or other metrics
         """
         base_env = self._get_base_env()
+
+        # Special case: For remove actions, use symmetric removal from base env
+        if success and action == 31:  # Remove piece
+            if base_env.piece_rewards:
+                # Return the exact negative of what was earned when placing this piece
+                removed_reward = base_env.piece_rewards.pop()
+                if base_env.verbose >= 2:
+                    print(f"Phase1 Remove: reversing reward of {removed_reward:.2f}")
+                return -removed_reward
+            else:
+                # No pieces to remove, small penalty
+                return -1
+
         reward = 0
         
         # Basic reward for successful placement
@@ -220,7 +233,7 @@ class PhasedCurriculumWrapper(gym.Wrapper):
         
         return reward
     
-    def _phase2_reward(self, success):
+    def _phase2_reward(self, success, action):
         """
         Phase 2: Explore while maintaining ability to return
         - Continue rewarding loop completion
@@ -228,6 +241,19 @@ class PhasedCurriculumWrapper(gym.Wrapper):
         - Keep distance-based rewards but reduced
         """
         base_env = self._get_base_env()
+
+        # Special case: For remove actions, use symmetric removal from base env
+        if success and action == 31:  # Remove piece
+            if base_env.piece_rewards:
+                # Return the exact negative of what was earned when placing this piece
+                removed_reward = base_env.piece_rewards.pop()
+                if base_env.verbose >= 2:
+                    print(f"Phase2 Remove: reversing reward of {removed_reward:.2f}")
+                return -removed_reward
+            else:
+                # No pieces to remove, small penalty
+                return -1
+
         reward = 0
         
         if success:
@@ -303,14 +329,14 @@ class PhasedCurriculumWrapper(gym.Wrapper):
         
         return reward
     
-    def _phase3_reward(self, success):
+    def _phase3_reward(self, success, action):
         """
         Phase 3: Full complexity - use original reward structure
         with all components enabled
         """
         base_env = self._get_base_env()
         # Use the original reward calculation
-        return base_env._original_calculate_reward(success)
+        return base_env._original_calculate_reward(success, action)
     
     def _check_phase_advancement(self):
         """Check if we should advance to the next phase"""

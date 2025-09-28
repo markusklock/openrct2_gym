@@ -46,9 +46,10 @@ class OpenRCT2Env(gym.Env):
         self.previous_distance = None
         self.position_history = deque(maxlen=5)
         self.chain_lift_positions = set()  # Track positions where chain lifts were placed
-        self.action_history = deque(maxlen=10)  # Track recent actions for pattern detection
-        self.remove_count = 0  # Track number of remove actions
-        
+        self.piece_rewards = []  # Track reward earned for each placed piece (for symmetric removal)
+        self._invalid_completion_attempt = False  # Track invalid loop completion attempts
+        self._invalid_completion_action = None  # Track which action failed validation
+
         # Additional metrics tracking
         self.min_distance_reached = float('inf')
         self.max_height_reached = 0
@@ -111,9 +112,32 @@ class OpenRCT2Env(gym.Env):
         if success and len(self.track_builder.history) > 0:
             last_entry = self.track_builder.history[-1]
             if "is_complete" in last_entry:
-                self._last_placement_complete = last_entry["is_complete"]
+                # Only accept loop completion if the last piece is valid for station connection
+                # Valid pieces: 0 (Flat), 13 (Up to Flat), 14 (Down to Flat)
+                VALID_STATION_CONNECTIONS = {0, 13, 14}
+
+                # Use original_action if auto-backtracked, otherwise use action
+                action_to_validate = original_action if auto_backtracked else action
+
+                if last_entry["is_complete"] and action_to_validate in VALID_STATION_CONNECTIONS:
+                    self._last_placement_complete = True
+                    if self.verbose >= 1:
+                        print(f"✅ Valid loop completion with piece {action_to_validate}")
+                elif last_entry["is_complete"]:
+                    # Circuit claims to be complete but last piece is invalid
+                    self._last_placement_complete = False
+                    self._invalid_completion_attempt = True
+                    self._invalid_completion_action = action_to_validate  # Store which action failed
+                    if self.verbose >= 1:
+                        print(f"❌ Invalid loop completion attempt with piece {action_to_validate} - must end with flat or transition to flat")
+                else:
+                    self._last_placement_complete = False
+                    self._invalid_completion_attempt = False
+                    self._invalid_completion_action = None
             else:
                 self._last_placement_complete = False
+                self._invalid_completion_attempt = False
+                self._invalid_completion_action = None
         
         # Update state based on the action that was actually executed
         if success:
@@ -130,20 +154,28 @@ class OpenRCT2Env(gym.Env):
             self.current_direction = new_direction
             # Track position history for trend analysis
             self.position_history.append(self.current_position.copy())
-        
+
         self.last_action = action
-        self.action_history.append(action)  # Track action history
-        
+
         # Check for loop completion BEFORE calculating reward
         self.loop_completed = self._last_placement_complete
         if self.loop_completed:
             if self.verbose >= 1:
                 print(f"Loop has been completed, great success!")
         terminated = self.loop_completed
-        
+
         # Now calculate reward (with correct loop_completed status)
         observation = self._get_observation()
-        reward = self._calculate_reward(success)
+        reward = self._calculate_reward(success, action)
+
+        # Track reward for this piece (for symmetric removal)
+        # Only track for successful placements (not removes)
+        if success and action != 31:
+            self.piece_rewards.append(reward)
+        elif success and action == 31 and self.piece_rewards:
+            # For remove action, the reward was already calculated as negative of last piece
+            # No need to track it
+            pass
         
         # Track metrics
         current_distance = self._calculate_distance_to_start()[0]
@@ -218,7 +250,6 @@ class OpenRCT2Env(gym.Env):
             info['episode_metrics'] = {
                 'min_distance': self.min_distance_reached,
                 'chain_lift_count': self.chain_lift_count,
-                'remove_count': self.remove_count,
                 'track_length': self.track_length,
                 'phase_rewards': dict(self.phase_rewards),
                 'collision_count': self.collision_count,
@@ -279,14 +310,15 @@ class OpenRCT2Env(gym.Env):
         self.last_action = None
         self.track_builder.history.clear()  # Clear the history when resetting the environment
         self._last_placement_complete = False
+        self._invalid_completion_attempt = False  # Reset invalid completion flag
+        self._invalid_completion_action = None  # Reset invalid completion action
         self.collision_count = 0
         self.consecutive_failures = 0
         self.steps_since_collision = 0
         self.previous_distance = None
         self.position_history = deque(maxlen=5)
         self.chain_lift_positions = set()
-        self.action_history = deque(maxlen=10)
-        self.remove_count = 0
+        self.piece_rewards = []  # Reset reward tracking
         self.min_distance_reached = float('inf')
         self.max_height_reached = 0
         self.unique_positions = set()
@@ -312,10 +344,53 @@ class OpenRCT2Env(gym.Env):
         info = {}
         return observation, info
 
-    def _calculate_reward(self, success):
+    def _calculate_reward(self, success, action):
+        # Special case: Remove action gets negative of last piece's reward
+        if success and action == 31:  # Remove piece
+            if self.piece_rewards:
+                # Return the exact negative of what was earned when placing this piece
+                removed_reward = self.piece_rewards.pop()
+                if self.verbose >= 2:
+                    print(f"Remove action: reversing reward of {removed_reward:.2f}")
+                return -removed_reward
+            else:
+                # No pieces to remove, small penalty
+                return -1
+
+        # Normal reward calculation for all other actions
         reward = 0
         current_distance = self._calculate_distance_to_start()[0]
-        
+
+        # Near-miss rewards for invalid loop completion attempts (Solution 2)
+        if hasattr(self, '_invalid_completion_attempt') and self._invalid_completion_attempt:
+            # Use the stored action that failed validation
+            failed_action = getattr(self, '_invalid_completion_action', self.last_action)
+
+            # Vary penalty based on how close the piece is to being valid
+            if failed_action in [11, 12]:  # Transitions to slopes (closer to correct)
+                reward -= 15
+                if self.verbose >= 2:
+                    print(f"Near-miss: transition piece {failed_action}, penalty -15")
+            elif failed_action in [5, 6, 9, 10]:  # Mild slopes
+                reward -= 20
+                if self.verbose >= 2:
+                    print(f"Near-miss: mild slope {failed_action}, penalty -20")
+            elif failed_action in [7, 8]:  # Steep slopes
+                reward -= 30
+                if self.verbose >= 2:
+                    print(f"Invalid completion: steep slope {failed_action}, penalty -30")
+            elif failed_action in range(1, 5):  # Turns
+                reward -= 40
+                if self.verbose >= 2:
+                    print(f"Invalid completion: turn {failed_action}, penalty -40")
+            else:  # Banking and special pieces
+                reward -= 40
+                if self.verbose >= 2:
+                    print(f"Invalid completion: special piece {failed_action}, penalty -40")
+
+            self._invalid_completion_attempt = False  # Reset flag after applying penalty
+            self._invalid_completion_action = None  # Reset action after applying penalty
+
         if success:
             # Base reward for successful action
             reward += 1
@@ -324,34 +399,18 @@ class OpenRCT2Env(gym.Env):
             # reduced incentive so the agent still has pieces left to return to
             # the station. Limit the reward to the first 15 pieces to avoid
             # spending the entire budget on hills.
-            if self.track_length < 15 and self.last_action in [9, 10]:
+            if self.track_length < 15 and action in [9, 10]:
                 position_key = tuple(self.current_position)
-                # Only reward if this is a NEW position for chain lift
+                # Reward if this is a NEW position for chain lift
                 if position_key not in self.chain_lift_positions and self.chain_lift_count < self.max_chain_lifts:
-                    reward += 5  # smaller bonus than before
+                    reward += 5  # bonus for chain lift
                     self.chain_lift_count += 1
                     self.chain_lift_positions.add(position_key)
-                else:
-                    # Penalty for rebuilding chain lift in same position
-                    reward -= 3
-            
-            # Penalty for removing pieces with progressive penalty
-            if self.last_action == 31:  # Fixed: was 18, should be 31
-                self.remove_count += 1
-                # Progressive penalty: increases with number of removals
-                remove_penalty = min(1 + self.remove_count * 0.5, 5)
-                reward -= remove_penalty
-                
-                # Additional penalty for remove-build-remove patterns
-                if len(self.action_history) >= 4:
-                    recent = list(self.action_history)[-4:]
-                    # Check for alternating pattern of build(9/10) and remove(31)
-                    if recent.count(31) >= 2 and any(a in [9, 10] for a in recent):
-                        reward -= 5  # Heavy penalty for exploitative pattern
+                # No penalty for rebuilding - the symmetry handles it
 
             # Big reward for completing the loop
             if self.loop_completed:
-                reward += 250
+                reward += 500
                 # Length bonus for longer completed tracks
                 if self.track_length > 50:
                     reward += (self.track_length - 50) * 0.5
@@ -417,17 +476,24 @@ class OpenRCT2Env(gym.Env):
             # Small continuous reward for building longer tracks
             if self.track_length > 30:
                 reward += 0.1
+
+            # Small reward for forward progress
+            if action != 31:
+                reward += 0.2  # Bonus for building
             
-            # Reward for continuous forward progress (no recent removes)
-            if self.last_action not in [31] and 31 not in list(self.action_history)[-3:]:
-                reward += 0.2  # Bonus for sustained building
-                
-            # Reset remove_count after sustained building (5+ pieces without removes)
-            # This allows recovery from exploration mistakes
-            if len(self.action_history) >= 5 and 31 not in list(self.action_history)[-5:]:
-                if self.remove_count > 0:
-                    self.remove_count = 0  # Reset penalty accumulation
-            
+            # Reward shaping when close to goal (Solution 4)
+            if current_distance < 10:
+                # Strong incentive to use flat pieces when close to station
+                # Use the actual action taken (not last_action which is from previous step)
+                if action in [0, 13, 14]:  # Flat or transitions to flat
+                    reward += 5
+                    if self.verbose >= 2:
+                        print(f"Good choice near goal: flat piece {action}, bonus +5")
+                elif action != 31:  # Not remove action
+                    reward -= 2
+                    if self.verbose >= 2:
+                        print(f"Poor choice near goal: non-flat piece {action}, penalty -2")
+
             # Adjusted height penalty (only after transition phase)
             if self.track_length > 40 and self.current_position[2] > 25:
                 reward -= 0.2
@@ -453,17 +519,12 @@ class OpenRCT2Env(gym.Env):
         # Check for extreme distance termination
         current_distance = self._calculate_distance_to_start()[0]
         too_far = current_distance > 100  # Terminate if more than 100 units away
-        
-        # Check for stuck pattern (optional)
-        stuck = False
-        if len(self.action_history) >= 10:
-            # Check if last 10 actions have too many removes (exploitation)
-            if list(self.action_history).count(31) >= 5:
-                stuck = True
-        
-        return (self.steps >= self.max_steps or 
+
+        # No need to check for stuck patterns - symmetric removal prevents exploitation
+
+        return (self.steps >= self.max_steps or
                 self.track_length >= self.max_track_length or
-                too_far or stuck)
+                too_far)
 
     def _get_observation(self):
         current_distance = self._calculate_distance_to_start()[0]
