@@ -57,6 +57,8 @@ class OpenRCT2Env(gym.Env):
         self.phase_rewards = {'building': 0, 'transition': 0, 'return': 0}
         self.current_phase = 'building'
         self.episode_rewards = []
+        self.last_height = 14  # Starting height
+        self.used_piece_types = set()  # Track variety of pieces used
         
         self.direction_vectors = [
             (0, 1),   # North (0)
@@ -227,10 +229,19 @@ class OpenRCT2Env(gym.Env):
                     if self.verbose >= 1:
                         print(f"⚠️ Failed to place entrance/exit: {entrance_result.get('error', 'Unknown error')}")
                 
-                # Set ride to testing mode and get ratings
-                self.api_controller.set_ride_status(1)  # 1 = Testing
-                time.sleep(5)  # Wait for testing to complete
-                ride_rating = self.evaluate_ride()
+                # Start ride test using the correct API endpoint
+                test_result = self.api_controller.start_ride_test()
+                if test_result.get("success"):
+                    if self.verbose >= 2:
+                        print(f"🎢 Ride test started: {test_result.get('payload', '')}")
+
+                    # Smart polling for ride stats (max 10 seconds for training efficiency)
+                    ride_rating = self._poll_for_ride_stats(max_wait=10)
+                else:
+                    if self.verbose >= 1:
+                        print(f"⚠️ Failed to start ride test: {test_result.get('error')}")
+                    ride_rating = {"excitement": 0, "intensity": 0, "nausea": 0}
+
                 info['ride_rating'] = ride_rating
             else:
                 # Skip testing in early phases - agent is just learning to build circuits
@@ -325,6 +336,8 @@ class OpenRCT2Env(gym.Env):
         self.phase_rewards = {'building': 0, 'transition': 0, 'return': 0}
         self.current_phase = 'building'
         self.episode_rewards = []
+        self.last_height = 14  # Starting height
+        self.used_piece_types = set()  # Track variety of pieces used
         
         # Demolish ALL rides to ensure clean state
         # This is more reliable than just demolishing our tracked ride
@@ -418,50 +431,42 @@ class OpenRCT2Env(gym.Env):
                 if self.chain_lift_count > 0:
                     reward += 10
             
-            # Progressive distance-based rewards - STRENGTHENED
+            # Simplified distance-based rewards (no internal phases)
             if self.previous_distance is not None:
                 distance_delta = self.previous_distance - current_distance
-                
-                # Phase-based distance rewards with EARLIER and STRONGER return phase
-                if self.track_length <= 25:
-                    # Building phase - allow exploration, reward height for chain lift
-                    if self.current_position[2] > self.goal_position[2]:
-                        reward += 0.2
-                    # Small reward for building outward initially
-                    if self.last_action not in [31]:
-                        reward += 0.3
-                elif self.track_length <= 40:
-                    # Transition phase - start gentle guidance back
-                    if distance_delta > 0:  # Moving closer
-                        reward += distance_delta * 0.5
-                else:
-                    # Return phase - MUCH stronger pull back to station
-                    if distance_delta > 0:  # Moving closer
-                        reward += distance_delta * 2.0  # Strong reward for progress
-                    # No penalty for moving away - let the agent explore
-                    
-                    # Distance checkpoint rewards
-                        #if current_distance < 50 and self.previous_distance >= 50:
-                        #    reward += 5  # Crossed 50-unit threshold
-                        #if current_distance < 30 and self.previous_distance >= 30:
-                        #    reward += 10  # Crossed 30-unit threshold
-                        #if current_distance < 20 and self.previous_distance >= 20:
-                        #    reward += 15  # Crossed 20-unit threshold
-                        #if current_distance < 10 and self.previous_distance >= 10:
-                        #    reward += 20  # Crossed 10-unit threshold
-                    
-                    # Escalating proximity bonuses - only from valid approach directions
-                    # Goal is at X+1 from station, so we need X >= goal_X to approach from the correct side
-                    if self.current_position[0] >= self.goal_position[0]:
-                        # Agent is approaching from east/correct side - give proximity bonuses
-                        if current_distance < 40:
-                            reward += (40 - current_distance) * 0.3
-                        if current_distance < 20:
-                            reward += (20 - current_distance) * 0.5
-                        if current_distance < 10:
-                            reward += (10 - current_distance) * 1.0
-                        if current_distance < 5:
-                            reward += (5 - current_distance) * 2.0
+
+                # Consistent distance reward throughout
+                if distance_delta > 0:  # Moving closer
+                    reward += distance_delta * 1.0  # Moderate reward
+                else:  # Moving away
+                    # Small penalty that increases with track length
+                    penalty_factor = min(0.5 + (self.track_length / 100), 1.5)
+                    reward += distance_delta * penalty_factor * 0.2
+
+                # Proximity bonuses when getting close
+                if current_distance < 30:
+                    reward += (30 - current_distance) * 0.1
+                if current_distance < 15:
+                    reward += (15 - current_distance) * 0.2
+                if current_distance < 5:
+                    reward += (5 - current_distance) * 0.5
+
+            # Height variation reward (for interesting coasters)
+            if action in [5, 6, 7, 8, 9, 10, 11, 12, 13, 14]:  # Slope pieces
+                # Reward height changes for variety
+                if not hasattr(self, 'last_height'):
+                    self.last_height = self.current_position[2]
+                height_change = abs(self.current_position[2] - self.last_height)
+                if height_change > 0:
+                    reward += min(height_change * 0.3, 2.0)  # Reward hills and drops
+                self.last_height = self.current_position[2]
+
+            # Track variety bonus
+            if not hasattr(self, 'used_piece_types'):
+                self.used_piece_types = set()
+            if action not in self.used_piece_types and action != 31:
+                reward += 1.0  # Bonus for using new piece types
+                self.used_piece_types.add(action)
             
             # Track length milestone rewards
             if self.track_length == 30:
@@ -494,9 +499,9 @@ class OpenRCT2Env(gym.Env):
                     if self.verbose >= 2:
                         print(f"Poor choice near goal: non-flat piece {action}, penalty -2")
 
-            # Adjusted height penalty (only after transition phase)
-            if self.track_length > 40 and self.current_position[2] > 25:
-                reward -= 0.2
+            # Height penalty only for excessive height
+            if self.current_position[2] > 30:
+                reward -= (self.current_position[2] - 30) * 0.1  # Progressive penalty for going too high
                 
         else:
             # Reduced penalty for failed placement (exploration)
@@ -587,7 +592,7 @@ class OpenRCT2Env(gym.Env):
         return observation
 
     def evaluate_ride(self):
-        resp = self.api_controller.get_ride_ratings()
+        resp = self.api_controller.get_ride_stats()  # Changed from get_ride_ratings
         if resp.get("success"):
             ratings = resp["payload"]
             return {
@@ -597,12 +602,48 @@ class OpenRCT2Env(gym.Env):
             }
         else:
             if self.verbose >= 1:
-                print("Failed to get ride ratings")
+                print("Failed to get ride statistics")
             return {
                 'excitement': 0,
                 'intensity': 0,
                 'nausea': 0
             }
+
+    def _poll_for_ride_stats(self, max_wait=10):
+        """Poll for ride statistics with smart detection of completion."""
+        for i in range(max_wait):
+            time.sleep(1)
+
+            # Try to get ride stats
+            result = self.api_controller.get_ride_stats()
+
+            if result.get("success"):
+                stats = result.get("payload", {})
+                # Check if we have actual stats
+                has_ratings = (
+                    "excitement" in stats and
+                    "intensity" in stats and
+                    "nausea" in stats
+                )
+                has_nonzero = (
+                    stats.get("excitement", 0) != 0 or
+                    stats.get("intensity", 0) != 0 or
+                    stats.get("nausea", 0) != 0
+                )
+
+                if has_ratings and (has_nonzero or i >= 3):  # Accept all zeros after 3 seconds
+                    if self.verbose >= 2:
+                        print(f"✅ Ride test completed after {i+1} seconds")
+                    return {
+                        'excitement': stats.get('excitement', 0),
+                        'intensity': stats.get('intensity', 0),
+                        'nausea': stats.get('nausea', 0)
+                    }
+
+        # Timeout - return zeros
+        if self.verbose >= 1:
+            print(f"⚠️ Ride test timeout after {max_wait} seconds")
+        return {'excitement': 0, 'intensity': 0, 'nausea': 0}
     
     def _build_initial_station(self):
         # Build station pieces

@@ -195,9 +195,35 @@ class APIController:
     def get_ride_ratings(self):
         if self.ride_id is None:
             return {"success": False, "error": "No ride created"}
-            
+
         req = {
             "endpoint": "getRideRatings",
+            "params": {
+                "rideId": self.ride_id
+            }
+        }
+        return self.send_request(req)
+
+    def start_ride_test(self):
+        """Start ride test mode using the correct API endpoint."""
+        if self.ride_id is None:
+            return {"success": False, "error": "No ride created"}
+
+        req = {
+            "endpoint": "startRideTest",
+            "params": {
+                "rideId": self.ride_id
+            }
+        }
+        return self.send_request(req)
+
+    def get_ride_stats(self):
+        """Get ride statistics using the correct API endpoint."""
+        if self.ride_id is None:
+            return {"success": False, "error": "No ride created"}
+
+        req = {
+            "endpoint": "getRideStats",
             "params": {
                 "rideId": self.ride_id
             }

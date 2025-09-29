@@ -255,75 +255,75 @@ class PhasedCurriculumWrapper(gym.Wrapper):
                 return -1
 
         reward = 0
-        
+
         if success:
             reward += 0.5
-            
-            # Track action position for repetition detection
-            current_pos_tuple = tuple(base_env.current_position)
-            action_type = 'remove' if base_env.last_action == base_env.action_space.n - 1 else 'place'
-            
-            # Check for repetitive pattern
-            if len(self.recent_action_positions) >= 4:
-                recent = list(self.recent_action_positions)[-4:]
-                if (len(recent) == 4 and 
-                    recent[0] == (current_pos_tuple, 'place') and
-                    recent[1] == (current_pos_tuple, 'remove') and
-                    recent[2] == (current_pos_tuple, 'place') and
-                    action_type == 'remove'):
-                    self.repetition_penalty_count += 1
-                    reward -= 8 * self.repetition_penalty_count  # Slightly less harsh in phase 2
-            
-            self.recent_action_positions.append((current_pos_tuple, action_type))
-            
-            if base_env.last_action == base_env.action_space.n - 1:
-                reward -= 1
-            else:
-                # Distance rewards (reduced from phase 1)
+
+            # No need for repetition detection - symmetric removal handles it
+
+            if action != 31:  # Not a remove action
+                # Distance rewards (heavily reduced to shift focus to building)
                 current_distance = base_env._calculate_distance_to_start()[0]
-                
+
                 if len(base_env.position_history) > 1:
                     prev_distance = np.linalg.norm(
                         np.array(base_env.position_history[-2]) - np.array(base_env.goal_position)
                     )
                     distance_delta = prev_distance - current_distance
-                    
+
                     if distance_delta > 0:
-                        reward += distance_delta * 1.5  # Reduced from phase 1
+                        reward += distance_delta * 0.5  # Much less than phase 1 (was 3.0)
                     else:
-                        reward += distance_delta * 0.3
-                
-                # Track length rewards (new in phase 2)
-                if base_env.track_length > 10:
-                    reward += 0.2  # Small reward for building
+                        reward += distance_delta * 0.1  # Very gentle penalty for moving away
+
+                # Track length rewards (STRENGTHENED for phase 2)
+                # Progressive rewards to encourage building longer tracks
+                if base_env.track_length >= 10:
+                    reward += 0.5  # Start rewarding at 10 pieces
+                if base_env.track_length >= 20:
+                    reward += 1.0  # Bigger reward at 20
+                if base_env.track_length >= 30:
+                    reward += 1.5  # Even more at 30
+                if base_env.track_length >= 40:
+                    reward += 2.0  # Strong reward for reaching 40
+
+                # Continuous building reward after 20 pieces
                 if base_env.track_length > 20:
-                    reward += 0.3
-                if base_env.track_length > 30:
-                    reward += 0.5
+                    reward += 0.1 * (base_env.track_length - 20) * 0.05  # Small per-piece bonus
+
+                # Exploration bonus: reward for reaching new positions
+                current_pos_tuple = tuple(base_env.current_position)
+                if not hasattr(self, 'phase2_visited_positions'):
+                    self.phase2_visited_positions = set()
+                if current_pos_tuple not in self.phase2_visited_positions:
+                    reward += 0.3  # Small bonus for exploring new areas
+                    self.phase2_visited_positions.add(current_pos_tuple)
                 
-                # Distance checkpoints
+                # Distance checkpoints (reduced to not overshadow building)
                 if not hasattr(base_env, 'min_distance_reached'):
                     base_env.min_distance_reached = float('inf')
-                    
+
                 if current_distance < base_env.min_distance_reached:
                     prev_min = base_env.min_distance_reached
                     base_env.min_distance_reached = current_distance
-                    
-                    # Checkpoint rewards for first time reaching thresholds
+
+                    # Smaller checkpoint rewards
                     if current_distance < 30 and prev_min >= 30:
-                        reward += 10
+                        reward += 5  # Reduced from 10
                     if current_distance < 20 and prev_min >= 20:
-                        reward += 15
+                        reward += 7  # Reduced from 15
                     if current_distance < 10 and prev_min >= 10:
-                        reward += 20
+                        reward += 10  # Reduced from 20
                 
-                # Loop completion (still important)
+                # Loop completion (still important but with stronger length bonus)
                 if base_env.loop_completed:
                     reward += 150  # Still high but less than phase 1
-                    
-                    # Bonus for longer tracks
+
+                    # Stronger bonus for longer completed tracks
                     if base_env.track_length > 30:
-                        reward += (base_env.track_length - 30) * 1.0
+                        reward += (base_env.track_length - 30) * 2.0  # Doubled from 1.0
+                    if base_env.track_length > 50:
+                        reward += (base_env.track_length - 50) * 1.0  # Additional bonus for very long tracks
         else:
             reward -= 1
         
