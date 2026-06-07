@@ -1,2 +1,3 @@
 from .openrct2_env import OpenRCT2Env
 from .wrappers import OpenRCT2Wrapper
+from .improved_phased_curriculum_wrapper import ImprovedPhasedCurriculumWrapper

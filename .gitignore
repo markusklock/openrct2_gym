@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual env
+venv/
+
+# Training artifacts
+logs_parallel_curriculum_masked_*/
+*_tensorboard/

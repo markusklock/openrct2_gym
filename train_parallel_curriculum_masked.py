@@ -7,12 +7,14 @@ import gymnasium as gym
 import openrct2_gym
 from openrct2_gym.envs.curriculum_wrapper import CurriculumWrapper, AdaptiveCurriculumWrapper
 from openrct2_gym.envs.phased_curriculum_wrapper import PhasedCurriculumWrapper
+from openrct2_gym.envs.improved_phased_curriculum_wrapper import ImprovedPhasedCurriculumWrapper
 from openrct2_gym.envs.wrappers import OpenRCT2Wrapper
+from openrct2_gym.envs.feature_extractor import BuildHistoryExtractor
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.maskable.policies import MaskableMultiInputActorCriticPolicy
 from sb3_contrib.common.wrappers import ActionMasker
 from sb3_contrib.common.maskable.evaluation import evaluate_policy
-from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
 from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback
 from stable_baselines3.common.monitor import Monitor
 import numpy as np
@@ -22,6 +24,55 @@ import time
 import math
 from typing import List, Callable
 from contextlib import ExitStack
+
+
+def _vecnormalize_path(model_path: str) -> str:
+    """Sibling path for a model's VecNormalize stats (``X.zip`` -> ``X_vecnormalize.pkl``)."""
+    if model_path.endswith(".zip"):
+        model_path = model_path[:-4]
+    return model_path + "_vecnormalize.pkl"
+
+
+def _unwrap_to_vecenv_with_envs(env):
+    """Return the underlying vec env exposing ``.envs`` (e.g. DummyVecEnv), or None.
+
+    VecNormalize wraps the vec env in ``.venv``; access ``.envs`` explicitly rather than
+    relying on attribute forwarding. SubprocVecEnv has no ``.envs`` -> returns None.
+    """
+    base = env
+    for _ in range(8):
+        if base is None:
+            break
+        if hasattr(base, "envs"):
+            return base
+        base = getattr(base, "venv", None)
+    return None
+
+
+class SaveVecNormalizeCallback(BaseCallback):
+    """Persist VecNormalize running stats next to each model checkpoint.
+
+    Without matching stats a saved checkpoint cannot be correctly reloaded for eval or
+    resume (the obs normalization would be wrong). Filenames mirror CheckpointCallback's.
+    """
+
+    def __init__(self, save_freq: int, save_path: str, name_prefix: str, verbose: int = 0):
+        super().__init__(verbose)
+        self.save_freq = save_freq
+        self.save_path = save_path
+        self.name_prefix = name_prefix
+
+    def _on_step(self) -> bool:
+        if self.save_freq > 0 and self.n_calls % self.save_freq == 0:
+            vec_env = self.model.get_vec_normalize_env()
+            if vec_env is not None:
+                path = os.path.join(
+                    self.save_path,
+                    f"{self.name_prefix}_{self.num_timesteps}_steps_vecnormalize.pkl",
+                )
+                vec_env.save(path)
+        return True
+
 
 class ParallelCurriculumMaskableCallback(BaseCallback):
     """
@@ -272,25 +323,45 @@ def mask_fn(env: gym.Env) -> np.ndarray:
     print("Warning: Could not find valid_action_mask method, allowing all actions")
     return np.ones(env.action_space.n, dtype=bool)
 
-def create_curriculum_masked_env(port: int, use_adaptive: bool = False, use_phased: bool = False, verbose: int = 0) -> gym.Env:
+def create_curriculum_masked_env(port: int, use_adaptive: bool = False, use_phased: bool = False,
+                                  use_improved: bool = False, verbose: int = 0) -> gym.Env:
     """Create environment with curriculum wrapper and action masking for a specific port"""
     # Base environment with specific port and verbosity
     base_env = gym.make('OpenRCT2-v0', host='localhost', port=port, verbose=verbose)
-    
+
     # Add OpenRCT2Wrapper to expose valid_action_mask method
     # This is crucial for the mask_fn to work
     base_env = OpenRCT2Wrapper(base_env)
-    
+
     # Apply curriculum wrapper
-    if use_phased:
-        # Use new phased curriculum that focuses on station return first
+    if use_improved:
+        # Use improved 5-phase curriculum with physics-aware rewards
+        env = ImprovedPhasedCurriculumWrapper(
+            base_env,
+            phase1_success_threshold=0.5,   # 50% loop completion
+            phase2_success_threshold=0.4,   # 40% with 3+ chain lifts
+            phase3_success_threshold=0.35,  # 35% with good patterns
+            phase4_success_threshold=0.30,  # 30% clean completions
+            phase5_success_threshold=0.25,  # 25% with quality ratings
+            window_size=50,
+            phase1_max_length=25,   # Return practice
+            phase2_max_length=40,   # Lift hill building
+            phase3_max_length=60,   # Drop & turn
+            phase4_max_length=80,   # Circuit mastery
+            phase5_initial_length=80,
+            phase5_target_length=120,
+            phase5_increase_step=10,
+            verbose=verbose
+        )
+    elif use_phased:
+        # Use old 3-phase curriculum that focuses on station return first
         env = PhasedCurriculumWrapper(
             base_env,
             phase1_success_threshold=0.5,  # 50% success to advance from phase 1
             phase2_success_threshold=0.4,  # 40% success to advance from phase 2
             window_size=50,
             phase1_max_length=40,  # More room for exploration while learning to return
-            phase2_max_length=60,  # Medium tracks
+            phase2_max_length=80,  # Longer tracks for chain lift building and exploration
             phase3_initial_length=60,
             phase3_target_length=120,
             phase3_increase_step=10,
@@ -324,11 +395,12 @@ def create_curriculum_masked_env(port: int, use_adaptive: bool = False, use_phas
     
     return env
 
-def make_env_factory(port: int, use_adaptive: bool = False, use_phased: bool = False, verbose: int = 0) -> Callable[[], gym.Env]:
+def make_env_factory(port: int, use_adaptive: bool = False, use_phased: bool = False,
+                      use_improved: bool = False, verbose: int = 0) -> Callable[[], gym.Env]:
     """Create a factory function for an environment on a specific port"""
     def _init() -> gym.Env:
         try:
-            env = create_curriculum_masked_env(port, use_adaptive, use_phased, verbose)
+            env = create_curriculum_masked_env(port, use_adaptive, use_phased, use_improved, verbose)
             print(f"✅ Successfully connected to OpenRCT2 on port {port}")
             return env
         except Exception as e:
@@ -344,24 +416,34 @@ def train_parallel_curriculum_masked(
     model_path: str | None = None,
     use_adaptive: bool = False,
     use_phased: bool = False,
+    use_improved: bool = False,
+    use_subproc: bool = False,
     verbose: int = 0,
     eval_episodes: int = 10,
     disable_eval: bool = False,
 ):
     """Train agent with curriculum learning AND action masking on multiple parallel environments"""
-    
+
     n_envs = len(ports)
-    
+
     print("="*60)
     print("🎓 PARALLEL CURRICULUM LEARNING + ACTION MASKING")
     print("="*60)
     print(f"Training on {n_envs} parallel OpenRCT2 instances")
     print(f"Ports: {', '.join(map(str, ports))}")
-    if use_phased:
-        print("Using PHASED curriculum learning:")
+    if use_improved:
+        print("Using IMPROVED 5-phase curriculum with physics-aware rewards:")
+        print("  Phase 1: Return Practice (25 pieces) - Learn navigation")
+        print("  Phase 2: Lift Hill Building (40 pieces) - Learn chain lifts & energy")
+        print("  Phase 3: Drop & Turn (60 pieces) - Learn drops & turnarounds")
+        print("  Phase 4: Circuit Mastery (80 pieces) - Full integration")
+        print("  Phase 5: Quality Optimization (80-120 pieces) - E=7-9, I=4.5-6.5, N<4.5")
+        print("  + Energy estimation, pattern detection, approach guidance")
+    elif use_phased:
+        print("Using PHASED curriculum learning (3 phases):")
         print("  Phase 1: Learn to return to station (40 pieces max)")
-        print("  Phase 2: Explore while returning (60 pieces max)")
-        print("  Phase 3: Build quality tracks (60-120 pieces)")
+        print("  Phase 2: Build chain lifts and explore (80 pieces max)")
+        print("  Phase 3: Optimize ride quality - E=7-9, I=4.5-6.5, N<4.5 (60-120 pieces)")
     elif use_adaptive:
         print("Using adaptive curriculum (50-120 pieces)")
     else:
@@ -371,19 +453,37 @@ def train_parallel_curriculum_masked(
     print("="*60 + "\n")
     
     # Create environment factories for each port
-    env_factories = [make_env_factory(port, use_adaptive, use_phased, verbose) for port in ports]
+    env_factories = [make_env_factory(port, use_adaptive, use_phased, use_improved, verbose) for port in ports]
     
-    # Create parallel training environments
+    # Create vectorized environments
     print(f"\n🔌 Connecting to {n_envs} OpenRCT2 instances...")
-    if n_envs > 1:
-        # Use SubprocVecEnv for true parallel execution
+    if use_subproc and n_envs > 1:
+        # SubprocVecEnv for true parallel execution
+        # Now more stable with retry logic and proper resource cleanup
         env = SubprocVecEnv(env_factories)
         print(f"✅ Created {n_envs} parallel environments using SubprocVecEnv")
     else:
-        # Fall back to DummyVecEnv for single environment
+        # DummyVecEnv runs sequentially (stable but no parallelism)
         env = DummyVecEnv(env_factories)
-        print("✅ Created single environment using DummyVecEnv")
+        if n_envs > 1:
+            print(f"✅ Created {n_envs} environments using DummyVecEnv (sequential)")
+            print("   💡 Use --use-subproc for true parallel execution")
+        else:
+            print(f"✅ Created {n_envs} environment using DummyVecEnv")
     
+    # Normalize ONLY the continuous 'scalars' key. norm_reward=False preserves the
+    # curriculum's tuned absolute reward magnitudes and phase-advancement thresholds.
+    # Other keys (map, tokens, mask, already-clipped goal vectors, Discretes) are left
+    # alone (VecNormalize handles only Box keys, and would corrupt token ids).
+    vecnorm_path = _vecnormalize_path(model_path) if model_path else None
+    if vecnorm_path and os.path.exists(vecnorm_path):
+        print(f"Loading VecNormalize stats from {vecnorm_path}")
+        env = VecNormalize.load(vecnorm_path, env)
+        env.training = True
+        env.norm_reward = False
+    else:
+        env = VecNormalize(env, norm_obs=True, norm_reward=False, norm_obs_keys=["scalars"])
+
     # IMPORTANT: Do NOT create a separate eval env on the same ports.
     # We will evaluate using the training env between learn chunks to avoid
     # corrupting in-progress episodes on shared API ports.
@@ -395,7 +495,10 @@ def train_parallel_curriculum_masked(
     else:
         print(f"Creating new MaskablePPO model for {n_envs} parallel environments")
         policy_kwargs = dict(
-            net_arch=dict(pi=[256, 256], vf=[256, 256])
+            features_extractor_class=BuildHistoryExtractor,
+            features_extractor_kwargs=dict(encoder="gru"),
+            net_arch=dict(pi=[256, 256], vf=[256, 256]),
+            normalize_images=False,
         )
         
         # Adjust n_steps and batch_size ensuring train_batch_size % batch_size == 0
@@ -433,12 +536,21 @@ def train_parallel_curriculum_masked(
     os.makedirs(log_dir, exist_ok=True)
     
     # Callbacks
+    _ckpt_save_freq = max(1, checkpoint_freq // max(1, n_envs))  # Guard against zero
+    _ckpt_prefix = f"parallel_curriculum_masked_{n_envs}envs"
     checkpoint_callback = CheckpointCallback(
-        save_freq=max(1, checkpoint_freq // max(1, n_envs)),  # Guard against zero
+        save_freq=_ckpt_save_freq,
         save_path=log_dir,
-        name_prefix=f"parallel_curriculum_masked_{n_envs}envs"
+        name_prefix=_ckpt_prefix
     )
-    
+
+    # Save VecNormalize stats alongside each checkpoint so checkpoints stay reloadable.
+    vecnormalize_callback = SaveVecNormalizeCallback(
+        save_freq=_ckpt_save_freq,
+        save_path=log_dir,
+        name_prefix=_ckpt_prefix,
+    )
+
     tensorboard_callback = ParallelCurriculumMaskableCallback(n_envs=n_envs, training_verbose=verbose)
 
     # Container for final curriculum statistics
@@ -465,7 +577,7 @@ def train_parallel_curriculum_masked(
             this_chunk = remaining if disable_eval else min(chunk, remaining)
             model.learn(
                 total_timesteps=this_chunk,
-                callback=[checkpoint_callback, tensorboard_callback],
+                callback=[checkpoint_callback, vecnormalize_callback, tensorboard_callback],
                 reset_num_timesteps=False,
             )
             learned += this_chunk
@@ -477,8 +589,9 @@ def train_parallel_curriculum_masked(
 
                 # Temporarily disable curriculum statistics during evaluation
                 curriculum_wrappers = []
-                if hasattr(env, 'envs'):
-                    for wrapped_env in env.envs:
+                base_vec = _unwrap_to_vecenv_with_envs(env)
+                if base_vec is not None:
+                    for wrapped_env in base_vec.envs:
                         temp_env = wrapped_env
                         while temp_env is not None:
                             if hasattr(temp_env, 'evaluation_mode'):
@@ -489,10 +602,20 @@ def train_parallel_curriculum_masked(
                             else:
                                 break
 
-                with ExitStack() as stack:
-                    for cw in curriculum_wrappers:
-                        stack.enter_context(cw.evaluation_mode())
-                    mean_reward, std_reward = evaluate_policy(model, env, n_eval_episodes=eval_episodes)
+                # Freeze VecNormalize running stats during evaluation so eval rollouts
+                # don't pollute the obs normalization statistics.
+                vecn = model.get_vec_normalize_env()
+                prev_training = vecn.training if vecn is not None else None
+                if vecn is not None:
+                    vecn.training = False
+                try:
+                    with ExitStack() as stack:
+                        for cw in curriculum_wrappers:
+                            stack.enter_context(cw.evaluation_mode())
+                        mean_reward, std_reward = evaluate_policy(model, env, n_eval_episodes=eval_episodes)
+                finally:
+                    if vecn is not None:
+                        vecn.training = prev_training
                 print(f"  Mean reward: {mean_reward:.2f} ± {std_reward:.2f}")
         
     except KeyboardInterrupt:
@@ -503,8 +626,9 @@ def train_parallel_curriculum_masked(
         traceback.print_exc()
     finally:
         # Retrieve final curriculum stats before closing the environment
-        if hasattr(env, 'envs') and len(env.envs) > 0:
-            env_instance = env.envs[0]
+        base_vec = _unwrap_to_vecenv_with_envs(env)
+        if base_vec is not None and len(base_vec.envs) > 0:
+            env_instance = base_vec.envs[0]
             curriculum_env = None
             temp_env = env_instance
 
@@ -525,6 +649,15 @@ def train_parallel_curriculum_masked(
                 else:
                     stats = curriculum_env.get_curriculum_stats()
 
+        # Persist final VecNormalize stats (needed to reload the model for eval/resume)
+        # before the env is closed.
+        try:
+            vec_env = model.get_vec_normalize_env()
+            if vec_env is not None:
+                vec_env.save(_vecnormalize_path(os.path.join(log_dir, "final_model")))
+        except Exception as e:
+            print(f"⚠️ Could not save VecNormalize stats: {e}")
+
         # Clean up environments after collecting stats
         env.close()
 
@@ -532,6 +665,7 @@ def train_parallel_curriculum_masked(
     final_model_path = os.path.join(log_dir, "final_model")
     model.save(final_model_path)
     print(f"\n💾 Final model saved to {final_model_path}")
+    print(f"💾 VecNormalize stats: {_vecnormalize_path(final_model_path)}")
 
     # Log final curriculum stats if available
     if stats:
@@ -587,7 +721,11 @@ def main():
     parser.add_argument("--adaptive", action="store_true",
                        help="Use adaptive curriculum with dynamic reward scaling")
     parser.add_argument("--phased", action="store_true",
-                       help="Use phased curriculum focusing on station return first")
+                       help="Use phased curriculum focusing on station return first (3 phases)")
+    parser.add_argument("--improved", action="store_true",
+                       help="Use improved 5-phase curriculum with physics-aware rewards (RECOMMENDED)")
+    parser.add_argument("--use-subproc", action="store_true",
+                       help="Use SubprocVecEnv for true parallel execution (test with retry fixes)")
     parser.add_argument("--verbose", type=int, default=None,
                        help="Verbosity level: 0=silent, 1=important, 2=detailed (default: auto)")
     args = parser.parse_args()
@@ -669,6 +807,8 @@ def main():
         args.model_path,
         args.adaptive,
         args.phased,
+        args.improved,
+        args.use_subproc,
         verbose,
         args.eval_episodes,
         args.disable_eval or args.eval_freq <= 0,

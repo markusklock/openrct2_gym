@@ -26,29 +26,88 @@ class APIController:
     
     def disconnect(self):
         if self.sock:
-            self.sock.close()
+            try:
+                self.sock.close()
+            except Exception:
+                pass
             self.sock = None
-            
-    def send_request(self, request):
-        if not self.sock:
-            if not self.connect():
-                return {"success": False, "error": "Not connected to API server"}
-        
-        try:
-            message = json.dumps(request) + "\n"
-            self.sock.sendall(message.encode("utf-8"))
-            
-            file_obj = self.sock.makefile("r")
-            line = file_obj.readline()
-            if not line:
-                return {"success": False, "error": "No response from server"}
-            response = json.loads(line)
-        except socket.timeout:
-            print(f"Request timeout for endpoint: {request.get('endpoint', 'unknown')}")
-            response = {"success": False, "error": "Request timeout"}
-        except Exception as e:
-            response = {"success": False, "error": "Failed to decode response: " + str(e)}
-        return response
+
+    def _reconnect(self):
+        """Close and reopen socket connection with brief delay."""
+        self.disconnect()
+        time.sleep(0.1)  # Brief delay before reconnect
+        return self.connect()
+
+    def send_request(self, request, max_retries=3, base_timeout=0.5):
+        """
+        Send request with retry logic and proper resource cleanup.
+
+        Args:
+            request: The request dictionary to send
+            max_retries: Maximum number of retry attempts (default: 3)
+            base_timeout: Base timeout in seconds, doubles each retry (default: 0.5)
+
+        Returns:
+            Response dictionary with 'success' key
+        """
+        endpoint = request.get('endpoint', 'unknown')
+
+        for attempt in range(max_retries):
+            # Ensure we have a connection
+            if not self.sock:
+                if not self.connect():
+                    if attempt < max_retries - 1:
+                        time.sleep(0.1 * (attempt + 1))
+                        continue
+                    return {"success": False, "error": "Not connected to API server"}
+
+            try:
+                # Set timeout with exponential backoff: 0.5s, 1s, 2s
+                timeout = base_timeout * (2 ** attempt)
+                self.sock.settimeout(timeout)
+
+                # Send request
+                message = json.dumps(request) + "\n"
+                self.sock.sendall(message.encode("utf-8"))
+
+                # Receive response with proper resource cleanup
+                file_obj = self.sock.makefile("r")
+                try:
+                    line = file_obj.readline()
+                    if not line:
+                        raise socket.timeout("Empty response from server")
+                    return json.loads(line)
+                finally:
+                    file_obj.close()  # Fix: Always close the file object
+
+            except socket.timeout:
+                if self.verbose >= 2:
+                    print(f"Timeout (attempt {attempt + 1}/{max_retries}) for endpoint: {endpoint}")
+                if attempt < max_retries - 1:
+                    self._reconnect()
+                    continue
+                return {"success": False, "error": f"Request timeout after {max_retries} attempts"}
+
+            except (ConnectionError, BrokenPipeError, ConnectionResetError) as e:
+                if self.verbose >= 2:
+                    print(f"Connection error (attempt {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    self._reconnect()
+                    continue
+                return {"success": False, "error": f"Connection error: {e}"}
+
+            except json.JSONDecodeError as e:
+                return {"success": False, "error": f"Invalid JSON response: {e}"}
+
+            except Exception as e:
+                if self.verbose >= 2:
+                    print(f"Unexpected error (attempt {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    self._reconnect()
+                    continue
+                return {"success": False, "error": f"Request failed: {e}"}
+
+        return {"success": False, "error": "Max retries exceeded"}
     
     def create_ride(self, ride_type=52, ride_object=0):
         req = {

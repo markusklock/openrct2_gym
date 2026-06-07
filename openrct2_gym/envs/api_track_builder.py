@@ -8,7 +8,11 @@ class APITrackBuilder:
             (-1, 0)   # West (3)
         ]
         self.history = []
-        
+        # Cache of valid next track TYPES from the last successful placement's response
+        # (the plugin returns them in placeTrackPiece -> payload.validNextPieces.validPieces),
+        # so we avoid a separate get_valid_next_pieces round-trip every step. None => must query.
+        self.valid_track_types = None
+
         # Comprehensive track type mapping with all available pieces
         self.action_to_track_type = {
             # Basic
@@ -71,6 +75,15 @@ class APITrackBuilder:
         # Actions that should add chain lift
         self.chain_lift_actions = {9, 10}  # Up 25° with chain, Flat to Up 25° with chain
         
+    def _cache_valid_from_payload(self, payload):
+        """Cache valid next track types from a placement/deletion payload.
+
+        Sets None if the payload doesn't carry them (e.g. an older plugin, or the delete
+        endpoint), which forces a get_valid_next_pieces fallback on the next query.
+        """
+        vnp = payload.get("validNextPieces") if payload else None
+        self.valid_track_types = vnp.get("validPieces") if isinstance(vnp, dict) else None
+
     def take_action(self, action, current_position, current_direction):
         success = False
         new_position = current_position.copy()
@@ -91,6 +104,9 @@ class APITrackBuilder:
                 
                 # Get the new position from the API response
                 payload = resp.get("payload", {})
+                # Endpoint changed; refresh valid-piece cache from the delete payload
+                # (or invalidate it if the delete endpoint doesn't include them).
+                self._cache_valid_from_payload(payload)
                 next_endpoint = payload.get("nextEndpoint")
                 
                 if next_endpoint:
@@ -150,26 +166,38 @@ class APITrackBuilder:
                 "track_type": track_type,
                 "is_complete": is_complete
             })
-            
+
+            # Cache valid next pieces returned with the placement (saves a round-trip).
+            self._cache_valid_from_payload(resp["payload"])
+
             if is_complete:
                 print(f"[API] Circuit complete detected! Track returned to station after {len(self.history)} pieces.")
                 print(f"[API] Final position: {new_position}, Direction: {new_direction}")
         
         return success, new_position, new_direction
     
+    def _actions_from_track_types(self, valid_pieces):
+        """Map a list of valid track TYPES to the agent's action indices."""
+        valid_actions = []
+        for action, track_type in self.action_to_track_type.items():
+            if track_type in valid_pieces and track_type != -1:  # Skip remove action
+                valid_actions.append(action)
+                # Special case: if track type 4 is valid, both with/without chain are valid
+                if track_type == 4 and action == 5:  # Up 25° without chain
+                    valid_actions.append(9)  # Also add Up 25° with chain
+                elif track_type == 6 and action == 11:  # Flat to Up 25° without chain
+                    valid_actions.append(10)  # Also add with chain
+        return valid_actions
+
     def get_valid_actions(self):
+        # Use the cache populated from the last placement's response if available; only
+        # fall back to a dedicated getValidNextPieces round-trip when we have none
+        # (after a reset, a remove, or against an older plugin).
+        if self.valid_track_types is not None:
+            return self._actions_from_track_types(self.valid_track_types)
+
         resp = self.api.get_valid_next_pieces()
         if resp.get("success"):
-            valid_pieces = resp["payload"]["validPieces"]
-            # Convert track types back to actions
-            valid_actions = []
-            for action, track_type in self.action_to_track_type.items():
-                if track_type in valid_pieces and track_type != -1:  # Skip remove action
-                    valid_actions.append(action)
-                    # Special case: if track type 4 is valid, both with/without chain are valid
-                    if track_type == 4 and action == 5:  # Up 25° without chain
-                        valid_actions.append(9)  # Also add Up 25° with chain
-                    elif track_type == 6 and action == 11:  # Flat to Up 25° without chain
-                        valid_actions.append(10)  # Also add with chain
-            return valid_actions
+            self.valid_track_types = resp["payload"]["validPieces"]
+            return self._actions_from_track_types(self.valid_track_types)
         return []

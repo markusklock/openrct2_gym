@@ -16,18 +16,23 @@ Initially I tried using UI automation with pyautogui to click buttons in the gam
 
 The project has evolved significantly from its UI automation origins. It now features:
 
-- **API-based control**: Direct communication with OpenRCT2 via HTTP API (requires custom OpenRCT2 plugin)
-- **Fast training**: No UI automation, direct game state manipulation
-- **Sophisticated reward system**: Multi-phase rewards encouraging chain lifts, exploration, and return to station
-- **Curriculum learning**: Gradually increases difficulty as the agent improves
+- **API-based control**: Direct communication with OpenRCT2 via HTTP API with retry logic
+- **Physics-aware rewards**: Energy estimation helps agent understand chain lifts add energy, drops provide speed
+- **Pattern detection**: Rewards for building proper lift hills, drops, and turnarounds
+- **5-phase curriculum learning**: Progressive skill acquisition from navigation to ride quality optimization
+- **Parallel training**: Multiple OpenRCT2 instances on different ports using DummyVecEnv
 - **Action masking**: Prevents invalid track placements
-- **Comprehensive metrics**: Detailed Tensorboard tracking of all aspects of training
+- **Ride quality optimization**: Phase 5 targets Excitement 7-9, Intensity 4.5-6.5, Nausea <4.5
+- **3D-aware observation + build memory**: an egocentric, forward-aligned 2.5D map (occupancy / signed height / goal+station marker / chain-lift trail) gives spatial awareness, and a structured build-history buffer (last 128 pieces: learned piece-type embedding + per-piece relative geometry) gives the agent memory of what it has built. Both are encoded by a custom feature extractor (`openrct2_gym/envs/feature_extractor.py`) with a GRU over the history and a CNN over the map, plus `VecNormalize` over the continuous scalars.
 
-The agent is currently learning to:
-1. Build tracks starting with chain lift hills
-2. Explore outward to create interesting layouts
-3. Navigate back to the station to complete the circuit
-4. Gradually build longer and more complex tracks
+> **Note:** The observation space was redesigned (see `openrct2_gym/envs/obs_config.py`). This changes the model input shape, so **models trained before this change cannot be loaded** — retrain from scratch. Each checkpoint now has a matching `*_vecnormalize.pkl` stats file that must accompany the model when resuming or running it.
+
+The improved curriculum teaches the agent to:
+1. **Phase 1**: Navigate back to the station (basic circuit completion)
+2. **Phase 2**: Build proper lift hills with chain lifts (energy accumulation)
+3. **Phase 3**: Create drops and turnarounds (use stored energy)
+4. **Phase 4**: Integrate all skills for consistent circuit completion
+5. **Phase 5**: Optimize ride ratings for quality roller coasters
 
 ## Installation
 
@@ -55,132 +60,83 @@ pip install -e .
 
 ## Training the Agent
 
-### Quick Start - Train with Curriculum Learning (Recommended)
+### Quick Start - Improved 5-Phase Curriculum (Recommended)
 ```bash
-python train_with_curriculum.py --timesteps 1000000
+# Single environment
+python train_parallel_curriculum_masked.py --ports 8080 --improved --timesteps 1000000
+
+# Multiple parallel environments (faster training)
+python train_parallel_curriculum_masked.py --ports 8080,8081,8082,8083 --improved --timesteps 1000000
 ```
 
-This uses curriculum learning to gradually increase difficulty from 30-piece tracks to 100-piece tracks.
+The `--improved` flag enables the physics-aware 5-phase curriculum with energy estimation and pattern detection.
 
-### Alternative Training Scripts
+### Alternative Training Options
 
 ```bash
-# Standard training with action masking
+# Legacy 3-phase curriculum
+python train_parallel_curriculum_masked.py --ports 8080 --phased --timesteps 500000
+
+# Standard training with action masking (no curriculum)
 python train_rl_agent_masked.py --timesteps 500000
-
-# Simple training without masking
-python train_rl_agent_simple.py --timesteps 500000
-
-# Enhanced training with detailed metrics
-python train_rl_agent_enhanced.py --timesteps 500000
 ```
 
 ### Monitor Training Progress
 
 ```bash
 # Start Tensorboard to view training metrics
-tensorboard --logdir ./ppo_openrct2_tensorboard/
-
-# For curriculum training logs
-tensorboard --logdir ./curriculum_tensorboard/
+tensorboard --logdir ./parallel_curriculum_masked_tensorboard/
 ```
 
-## Reward System
+## Reward System (Improved 5-Phase Curriculum)
 
-The reward system is carefully designed to guide the agent through different phases of track construction. Here's a detailed breakdown:
+The `--improved` flag enables a physics-aware reward system that teaches roller coaster mechanics:
 
-### Base Rewards
+### Energy Model
 
-- **Successful track placement**: +1.0
-- **Failed placement (collision)**: -0.2
-- **Track removal action**: Progressive penalty starting at -1.0, increasing by 0.5 per removal (caps at -5.0)
+The agent learns that roller coasters need energy:
+- **Chain lifts add energy**: +50 energy per chain lift piece
+- **Drops convert potential to kinetic**: +3 energy per unit of descent
+- **Friction costs energy**: -2 per piece, extra for turns
+- **Climbing without chain costs energy**: -5 per unit of ascent
 
-### Chain Lift Rewards
+**Energy margin reward**: Agent is rewarded for maintaining positive energy (track is viable).
 
-Chain lifts are crucial for roller coasters. The agent is encouraged to use them early:
+### Pattern Detection
 
-- **Chain lift placement** (actions 9 or 10): +10.0 bonus (only for first placement at each position)
-- **Rebuilding chain lift at same position**: -3.0 penalty (prevents exploitation)
-- **Chain lift zone**: First 30 track pieces
-- **Maximum chain lifts**: 15 per track
+Rewards for building proper roller coaster patterns:
+- **Lift hill pattern** (3+ chain pieces → drop): +15 to +20
+- **Drop pattern** (transition → steep descent → recovery): +10 to +15
+- **Turnaround** (reversing direction toward station): +15 to +20
 
-### Phase-Based Distance Rewards
+### 5-Phase Curriculum
 
-The reward system uses three distinct phases to guide behavior:
+Each phase emphasizes different skills:
 
-#### Phase 1: Building Phase (0-25 pieces)
-- **Height gain reward**: +0.2 for building above station height
-- **Building reward**: +0.3 for placing non-removal pieces
-- **Focus**: Encourage initial hill climb with chain lift
+| Phase | Name | Max Pieces | Focus | Advancement |
+|-------|------|------------|-------|-------------|
+| 1 | Return Practice | 25 | Pure navigation (4x distance rewards) | 50% completion |
+| 2 | Lift Hill Building | 40 | Chain lifts + energy (2x energy rewards) | 40% with 3+ chains |
+| 3 | Drop & Turn | 60 | Drops + turnarounds + patterns | 35% with patterns |
+| 4 | Circuit Mastery | 80 | Full integration + approach guidance | 30% completion |
+| 5 | Quality Optimization | 80-120 | Ride ratings (E=7-9, I=4.5-6.5, N<4.5) | Progressive |
 
-#### Phase 2: Transition Phase (25-35 pieces)
-- **Distance delta reward**: +0.5 × distance_moved_closer
-- **Direction reward**: +0.3 for facing toward goal
-- **Focus**: Start guiding back toward station
+### Approach Guidance (Soft, Non-Restrictive)
 
-#### Phase 3: Return Phase (35+ pieces)
-- **Strong distance delta reward**: +2.0 × distance_moved_closer
-- **Distance penalty**: -1.0 × distance_moved_away
-- **Direction rewards**:
-  - +1.0 for facing directly toward goal (< 45°)
-  - +0.5 for somewhat toward goal (< 90°)
-  - -0.5 for facing away from goal
+Near the station, the agent receives bonuses (not penalties) for:
+- **Height alignment**: +5 when at correct height (z=14)
+- **Flat piece usage**: +3 for using flat/transition pieces when close
+- **Direction alignment**: +3 when facing toward station
 
-### Distance Checkpoint Bonuses
+### Circuit Completion
 
-Major bonuses for crossing distance thresholds when returning:
-- **50 units**: +5 bonus
-- **30 units**: +10 bonus
-- **20 units**: +15 bonus
-- **10 units**: +20 bonus
-
-### Proximity Rewards
-
-Escalating rewards for getting close to the station:
-- **< 40 units**: +(40 - distance) × 0.3
-- **< 20 units**: +(20 - distance) × 0.5
-- **< 10 units**: +(10 - distance) × 1.0
-- **< 5 units**: +(5 - distance) × 2.0
-
-### Distance Penalties
-
-Soft boundaries to prevent going too far:
-- **> 60 units**: -(distance - 60) × 0.2
-- **> 80 units**: -(distance - 80) × 0.5
-- **> 100 units**: Episode terminates
-
-### Track Length Milestones
-
-Bonuses for reaching certain track lengths:
-- **30 pieces**: +5
-- **50 pieces**: +10
-- **75 pieces**: +15
-- **100 pieces**: +20
-- **Continuous bonus**: +0.1 per piece after 30
-
-### Loop Completion Rewards
-
-Major rewards for successfully completing the circuit:
-- **Base completion bonus**: +100
-- **Length bonus**: +(track_length - 50) × 0.5 for tracks over 50 pieces
-- **Chain lift usage bonus**: +10 if chain lifts were used
-
-### Behavioral Rewards
-
-- **Sustained building bonus**: +0.2 for continuous building without recent removals
-- **Pattern penalty**: -5.0 for detected exploitation patterns (build-remove-build)
-
-### Partial Success Rewards
-
-Even if the loop isn't completed, proximity matters:
-- **Final distance < 10 units**: +(10 - distance) × 2.0
-- **Final distance < 20 units**: +(20 - distance) × 0.5
+Any piece that the game engine accepts as completing the circuit is valid. The artificial restriction limiting completion to only flat pieces has been removed.
 
 ## Observation Space
 
 The agent receives comprehensive information about the current state:
 
-- **track_pieces**: Array of placed track piece IDs
+- **track_pieces**: Array of placed track piece IDs (up to 250)
 - **current_position**: 3D coordinates (x, y, z)
 - **current_direction**: Facing direction (0=North, 1=East, 2=South, 3=West)
 - **distance_to_start**: Euclidean distance to station
@@ -189,6 +145,7 @@ The agent receives comprehensive information about the current state:
 - **goal_direction**: Normalized 2D vector pointing to station
 - **angle_to_goal**: Radians to turn to face station
 - **distance_trend**: Change in distance (positive = getting closer)
+- **last_ride_excitement/intensity/nausea**: Ratings from previous completed ride (for learning)
 
 ## Action Space
 
@@ -216,13 +173,20 @@ The training scripts provide extensive metrics in Tensorboard:
 - Requires custom OpenRCT2 plugin for API support
 - Only tested with Wooden Coaster type
 - Single-track construction (no multiple rides)
-- No consideration of ride excitement/intensity ratings yet
 - Training can take 1-2 million timesteps for consistent success
+
+## Recent Improvements
+
+- **Physics-aware rewards**: Energy model helps agent understand roller coaster mechanics
+- **Pattern detection**: Rewards for lift hills, drops, and turnarounds
+- **5-phase curriculum**: Progressive skill acquisition
+- **Ride quality optimization**: Phase 5 targets good excitement/intensity/nausea ratings
+- **Parallel training stability**: DummyVecEnv with retry logic for reliable multi-instance training
+- **Removed artificial restrictions**: Any valid circuit completion is accepted
 
 ## Future Improvements
 
-- Multi-agent training for parallel learning
-- Incorporation of ride ratings into reward system
 - Support for different coaster types
 - Visual observation space using track renders
 - Transfer learning between coaster types
+- More sophisticated physics model (G-forces, speed estimation)

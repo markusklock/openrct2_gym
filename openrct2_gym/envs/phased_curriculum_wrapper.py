@@ -22,11 +22,11 @@ class PhasedCurriculumWrapper(gym.Wrapper):
     def __init__(self, env,
                  # Phase progression parameters
                  phase1_success_threshold=0.5,  # 50% success rate to advance from phase 1
-                 phase2_success_threshold=0.4,  # 40% success rate to advance from phase 2
+                 phase2_success_threshold=0.6,  # 60% success rate to advance from phase 2
                  window_size=100,
                  # Track length curriculum
                  phase1_max_length=40,  # More room for exploration while learning to return
-                 phase2_max_length=60,  # Medium tracks
+                 phase2_max_length=80,  # Longer tracks for exploration and chain lift building
                  phase3_initial_length=60,
                  phase3_target_length=120,
                  phase3_increase_step=10,
@@ -68,10 +68,11 @@ class PhasedCurriculumWrapper(gym.Wrapper):
         
         # Performance tracking
         self.episode_results = deque(maxlen=window_size)
+        self.episode_qualified_results = deque(maxlen=window_size)  # Phase 2: success with chain lift requirement
         self.episode_count = 0
         self.phase_episode_count = 0
         self.total_loops_completed = 0
-        
+
         # Phase 3 sub-stages
         self.phase3_stage = 1
         
@@ -235,16 +236,26 @@ class PhasedCurriculumWrapper(gym.Wrapper):
     
     def _phase2_reward(self, success, action):
         """
-        Phase 2: Explore while maintaining ability to return
-        - Continue rewarding loop completion
-        - Add rewards for track length
-        - Keep distance-based rewards but reduced
+        Phase 2: Build chain lifts and explore with longer tracks
+        - Strong incentives for chain lifts early in the track
+        - Rewards for building longer tracks (up to 80 pieces)
+        - Minimal distance penalties to encourage exploration
+        - Variety and height variation rewards
         """
         base_env = self._get_base_env()
 
         # Special case: For remove actions, use symmetric removal from base env
         if success and action == 31:  # Remove piece
             if base_env.piece_rewards:
+                # Check if the piece being removed was a chain lift
+                if hasattr(base_env, 'track_pieces') and base_env.track_pieces:
+                    removed_piece = base_env.track_pieces[-1]  # Last piece in the track
+                    if removed_piece in [9, 10]:  # Was it a chain lift?
+                        if hasattr(base_env, 'phase2_chain_lift_count') and base_env.phase2_chain_lift_count > 0:
+                            base_env.phase2_chain_lift_count -= 1
+                            if base_env.verbose >= 2:
+                                print(f"Phase2: Chain lift removed, count now: {base_env.phase2_chain_lift_count}")
+
                 # Return the exact negative of what was earned when placing this piece
                 removed_reward = base_env.piece_rewards.pop()
                 if base_env.verbose >= 2:
@@ -257,12 +268,87 @@ class PhasedCurriculumWrapper(gym.Wrapper):
         reward = 0
 
         if success:
-            reward += 0.5
-
-            # No need for repetition detection - symmetric removal handles it
+            reward += 0.5  # Base success reward
 
             if action != 31:  # Not a remove action
-                # Distance rewards (heavily reduced to shift focus to building)
+
+                # CHAIN LIFT INCENTIVES - Primary focus of Phase 2
+                if action in [9, 10]:  # Chain lift pieces
+                    # Track total chain lifts (no position tracking needed - symmetric removal prevents exploitation)
+                    if not hasattr(base_env, 'phase2_chain_lift_count'):
+                        base_env.phase2_chain_lift_count = 0
+
+                    base_env.phase2_chain_lift_count += 1
+
+                    # Strong rewards for chain lifts placed early
+                    if base_env.track_length <= 15:
+                        reward += 10  # Big reward for early chain lifts
+                        if base_env.verbose >= 2:
+                            print(f"Phase2: Early chain lift #{base_env.phase2_chain_lift_count} at piece {base_env.track_length}, +10 reward")
+                    elif base_env.track_length <= 30:
+                        reward += 5  # Moderate reward for mid-track chain lifts
+                    else:
+                        reward += 2  # Small reward for late chain lifts
+
+                    # Milestone bonuses for total chain lifts
+                    if base_env.phase2_chain_lift_count == 1:
+                        reward += 5  # First chain lift bonus
+                    elif base_env.phase2_chain_lift_count == 3:
+                        reward += 10  # Three chain lifts bonus
+                    elif base_env.phase2_chain_lift_count == 5:
+                        reward += 15  # Five chain lifts bonus
+
+                    # Height bonus for chain lifts going higher
+                    if base_env.current_position[2] > 20:
+                        reward += min((base_env.current_position[2] - 20) * 0.5, 5)  # Extra reward for height
+
+                # TRACK LENGTH REWARDS - Encourage building longer tracks
+                # Progressive milestones up to 80 pieces
+                if base_env.track_length == 10:
+                    reward += 2
+                elif base_env.track_length == 20:
+                    reward += 3
+                elif base_env.track_length == 30:
+                    reward += 4
+                elif base_env.track_length == 40:
+                    reward += 5
+                elif base_env.track_length == 50:
+                    reward += 6
+                elif base_env.track_length == 60:
+                    reward += 8
+                elif base_env.track_length == 70:
+                    reward += 10
+
+                # Continuous building reward after 30 pieces
+                if base_env.track_length > 30:
+                    reward += 0.2  # Consistent reward for each new piece
+
+                # VARIETY REWARDS - Encourage diverse track building
+                # Track piece type variety
+                if not hasattr(base_env, 'phase2_used_pieces'):
+                    base_env.phase2_used_pieces = set()
+                if action not in base_env.phase2_used_pieces:
+                    base_env.phase2_used_pieces.add(action)
+                    reward += 0.5  # Bonus for using new piece types
+
+                # Height variation reward
+                if action in [5, 6, 7, 8, 9, 10, 11, 12, 13, 14]:  # Slope pieces
+                    if not hasattr(base_env, 'phase2_last_height'):
+                        base_env.phase2_last_height = base_env.current_position[2]
+                    height_change = abs(base_env.current_position[2] - base_env.phase2_last_height)
+                    if height_change > 0:
+                        reward += min(height_change * 0.4, 3.0)  # Reward height changes
+                    base_env.phase2_last_height = base_env.current_position[2]
+
+                # EXPLORATION BONUS - Reward reaching new positions
+                current_pos_tuple = tuple(base_env.current_position)
+                if not hasattr(self, 'phase2_visited_positions'):
+                    self.phase2_visited_positions = set()
+                if current_pos_tuple not in self.phase2_visited_positions:
+                    reward += 0.3  # Bonus for exploring new areas
+                    self.phase2_visited_positions.add(current_pos_tuple)
+
+                # DISTANCE REWARDS - Greatly reduced to avoid conflicting signals
                 current_distance = base_env._calculate_distance_to_start()[0]
 
                 if len(base_env.position_history) > 1:
@@ -272,34 +358,11 @@ class PhasedCurriculumWrapper(gym.Wrapper):
                     distance_delta = prev_distance - current_distance
 
                     if distance_delta > 0:
-                        reward += distance_delta * 0.5  # Much less than phase 1 (was 3.0)
+                        reward += distance_delta * 0.3  # Small reward for getting closer
                     else:
-                        reward += distance_delta * 0.1  # Very gentle penalty for moving away
+                        reward += distance_delta * 0.05  # Very gentle penalty for moving away
 
-                # Track length rewards (STRENGTHENED for phase 2)
-                # Progressive rewards to encourage building longer tracks
-                if base_env.track_length >= 10:
-                    reward += 0.5  # Start rewarding at 10 pieces
-                if base_env.track_length >= 20:
-                    reward += 1.0  # Bigger reward at 20
-                if base_env.track_length >= 30:
-                    reward += 1.5  # Even more at 30
-                if base_env.track_length >= 40:
-                    reward += 2.0  # Strong reward for reaching 40
-
-                # Continuous building reward after 20 pieces
-                if base_env.track_length > 20:
-                    reward += 0.1 * (base_env.track_length - 20) * 0.05  # Small per-piece bonus
-
-                # Exploration bonus: reward for reaching new positions
-                current_pos_tuple = tuple(base_env.current_position)
-                if not hasattr(self, 'phase2_visited_positions'):
-                    self.phase2_visited_positions = set()
-                if current_pos_tuple not in self.phase2_visited_positions:
-                    reward += 0.3  # Small bonus for exploring new areas
-                    self.phase2_visited_positions.add(current_pos_tuple)
-                
-                # Distance checkpoints (reduced to not overshadow building)
+                # Minimal distance checkpoints (only when very close)
                 if not hasattr(base_env, 'min_distance_reached'):
                     base_env.min_distance_reached = float('inf')
 
@@ -307,52 +370,151 @@ class PhasedCurriculumWrapper(gym.Wrapper):
                     prev_min = base_env.min_distance_reached
                     base_env.min_distance_reached = current_distance
 
-                    # Smaller checkpoint rewards
-                    if current_distance < 30 and prev_min >= 30:
-                        reward += 5  # Reduced from 10
-                    if current_distance < 20 and prev_min >= 20:
-                        reward += 7  # Reduced from 15
+                    # Only reward when getting very close (to help with loop completion)
                     if current_distance < 10 and prev_min >= 10:
-                        reward += 10  # Reduced from 20
-                
-                # Loop completion (still important but with stronger length bonus)
-                if base_env.loop_completed:
-                    reward += 150  # Still high but less than phase 1
+                        reward += 5
 
-                    # Stronger bonus for longer completed tracks
-                    if base_env.track_length > 30:
-                        reward += (base_env.track_length - 30) * 2.0  # Doubled from 1.0
-                    if base_env.track_length > 50:
-                        reward += (base_env.track_length - 50) * 1.0  # Additional bonus for very long tracks
+                # LOOP COMPLETION - Still important with length bonuses
+                if base_env.loop_completed:
+                    reward += 100  # Reduced from 150 to balance with other rewards
+
+                    # Bonus for chain lifts in completed track
+                    if hasattr(base_env, 'phase2_chain_lift_count'):
+                        reward += base_env.phase2_chain_lift_count * 5  # +5 per chain lift
+
+                    # Strong bonus for longer completed tracks
+                    if base_env.track_length > 40:
+                        reward += (base_env.track_length - 40) * 2.0
+                    if base_env.track_length > 60:
+                        reward += (base_env.track_length - 60) * 3.0  # Extra bonus for very long tracks
         else:
-            reward -= 1
-        
+            # Small penalty for invalid action
+            reward -= 0.5
+
         return reward
     
     def _phase3_reward(self, success, action):
         """
-        Phase 3: Full complexity - use original reward structure
-        with all components enabled
+        Phase 3: Build quality rides - optimize for ride statistics
+        - Uses base reward structure but scaled down (0.5x)
+        - Primary focus on ride quality metrics at episode completion
+        - Ride stats bonus is added separately in wrapper's step function
         """
         base_env = self._get_base_env()
-        # Use the original reward calculation
-        return base_env._original_calculate_reward(success, action)
-    
+
+        # Special case: For remove actions, use symmetric removal from base env
+        if success and action == 31:  # Remove piece
+            if base_env.piece_rewards:
+                # Return the exact negative of what was earned when placing this piece
+                removed_reward = base_env.piece_rewards.pop()
+                if base_env.verbose >= 2:
+                    print(f"Phase3 Remove: reversing reward of {removed_reward:.2f}")
+                return -removed_reward
+            else:
+                # No pieces to remove, small penalty
+                return -1
+
+        # Get the original reward and scale it down
+        # We scale it because ride quality will be the primary signal in Phase 3
+        original_reward = base_env._original_calculate_reward(success, action)
+
+        # Scale down base rewards (but not too much - still need guidance)
+        # Loop completion bonus is already in original_reward (+500), reduce it
+        if base_env.loop_completed:
+            # Original gives +500 for completion, reduce to +200
+            scaled_reward = (original_reward - 500) * 0.5 + 200
+        else:
+            # Scale other rewards moderately
+            scaled_reward = original_reward * 0.5
+
+        return scaled_reward
+
+    def _calculate_ride_quality_bonus(self, excitement, intensity, nausea):
+        """
+        Calculate bonus reward based on ride quality metrics.
+        Target ranges:
+        - Excitement: 7.0-9.0 (high)
+        - Intensity: 4.5-6.5 (medium-high)
+        - Nausea: <4.5 (low-medium)
+
+        Returns total bonus (can be up to ~400 points)
+        """
+        bonus = 0
+
+        # EXCITEMENT SCORING (target: 7.0-9.0)
+        if 7.0 <= excitement <= 9.0:
+            # Perfect range - scale from +100 to +200 based on position in range
+            # Peak at 8.0 (middle of range)
+            distance_from_optimal = abs(excitement - 8.0)
+            excitement_bonus = 200 - (distance_from_optimal * 50)  # Max 200 at 8.0, min 150 at edges
+            bonus += excitement_bonus
+        elif 5.0 <= excitement < 7.0:
+            # Below target but acceptable
+            bonus += (excitement - 5.0) / 2.0 * 100  # 0 to +100 scaled
+        elif 9.0 < excitement <= 11.0:
+            # Above target but acceptable
+            bonus += (11.0 - excitement) / 2.0 * 100  # +100 to 0 scaled
+        elif excitement < 5.0:
+            # Too boring
+            bonus += excitement * 10  # Small partial credit (0 to +50)
+        else:
+            # Way too exciting (>11.0)
+            bonus += max(0, 50 - (excitement - 11.0) * 10)  # Penalty for extreme
+
+        # INTENSITY SCORING (target: 4.5-6.5)
+        if 4.5 <= intensity <= 6.5:
+            # Perfect range - scale from +50 to +100 based on position
+            # Peak at 5.5 (middle of range)
+            distance_from_optimal = abs(intensity - 5.5)
+            intensity_bonus = 100 - (distance_from_optimal * 25)  # Max 100 at 5.5, min 75 at edges
+            bonus += intensity_bonus
+        elif 3.0 <= intensity < 4.5:
+            # Below target but acceptable
+            bonus += (intensity - 3.0) / 1.5 * 50  # 0 to +50 scaled
+        elif 6.5 < intensity <= 8.0:
+            # Above target but still rideable
+            bonus += (8.0 - intensity) / 1.5 * 50  # +50 to 0 scaled
+        elif intensity < 3.0:
+            # Too mild
+            bonus += intensity * 10  # Small partial credit (0 to +30)
+        else:
+            # Too intense (>8.0) - penalty
+            bonus -= (intensity - 8.0) * 10  # Penalty for excessive intensity
+
+        # NAUSEA SCORING (target: <4.5, lower is better)
+        if nausea < 2.0:
+            # Excellent - very comfortable ride
+            bonus += 100
+        elif 2.0 <= nausea <= 4.5:
+            # Acceptable range - scale from +100 to 0
+            bonus += (4.5 - nausea) / 2.5 * 100  # +100 at 2.0, 0 at 4.5
+        elif 4.5 < nausea <= 6.0:
+            # Too nauseating but not terrible
+            bonus -= (nausea - 4.5) / 1.5 * 50  # 0 to -50 penalty
+        else:
+            # Way too nauseating (>6.0) - heavy penalty
+            bonus -= 50 + (nausea - 6.0) * 25  # Increasing penalty
+
+        return bonus
+
     def _check_phase_advancement(self):
         """Check if we should advance to the next phase"""
         if not self._track_stats or len(self.episode_results) < 50:
             return False
-        
+
         success_rate = sum(self.episode_results) / len(self.episode_results)
-        
+
         if self.current_phase == 1 and success_rate >= self.phase1_success_threshold:
             # Advance to phase 2
             self._advance_to_phase(2)
             return True
-        elif self.current_phase == 2 and success_rate >= self.phase2_success_threshold:
-            # Advance to phase 3
-            self._advance_to_phase(3)
-            return True
+        elif self.current_phase == 2 and len(self.episode_qualified_results) >= 50:
+            # Phase 2 requires BOTH loop completion AND chain lift usage
+            qualified_success_rate = sum(self.episode_qualified_results) / len(self.episode_qualified_results)
+            if qualified_success_rate >= self.phase2_success_threshold:
+                # Advance to phase 3
+                self._advance_to_phase(3)
+                return True
         elif self.current_phase == 3:
             # Handle phase 3 sub-stage progression
             if (success_rate >= self.phase3_success_threshold and 
@@ -376,6 +538,7 @@ class PhasedCurriculumWrapper(gym.Wrapper):
                 
                 # Clear history for new sub-stage
                 self.episode_results.clear()
+                self.episode_qualified_results.clear()  # Clear this too to prevent stale data
                 self.phase_episode_count = 0
                 
                 if self.verbose >= 1:
@@ -404,7 +567,8 @@ class PhasedCurriculumWrapper(gym.Wrapper):
         self.current_phase = new_phase
         self.phase_episode_count = 0
         self.episode_results.clear()
-        
+        self.episode_qualified_results.clear()  # Clear qualified results too
+
         # Update environment settings
         self._update_phase_settings()
         
@@ -417,9 +581,10 @@ class PhasedCurriculumWrapper(gym.Wrapper):
                 print("   - Maintaining focus on loop completion")
                 print(f"   - Max track length: {self.phase2_max_length}")
             elif new_phase == 3:
-                print("   Phase 3: Build Quality")
-                print("   - Full reward structure enabled")
-                print("   - Progressive difficulty increase")
+                print("   Phase 3: Build Quality Rides")
+                print("   - Optimize for ride statistics (Excitement, Intensity, Nausea)")
+                print("   - Ride quality bonus up to ~400 points")
+                print("   - Target: E=7-9, I=4.5-6.5, N<4.5")
                 print(f"   - Starting max length: {self.phase3_current_length}")
             print(f"   Previous phase success rate: {success_rate:.1%}")
             print(f"{'='*70}\n")
@@ -428,11 +593,20 @@ class PhasedCurriculumWrapper(gym.Wrapper):
         """Reset environment and check for phase advancement"""
         # Check phase advancement before reset
         self._check_phase_advancement()
-        
+
         # Reset repetition tracking
         self.recent_action_positions.clear()
         self.repetition_penalty_count = 0
-        
+
+        # Reset Phase 2 specific tracking
+        if hasattr(self, 'phase2_visited_positions'):
+            self.phase2_visited_positions.clear()
+
+        # Reset Phase 2 chain lift counter
+        base_env = self._get_base_env()
+        if hasattr(base_env, 'phase2_chain_lift_count'):
+            base_env.phase2_chain_lift_count = 0
+
         # Reset the environment
         obs, info = self.env.reset(**kwargs)
         
@@ -460,20 +634,58 @@ class PhasedCurriculumWrapper(gym.Wrapper):
     def step(self, action):
         """Execute action and track performance"""
         obs, reward, terminated, truncated, info = self.env.step(action)
-        
+
         # Track episode completion
         if (terminated or truncated) and self._track_stats:
             self.episode_count += 1
             self.phase_episode_count += 1
-            
+
             # Check if loop was completed
             base_env = self._get_base_env()
             success = base_env.loop_completed if hasattr(base_env, 'loop_completed') else False
             self.episode_results.append(success)
-            
+
+            # Phase 2 specific: Track "qualified" success (loop completion + chain lift requirement)
+            if self.current_phase == 2:
+                chain_lift_count = getattr(base_env, 'phase2_chain_lift_count', 0)
+                qualified_success = success and chain_lift_count >= 8
+                self.episode_qualified_results.append(qualified_success)
+
+                if self.verbose >= 2 and success:
+                    if qualified_success:
+                        print(f"✅ Qualified success: Loop completed with {chain_lift_count} chain lifts")
+                    else:
+                        print(f"⚠️ Loop completed but only {chain_lift_count} chain lifts (need 8+, not counted for phase advancement)")
+
             if success:
                 self.total_loops_completed += 1
-            
+
+            # Phase 3: Add ride quality bonus if ride test was performed
+            if self.current_phase == 3 and success and 'ride_rating' in info:
+                ride_rating = info['ride_rating']
+                excitement = ride_rating.get('excitement', 0)
+                intensity = ride_rating.get('intensity', 0)
+                nausea = ride_rating.get('nausea', 0)
+
+                # Calculate and add quality bonus
+                quality_bonus = self._calculate_ride_quality_bonus(excitement, intensity, nausea)
+                reward += quality_bonus
+
+                # Log the bonus for transparency
+                info['ride_quality_bonus'] = quality_bonus
+                if self.verbose >= 1 and quality_bonus != 0:
+                    print(f"🎢 Ride Quality: E={excitement:.1f} I={intensity:.1f} N={nausea:.1f} → Bonus: {quality_bonus:+.1f}")
+
+                # Track best ride stats
+                if not hasattr(self, 'best_ride_quality'):
+                    self.best_ride_quality = quality_bonus
+                    self.best_ride_stats = (excitement, intensity, nausea)
+                elif quality_bonus > self.best_ride_quality:
+                    self.best_ride_quality = quality_bonus
+                    self.best_ride_stats = (excitement, intensity, nausea)
+                    if self.verbose >= 1:
+                        print(f"🏆 New best ride quality: {quality_bonus:.1f} points!")
+
             # Add phase info to episode info
             info['learning_phase'] = self.current_phase
             info['phase_success'] = success
@@ -481,7 +693,7 @@ class PhasedCurriculumWrapper(gym.Wrapper):
                 sum(self.episode_results) / len(self.episode_results)
                 if self.episode_results else 0
             )
-            
+
             # Add phase-specific rewards breakdown
             if hasattr(self, 'phase_rewards'):
                 info['phase_rewards'] = self.phase_rewards
@@ -491,14 +703,23 @@ class PhasedCurriculumWrapper(gym.Wrapper):
                 success_rate = sum(self.episode_results) / len(self.episode_results) if self.episode_results else 0
                 phase_name = {
                     1: "Find Home",
-                    2: "Explore & Return", 
+                    2: "Explore & Return",
                     3: f"Build Quality (stage {self.phase3_stage})"
                 }.get(self.current_phase, f"Phase {self.current_phase}")
-                
-                print(f"📊 Phase {self.current_phase} ({phase_name}): "
-                      f"Success: {success_rate:.1%} "
-                      f"({sum(self.episode_results)}/{len(self.episode_results)}) "
-                      f"Total loops: {self.total_loops_completed}")
+
+                # Phase 2: Show both loop completion and qualified (with chain lifts) rates
+                if self.current_phase == 2 and self.episode_qualified_results:
+                    qualified_rate = sum(self.episode_qualified_results) / len(self.episode_qualified_results)
+                    print(f"📊 Phase {self.current_phase} ({phase_name}): "
+                          f"Success: {success_rate:.1%} | "
+                          f"With Chain Lifts: {qualified_rate:.1%} "
+                          f"({sum(self.episode_qualified_results)}/{len(self.episode_qualified_results)}) "
+                          f"Total loops: {self.total_loops_completed}")
+                else:
+                    print(f"📊 Phase {self.current_phase} ({phase_name}): "
+                          f"Success: {success_rate:.1%} "
+                          f"({sum(self.episode_results)}/{len(self.episode_results)}) "
+                          f"Total loops: {self.total_loops_completed}")
         
         return obs, reward, terminated, truncated, info
     
