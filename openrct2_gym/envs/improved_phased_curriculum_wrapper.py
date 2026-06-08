@@ -100,12 +100,23 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
 
     @staticmethod
     def _phase_reward_params(phase):
-        """Per-phase RewardParams. The PBRS potential (Phi weights/normalizers) is FIXED
-        across phases for global policy-invariance; only the sparse objectives vary:
-        ride-quality scoring and a small living cost turn on in phase 5."""
+        """Per-phase RewardParams. The PBRS potential (Phi weights/normalizers, incl. the
+        elevation-discovery w_h/h_scale) is FIXED across phases for global policy-invariance;
+        only the sparse objectives vary. The structural bonus rewards the lift-hill / drop
+        structure each intermediate phase gates on (chains in P2; chains AND drop in P3/P4);
+        phase 5 turns it off and hands over to ride-quality scoring."""
         if phase >= 5:
-            return RewardParams(R_quality_max=500.0, step_cost=-0.01)
-        return RewardParams()
+            return RewardParams(R_quality_max=500.0, step_cost=-0.01)   # struct off, quality on
+        if phase == 2:                                                   # gate: >=3 chains
+            return RewardParams(R_struct_max=250.0, struct_chain_target=3,
+                                struct_w_chain=1.0, struct_w_drop=0.0)
+        if phase == 3:                                                   # gate: >=2 chains AND drop
+            return RewardParams(R_struct_max=250.0, struct_chain_target=2,
+                                struct_w_chain=0.5, struct_w_drop=0.5)
+        if phase == 4:                                                   # integration: hill + drop
+            return RewardParams(R_struct_max=250.0, struct_chain_target=3,
+                                struct_w_chain=0.5, struct_w_drop=0.5)
+        return RewardParams()                                           # phase 1: struct off
 
     @staticmethod
     def _history_chain_count(base_env):
@@ -118,6 +129,18 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
         """Whether the track history contains a drop/descent piece."""
         history = getattr(base_env.track_builder, 'history', [])
         return any(h.get('action') in (6, 8, 12, 14) for h in history)
+
+    def _is_qualified(self, base_env, success):
+        """Phase-specific 'qualified completion' predicate, matching each phase's reward:
+        P2 = completed with >=3 chain lifts; P3 = completed with >=2 chain lifts AND a drop
+        (tightened from OR so the agent must keep the lift hill and add a drop). Returns
+        None for phases without a structural gate (1, 4, 5)."""
+        if self.current_phase == 2:
+            return bool(success and self._history_chain_count(base_env) >= 3)
+        if self.current_phase == 3:
+            return bool(success and self._history_chain_count(base_env) >= 2
+                        and self._history_has_drop(base_env))
+        return None
 
     def _update_phase_settings(self):
         """Update environment settings based on current phase.
@@ -296,16 +319,11 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
             base_env = self._get_base_env()
             success = getattr(base_env, 'loop_completed', False)
             self.episode_results.append(success)
+            chain_count = self._history_chain_count(base_env)
 
-            # Phase-specific qualified success tracking, sourced from the removal-safe
-            # track history (not from reward-time bookkeeping, which no longer exists).
-            if self.current_phase == 2:
-                qualified = success and self._history_chain_count(base_env) >= 3
-                self.episode_qualified_results.append(qualified)
-
-            elif self.current_phase == 3:
-                has_patterns = self._history_chain_count(base_env) >= 2 or self._history_has_drop(base_env)
-                qualified = success and has_patterns
+            # Phase-specific qualified success, sourced from the removal-safe track history.
+            qualified = self._is_qualified(base_env, success)
+            if qualified is not None:
                 self.episode_qualified_results.append(qualified)
 
             if success:
@@ -314,8 +332,16 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
             # Ride-quality scoring now lives in the env's terminal reward (single
             # authority); the wrapper no longer adds a quality bonus here.
 
-            # Add phase info
+            # Add phase info + diagnostics (so the curriculum progress is visible in TB).
             info['learning_phase'] = self.current_phase
+            info['curriculum_phase'] = self.current_phase
+            info['chain_count'] = chain_count
+            if qualified is not None:
+                info['qualified'] = bool(qualified)
+                info['qualified_rate'] = (
+                    sum(self.episode_qualified_results) / len(self.episode_qualified_results)
+                    if self.episode_qualified_results else 0.0
+                )
             info['phase_success'] = success
             info['phase_success_rate'] = (
                 sum(self.episode_results) / len(self.episode_results)

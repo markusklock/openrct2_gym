@@ -183,14 +183,19 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
                     env_success_rate = self.loop_completed_counts[env_idx] / self.episode_counts[env_idx]
                     self.logger.record(f'success/env_{env_idx}_completion_rate', env_success_rate)
                 
-                # Log curriculum info if available (from first env that completes)
-                if 'curriculum_stage' in self.locals['infos'][env_idx]:
-                    self.logger.record('curriculum/stage', self.locals['infos'][env_idx]['curriculum_stage'])
-                if 'max_track_length' in self.locals['infos'][env_idx]:
-                    self.logger.record('curriculum/max_length', self.locals['infos'][env_idx]['max_track_length'])
-                if 'curriculum_success_rate' in self.locals['infos'][env_idx]:
-                    self.logger.record('curriculum/stage_success_rate', 
-                                     self.locals['infos'][env_idx]['curriculum_success_rate'])
+                # Log curriculum info if available (from first env that completes).
+                # The improved 5-phase wrapper emits 'learning_phase'/'curriculum_phase' and
+                # (in phases 2-3) 'qualified_rate' — surface them so the curriculum's progress
+                # past the lift-hill gate is visible in TensorBoard.
+                _info = self.locals['infos'][env_idx]
+                if 'curriculum_phase' in _info:
+                    self.logger.record('curriculum/phase', _info['curriculum_phase'])
+                elif 'learning_phase' in _info:
+                    self.logger.record('curriculum/phase', _info['learning_phase'])
+                if 'max_track_length' in _info:
+                    self.logger.record('curriculum/max_length', _info['max_track_length'])
+                if 'qualified_rate' in _info:
+                    self.logger.record('curriculum/qualified_rate', _info['qualified_rate'])
                 
                 # Episode metrics provided via info dict before reset
                 info_metrics = self.locals['infos'][env_idx].get('episode_metrics', {})
@@ -205,6 +210,12 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
                                 self.logger.record(f'rewards/{phase}_total', reward)
                         if 'chain_lift_count' in info_metrics:
                             self.logger.record('chain_lift/count', info_metrics['chain_lift_count'])
+                        if 'chain_count' in info_metrics:   # history-based, gate-aligned
+                            self.logger.record('chain_lift/history_count', info_metrics['chain_count'])
+                        if 'struct_bonus' in info_metrics:
+                            self.logger.record('rewards/struct_bonus', info_metrics['struct_bonus'])
+                        if 'max_gain' in info_metrics:
+                            self.logger.record('height/max_gain', info_metrics['max_gain'])
                         if 'remove_count' in info_metrics:
                             self.logger.record('behavior/remove_count', info_metrics['remove_count'])
 

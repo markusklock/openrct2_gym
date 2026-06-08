@@ -31,9 +31,17 @@ class RewardParams:
     d_xy: float = 40.0
     d_z: float = 20.0
     e_scale: float = 50.0
+    # --- Discovery potential (FIXED across phases; makes climbing findable) ---
+    w_h: float = 6.0               # banked-elevation weight in Phi
+    h_scale: float = 6.0           # elevation normalizer (z-units); saturate at ~a 3-chain hill
     # --- Sparse real objectives ---
     R_complete: float = 1000.0     # fixed completion bonus across all phases
     R_quality_max: float = 0.0     # 0 disables quality (phases 1-4); 500 in phase 5
+    # --- Structural objective (completion-conditioned; phase-scaled, rewards lift hills/drops) ---
+    R_struct_max: float = 0.0      # 0 in P1/P5; 250 in P2-4
+    struct_chain_target: int = 3   # chain-lift count for full chain credit (matches the phase gate)
+    struct_w_chain: float = 1.0    # weight on the chain-lift component
+    struct_w_drop: float = 0.0     # weight on the drop component
     exc_target: float = 8.0
     exc_sigma: float = 1.0
     int_target: float = 5.5
@@ -304,6 +312,10 @@ class OpenRCT2Env(gym.Env):
             info['episode_metrics'] = {
                 'min_distance': self.min_distance_reached,
                 'chain_lift_count': self.chain_lift_count,
+                'chain_count': sum(1 for h in self.track_builder.history if h.get('action') in (9, 10)),
+                'struct_bonus': getattr(self, '_last_struct_bonus', 0.0),
+                'max_gain': max((h['next_position'][2] - self.STATION_HEIGHT
+                                 for h in self.track_builder.history), default=0.0),
                 'track_length': self.track_length,
                 'phase_rewards': dict(self.phase_rewards),
                 'collision_count': self.collision_count,
@@ -416,6 +428,7 @@ class OpenRCT2Env(gym.Env):
         penalty OUTSIDE PBRS and must NOT advance _phi_prev (the head did not move).
         """
         params = self.reward_params
+        self._last_struct_bonus = 0.0          # reset each step (covers the failure early-return)
         if not success:
             return float(params.fail_penalty)
 
@@ -426,6 +439,10 @@ class OpenRCT2Env(gym.Env):
         reward += params.step_cost
         if self.loop_completed:
             reward += params.R_complete
+            # Completion-conditioned structural bonus (lift hill / drop). Computed once and
+            # stored so episode_metrics reports exactly what was added to the reward.
+            self._last_struct_bonus = self._structural_bonus(params)
+            reward += self._last_struct_bonus
 
         if getattr(self, "verbose", 0) >= 2:
             print("Reward was: %.3f (Phi'=%.3f, dist: %.1f, track: %d)" % (
@@ -562,6 +579,15 @@ class OpenRCT2Env(gym.Env):
         phi = (params.w_xy * (1.0 - m_xy)
                + params.w_z * (1.0 - m_z)
                + params.w_e * v)
+        # Discovery term: banked peak elevation gained above the station. A pure function of
+        # the removal-safe history (max recomputes lower on remove, so it telescopes), it makes
+        # climbing findable without penalizing the descent/return (max doesn't fall on the way
+        # down). The `if hist:` guard handles empty/None history (max() of empty would raise).
+        hist = getattr(self.track_builder, "history", None)
+        if hist:
+            max_gain = max(h["next_position"][2] - self.STATION_HEIGHT for h in hist)
+            max_gain = min(max(max_gain, 0.0), params.h_scale)
+            phi += params.w_h * (max_gain / params.h_scale)
         close_dir = self._reward_target_direction()
         if close_dir is not None:
             cur = self.direction_vectors[self.current_direction]
@@ -588,6 +614,22 @@ class OpenRCT2Env(gym.Env):
         q_n = 0.5 * (1.0 + np.tanh(0.5 * (params.nausea_max - nausea) / params.nausea_tau))
         return float(params.R_quality_max
                      * (params.q_w_exc * q_e + params.q_w_int * q_i + params.q_w_nausea * q_n))
+
+    def _structural_bonus(self, params):
+        """Completion-conditioned bonus for building the lift-hill / drop structure each
+        intermediate phase gates on, in [0, R_struct_max]. A pure function of the
+        removal-safe track history (NOT self.chain_lift_count, which is capped/bookkept and
+        can desync from the gate). Only the caller's completion guard makes it a real bonus,
+        so it cannot be place/remove-farmed. Returns 0 when disabled (P1/P5)."""
+        if params.R_struct_max <= 0:
+            return 0.0
+        hist = getattr(self.track_builder, "history", None) or []
+        chain_count = sum(1 for h in hist if h.get("action") in (9, 10))
+        has_drop = any(h.get("action") in (6, 8, 12, 14) for h in hist)
+        chain_q = min(chain_count / params.struct_chain_target, 1.0)
+        drop_q = 1.0 if has_drop else 0.0
+        quality = min(params.struct_w_chain * chain_q + params.struct_w_drop * drop_q, 1.0)
+        return float(params.R_struct_max * quality)
 
     def _calculate_distance_to_start(self):
         point_a = np.array(self.current_position)
