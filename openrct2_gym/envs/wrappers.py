@@ -101,29 +101,3 @@ class OpenRCT2Wrapper(gym.Wrapper):
     def _calculate_energy_margin(self) -> float:
         """Forward energy margin calculation to the unwrapped environment."""
         return self.unwrapped._calculate_energy_margin()
-
-    def _calculate_energy_reward(self) -> float:
-        """Forward energy reward calculation to the unwrapped environment."""
-        return self.unwrapped._calculate_energy_reward()
-
-    # Pattern detection methods
-    def _detect_lift_hill_pattern(self) -> float:
-        """Forward lift hill pattern detection to the unwrapped environment."""
-        return self.unwrapped._detect_lift_hill_pattern()
-
-    def _detect_drop_pattern(self) -> float:
-        """Forward drop pattern detection to the unwrapped environment."""
-        return self.unwrapped._detect_drop_pattern()
-
-    def _detect_turnaround(self) -> float:
-        """Forward turnaround detection to the unwrapped environment."""
-        return self.unwrapped._detect_turnaround()
-
-    def _get_pattern_rewards(self) -> float:
-        """Forward pattern rewards calculation to the unwrapped environment."""
-        return self.unwrapped._get_pattern_rewards()
-
-    # Approach guidance
-    def _calculate_approach_reward(self, action) -> float:
-        """Forward approach reward calculation to the unwrapped environment."""
-        return self.unwrapped._calculate_approach_reward(action)

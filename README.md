@@ -17,8 +17,8 @@ Initially I tried using UI automation with pyautogui to click buttons in the gam
 The project has evolved significantly from its UI automation origins. It now features:
 
 - **API-based control**: Direct communication with OpenRCT2 via HTTP API with retry logic
-- **Physics-aware rewards**: Energy estimation helps agent understand chain lifts add energy, drops provide speed
-- **Pattern detection**: Rewards for building proper lift hills, drops, and turnarounds
+- **Potential-based reward (PBRS)**: a single, unified, policy-invariant reward that gives a dense gradient toward closing the circuit — and is provably un-farmable (no place/remove exploit)
+- **Auto-calibrated closing target**: the geometry required to close the circuit is learned from the first completion, so the reward always points at the true closable state
 - **5-phase curriculum learning**: Progressive skill acquisition from navigation to ride quality optimization
 - **Parallel training**: Multiple OpenRCT2 instances on different ports using DummyVecEnv
 - **Action masking**: Prevents invalid track placements
@@ -69,14 +69,11 @@ python train_parallel_curriculum_masked.py --ports 8080 --improved --timesteps 1
 python train_parallel_curriculum_masked.py --ports 8080,8081,8082,8083 --improved --timesteps 1000000
 ```
 
-The `--improved` flag enables the physics-aware 5-phase curriculum with energy estimation and pattern detection.
+The `--improved` flag enables the 5-phase curriculum with the potential-based reward (see [Reward System](#reward-system-potential-based-shaping)).
 
 ### Alternative Training Options
 
 ```bash
-# Legacy 3-phase curriculum
-python train_parallel_curriculum_masked.py --ports 8080 --phased --timesteps 500000
-
 # Standard training with action masking (no curriculum)
 python train_rl_agent_masked.py --timesteps 500000
 ```
@@ -88,49 +85,61 @@ python train_rl_agent_masked.py --timesteps 500000
 tensorboard --logdir ./parallel_curriculum_masked_tensorboard/
 ```
 
-## Reward System (Improved 5-Phase Curriculum)
+## Reward System (Potential-Based Shaping)
 
-The `--improved` flag enables a physics-aware reward system that teaches roller coaster mechanics:
+The agent is trained with a **single, unified, potential-based reward** (PBRS — Ng, Harada & Russell, 1999). The curriculum never swaps the reward function; it only sets parameters per phase. Each step's reward is:
 
-### Energy Model
+```
+reward = F + sparse terms,    where   F = γ·Φ(s′) − Φ(s)
+```
 
-The agent learns that roller coasters need energy:
-- **Chain lifts add energy**: +50 energy per chain lift piece
-- **Drops convert potential to kinetic**: +3 energy per unit of descent
-- **Friction costs energy**: -2 per piece, extra for turns
-- **Climbing without chain costs energy**: -5 per unit of ascent
+### Potential Φ(s)
 
-**Energy margin reward**: Agent is rewarded for maintaining positive energy (track is viable).
+Φ measures how close the build head is to a state from which the circuit can **close**, combining three alignment axes plus energy viability:
 
-### Pattern Detection
+- **Horizontal alignment** to the closing tile
+- **Height alignment** to station height
+- **Heading alignment** to the closing direction
+- **Energy viability** — a sigmoid of the energy margin (does the track have enough energy to make it home?)
 
-Rewards for building proper roller coaster patterns:
-- **Lift hill pattern** (3+ chain pieces → drop): +15 to +20
-- **Drop pattern** (transition → steep descent → recovery): +10 to +15
-- **Turnaround** (reversing direction toward station): +15 to +20
+Φ is bounded and maximized exactly at the closable state, so `F = γ·Φ(s′) − Φ(s)` gives a **dense gradient that pulls the agent toward completing the circuit** — directly targeting the hardest part of the problem.
 
-### 5-Phase Curriculum
+**Why potential-based?** PBRS is *provably policy-invariant*: shaping changes how fast the agent learns, never the optimal policy. Two consequences:
+- Place-then-remove **telescopes to ≈(γ−1)·Φ < 0**, so it can never be farmed — the place/remove exploit is impossible by construction (no symmetric-removal bookkeeping needed).
+- The Φ weights are **fixed across all phases**, preserving global invariance — only the sparse objectives below vary by phase.
 
-Each phase emphasizes different skills:
+### Sparse objectives (the real goals)
 
-| Phase | Name | Max Pieces | Focus | Advancement |
-|-------|------|------------|-------|-------------|
-| 1 | Return Practice | 25 | Pure navigation (4x distance rewards) | 50% completion |
-| 2 | Lift Hill Building | 40 | Chain lifts + energy (2x energy rewards) | 40% with 3+ chains |
-| 3 | Drop & Turn | 60 | Drops + turnarounds + patterns | 35% with patterns |
-| 4 | Circuit Mastery | 80 | Full integration + approach guidance | 30% completion |
-| 5 | Quality Optimization | 80-120 | Ride ratings (E=7-9, I=4.5-6.5, N<4.5) | Progressive |
+- **Circuit completion: +1000** — the dominant signal. Completion always strictly outweighs all accumulated shaping, so the agent is *completion-first*.
+- **Ride quality (phase 5 only): 0–500** — a smooth, bounded, **non-negative** bonus peaking at Excitement ≈ 8, Intensity ≈ 5.5, low Nausea. Applied only on a completed, ride-tested circuit, so a finished ride is never punished.
+- **Small penalties** — a tiny failed-placement penalty, plus an optional small per-step cost in phase 5 to discourage stalling.
 
-### Approach Guidance (Soft, Non-Restrictive)
+### Auto-calibrated closing target
 
-Near the station, the agent receives bonuses (not penalties) for:
-- **Height alignment**: +5 when at correct height (z=14)
-- **Flat piece usage**: +3 for using flat/transition pieces when close
-- **Direction alignment**: +3 when facing toward station
+`goal_position` is only a guide tile; the game itself decides completion via its `isCircuitComplete` flag. So the **exact closing geometry** (the head position and direction from which the circuit actually closes) is **learned automatically from the first completed circuit** and reused for the rest of training (cached to `logs/close_geometry.json`). Until calibrated, the heading term is disabled so a wrong guess can't create a dead end. This guarantees Φ points at the *true* closable state rather than a hand-guessed tile.
 
-### Circuit Completion
+### Energy model (feeds Φ's viability term)
 
-Any piece that the game engine accepts as completing the circuit is valid. The artificial restriction limiting completion to only flat pieces has been removed.
+- **Chain lifts add energy**: +50 per chain-lift piece
+- **Drops convert height to speed**: +3 per unit of descent
+- **Friction costs energy**: −2 per piece (extra for turns)
+- **Climbing without a chain costs energy**: −5 per unit of ascent
+
+The **energy margin** estimates whether the current track can still return to the station. Φ rewards keeping it positive, which naturally encourages lift-hill-then-drop structure without any explicit per-pattern bonus.
+
+### 5-Phase Curriculum (parameters only)
+
+All five phases share the **same reward and the same Φ**; they differ only in the track-length limit, whether ride-testing/quality is active, and the advancement criterion:
+
+| Phase | Name | Max Pieces | What it adds | Advancement |
+|-------|------|------------|--------------|-------------|
+| 1 | Return Practice | 25 | completion only | 50% completion |
+| 2 | Lift Hill Building | 40 | completion only | 40% with 3+ chain lifts |
+| 3 | Drop & Turn | 60 | completion only | 35% with chain lifts or drops |
+| 4 | Circuit Mastery | 80 | completion only | 30% completion |
+| 5 | Quality Optimization | 80–120 | ride testing + quality bonus (+ tiny step cost) | progressive length |
+
+Circuit completion is whatever the game engine accepts via `isCircuitComplete` — there are no artificial restrictions on which piece may close the loop. Height, flatness, and heading near the station are handled smoothly by Φ's alignment terms rather than by hard rules.
 
 ## Observation Space
 
@@ -177,12 +186,11 @@ The training scripts provide extensive metrics in Tensorboard:
 
 ## Recent Improvements
 
-- **Physics-aware rewards**: Energy model helps agent understand roller coaster mechanics
-- **Pattern detection**: Rewards for lift hills, drops, and turnarounds
-- **5-phase curriculum**: Progressive skill acquisition
-- **Ride quality optimization**: Phase 5 targets good excitement/intensity/nausea ratings
+- **Potential-based reward (PBRS)**: a single unified, policy-invariant reward replacing the old per-step shaping — provably un-farmable
+- **Auto-calibrated closing target**: the closing geometry is learned from the first completed circuit, so the reward targets the true closable state
+- **Completion-first objective**: a large completion bonus dominates; ride quality is a smooth, bounded bonus in phase 5
+- **5-phase curriculum**: phases now only set parameters — the reward and potential stay identical throughout
 - **Parallel training stability**: DummyVecEnv with retry logic for reliable multi-instance training
-- **Removed artificial restrictions**: Any valid circuit completion is accepted
 
 ## Future Improvements
 

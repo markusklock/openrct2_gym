@@ -1,14 +1,58 @@
 import gymnasium as gym
 import numpy as np
 import time
+import json
+import os
 from collections import deque
+from dataclasses import dataclass
 from .api_track_builder import APITrackBuilder
 from .api_controller import APIController
 from .obs_config import (
     make_observation_space, SEQ_LEN, HIST_FEAT_DIM, MAP_SHAPE, SCALE, H_SCALE,
 )
 
+
+@dataclass(frozen=True)
+class RewardParams:
+    """All tunables for the unified, potential-based reward.
+
+    The Phi-weights and normalizers are FROZEN across all curriculum phases so the
+    single potential is globally policy-invariant (Ng/Harada/Russell 1999); only the
+    sparse-objective fields (R_quality_max, step_cost) and the env's max_track_length /
+    skip_ride_testing vary per phase.
+    """
+    gamma: float = 0.99            # MUST equal the PPO discount for PBRS invariance
+    # --- Phi potential weights (fixed across phases) ---
+    w_xy: float = 10.0             # horizontal alignment to the closing tile
+    w_z: float = 6.0               # height alignment to station height
+    w_dir: float = 6.0             # heading alignment to the closing direction
+    w_e: float = 2.0               # energy viability bonus
+    # --- Phi normalizers (decoupled from obs SCALE/H_SCALE; see plan #6) ---
+    d_xy: float = 40.0
+    d_z: float = 20.0
+    e_scale: float = 50.0
+    # --- Sparse real objectives ---
+    R_complete: float = 1000.0     # fixed completion bonus across all phases
+    R_quality_max: float = 0.0     # 0 disables quality (phases 1-4); 500 in phase 5
+    exc_target: float = 8.0
+    exc_sigma: float = 1.0
+    int_target: float = 5.5
+    int_sigma: float = 1.0
+    nausea_max: float = 4.5
+    nausea_tau: float = 1.0
+    q_w_exc: float = 0.5
+    q_w_int: float = 0.3
+    q_w_nausea: float = 0.2
+    # --- costs (negative; added to reward) ---
+    fail_penalty: float = -0.1
+    step_cost: float = 0.0
+
+
 class OpenRCT2Env(gym.Env):
+    # Calibrated closing geometry, shared across in-process env instances
+    # (DummyVecEnv) and backed by a JSON file for SubprocVecEnv / later runs.
+    _close_cache = None
+    _CLOSE_CACHE_PATH = "logs/close_geometry.json"
     def __init__(self, render_mode=None, host="localhost", port=8080, verbose=1):
         super(OpenRCT2Env, self).__init__()
         self.render_mode = render_mode
@@ -16,7 +60,11 @@ class OpenRCT2Env(gym.Env):
         self.api_controller = APIController(host, port, verbose)
         self.track_builder = APITrackBuilder(self.api_controller)
         self.skip_ride_testing = False  # Can be set by wrappers to skip entrance/exit and testing
-        
+
+        # Unified potential-based reward config (wrappers override per phase).
+        self.reward_params = RewardParams()
+        self._phi_prev = 0.0  # Phi(s) carried between steps for PBRS shaping
+
         # Connect to API server
         if not self.api_controller.connect():
             raise RuntimeError(f"Failed to connect to OpenRCT2 API server at {host}:{port}")
@@ -49,7 +97,6 @@ class OpenRCT2Env(gym.Env):
         self.previous_distance = None
         self.position_history = deque(maxlen=self.POSITION_HISTORY_MAXLEN)
         self.chain_lift_positions = set()  # Track positions where chain lifts were placed
-        self.piece_rewards = []  # Track reward earned for each placed piece (for symmetric removal)
         self.height_history = []  # Track height at each piece for energy calculations
 
         # Additional metrics tracking
@@ -137,6 +184,15 @@ class OpenRCT2Env(gym.Env):
                 self.track_length += 1
                 self.track_pieces.append(action)
                 self.height_history.append(new_position[2])  # Track height at this piece
+                # Chain-lift bookkeeping (count distinct chain-lift endpoints; reverted on
+                # remove by _revert_chain_lift). Kept out of the reward, which no longer
+                # pays a chain-lift bonus.
+                if action in (9, 10):
+                    pos_key = tuple(new_position)
+                    if (pos_key not in self.chain_lift_positions
+                            and self.chain_lift_count < self.max_chain_lifts):
+                        self.chain_lift_count += 1
+                        self.chain_lift_positions.add(pos_key)
 
             self.last_piece_type = action
             self.current_position = new_position
@@ -151,39 +207,20 @@ class OpenRCT2Env(gym.Env):
         if self.loop_completed:
             if self.verbose >= 1:
                 print(f"Loop has been completed, great success!")
+            # Learn the closing geometry from the first completion (applied next reset).
+            self._maybe_capture_closing_geometry()
         terminated = self.loop_completed
 
         # Now calculate reward (with correct loop_completed status)
         observation = self._get_observation()
         reward = self._calculate_reward(success, action)
 
-        # Track reward for this piece (for symmetric removal)
-        # Only track for successful placements (not removes)
-        if success and action != 31:
-            self.piece_rewards.append(reward)
-        elif success and action == 31 and self.piece_rewards:
-            # For remove action, the reward was already calculated as negative of last piece
-            # No need to track it
-            pass
-        
-        # Track metrics
+        # Track metrics that don't depend on the final reward value.
         current_distance = self._calculate_distance_to_start()[0]
         self.min_distance_reached = min(self.min_distance_reached, current_distance)
         self.max_height_reached = max(self.max_height_reached, self.current_position[2])
         self.unique_positions.add(tuple(self.current_position))
-        self.episode_rewards.append(reward)
-        
-        # Track phase-based rewards
-        if self.track_length <= 25:
-            self.current_phase = 'building'
-            self.phase_rewards['building'] += reward
-        elif self.track_length <= 40:
-            self.current_phase = 'transition'
-            self.phase_rewards['transition'] += reward
-        else:
-            self.current_phase = 'return'
-            self.phase_rewards['return'] += reward
-        
+
         # Check if episode was truncated
         truncated = self._is_trunkated()
         self.steps += 1
@@ -239,13 +276,28 @@ class OpenRCT2Env(gym.Env):
                 if self.verbose >= 1:
                     print("🎯 Loop completed! (Skipping ride testing in learning phase)")
                 info['ride_rating'] = {"excitement": 0, "intensity": 0, "nausea": 0}
-        elif truncated:
-            # Partial credit for getting close even if not completed
-            final_distance = self._calculate_distance_to_start()[0]
-            if final_distance < 10:
-                reward += (10 - final_distance) * 2
-            elif final_distance < 20:
-                reward += (20 - final_distance) * 0.5
+
+            # Graduated ride-quality bonus: the single authority for quality. Kept out of
+            # _calculate_reward because ride stats only arrive after the post-completion
+            # ride test. Gated to 0 when disabled (R_quality_max==0, phases 1-4) or when
+            # the ride was skipped/untested (all stats zero), so completion is never punished.
+            rr = info['ride_rating']
+            reward += self._quality_bonus(
+                rr.get('excitement', 0), rr.get('intensity', 0), rr.get('nausea', 0),
+                self.reward_params)
+        # Truncation gets no partial-credit bonus: PBRS already pays approach progress
+        # as-you-go (a non-potential terminal bonus would be farmable and break invariance).
+
+        # Reward accounting AFTER the terminal quality bonus is finalized, so episode_rewards
+        # and phase_rewards match the reward actually returned (no phase-5 under-reporting).
+        self.episode_rewards.append(reward)
+        if self.track_length <= 25:
+            self.current_phase = 'building'
+        elif self.track_length <= 40:
+            self.current_phase = 'transition'
+        else:
+            self.current_phase = 'return'
+        self.phase_rewards[self.current_phase] += reward
 
         # Store episode-level metrics before the environment resets
         if terminated or truncated:
@@ -299,9 +351,11 @@ class OpenRCT2Env(gym.Env):
         # Agent needs to place a piece at this position to connect to BeginStation
         self.goal_position = [
             self.station_start_position[0] + 1,     # X + 1 (one tile east)
-            self.station_start_position[1],      # Same Y 
+            self.station_start_position[1],      # Same Y
             self.station_start_position[2]       # Same Z
         ]
+        # Phi's geometric anchor: calibrated closing head if known, else provisional.
+        self._init_closing_target()
         self.current_direction = 0
         self.track_pieces = []
         self.track_length = 0
@@ -319,7 +373,6 @@ class OpenRCT2Env(gym.Env):
         self.previous_distance = None
         self.position_history = deque(maxlen=self.POSITION_HISTORY_MAXLEN)
         self.chain_lift_positions = set()
-        self.piece_rewards = []  # Reset reward tracking
         self.height_history = []  # Reset height tracking
         self.min_distance_reached = float('inf')
         self.max_height_reached = 0
@@ -345,150 +398,210 @@ class OpenRCT2Env(gym.Env):
         if not station_built:
             raise RuntimeError("Failed to build initial station")
 
+        # Seed the PBRS potential at the true starting head (post-station-build).
+        self._phi_prev = self._potential(self.reward_params)
+
         observation = self._get_observation()
         info = {}
         return observation, info
 
     def _calculate_reward(self, success, action):
-        # Special case: Remove action gets negative of last piece's reward
-        if success and action == 31:  # Remove piece
-            if self.piece_rewards:
-                # Return the exact negative of what was earned when placing this piece
-                removed_reward = self.piece_rewards.pop()
-                if self.verbose >= 2:
-                    print(f"Remove action: reversing reward of {removed_reward:.2f}")
-                return -removed_reward
-            else:
-                # No pieces to remove, small penalty
-                return -1
+        """Unified potential-based reward: ``reward = F + sparse terms``.
 
-        # Normal reward calculation for all other actions
-        reward = 0
-        current_distance = self._calculate_distance_to_start()[0]
+        F = gamma*Phi(s') - Phi(s) is policy-invariant shaping (Ng/Harada/Russell 1999),
+        so place-then-remove telescopes to ~(gamma-1)*Phi < 0 and cannot be farmed (the
+        old symmetric-removal hack is gone). On true completion Phi(s')=0 (standard
+        telescoping) and the large R_complete is added on top; the ride-quality bonus is
+        added separately in step() after the ride test. A failed placement returns a flat
+        penalty OUTSIDE PBRS and must NOT advance _phi_prev (the head did not move).
+        """
+        params = self.reward_params
+        if not success:
+            return float(params.fail_penalty)
 
-        if success:
-            # Base reward for successful action
-            reward += 1
+        phi_next = 0.0 if self.loop_completed else self._potential(params)
+        reward = params.gamma * phi_next - self._phi_prev
+        self._phi_prev = phi_next
 
-            # Reward for placing chain lifts early (actions 9 and 10), but at a
-            # reduced incentive so the agent still has pieces left to return to
-            # the station. Limit the reward to the first 15 pieces to avoid
-            # spending the entire budget on hills.
-            if self.track_length < 15 and action in [9, 10]:
-                position_key = tuple(self.current_position)
-                # Reward if this is a NEW position for chain lift
-                if position_key not in self.chain_lift_positions and self.chain_lift_count < self.max_chain_lifts:
-                    reward += 5  # bonus for chain lift
-                    self.chain_lift_count += 1
-                    self.chain_lift_positions.add(position_key)
-                # No penalty for rebuilding - the symmetry handles it
+        reward += params.step_cost
+        if self.loop_completed:
+            reward += params.R_complete
 
-            # Big reward for completing the loop
-            if self.loop_completed:
-                reward += 500
-                # Length bonus for longer completed tracks
-                if self.track_length > 50:
-                    reward += (self.track_length - 50) * 0.5
-                # Chain lift usage bonus
-                if self.chain_lift_count > 0:
-                    reward += 10
-            
-            # Simplified distance-based rewards (no internal phases)
-            if self.previous_distance is not None:
-                distance_delta = self.previous_distance - current_distance
+        if getattr(self, "verbose", 0) >= 2:
+            print("Reward was: %.3f (Phi'=%.3f, dist: %.1f, track: %d)" % (
+                reward, phi_next, self._calculate_distance_to_start()[0], self.track_length))
+        return float(reward)
 
-                # Consistent distance reward throughout
-                if distance_delta > 0:  # Moving closer
-                    reward += distance_delta * 1.0  # Moderate reward
-                else:  # Moving away
-                    # Small penalty that increases with track length
-                    penalty_factor = min(0.5 + (self.track_length / 100), 1.5)
-                    reward += distance_delta * penalty_factor * 0.2
+    def _reward_target_position(self):
+        """The geometric target Phi and the observation aim at.
 
-                # Proximity bonuses when getting close
-                if current_distance < 30:
-                    reward += (30 - current_distance) * 0.1
-                if current_distance < 15:
-                    reward += (15 - current_distance) * 0.2
-                if current_distance < 5:
-                    reward += (5 - current_distance) * 0.5
+        Once the closing geometry is calibrated (first completion), this is the
+        measured pre-close head tile; before calibration it is the provisional
+        guide tile ``goal_position``.
+        """
+        cp = getattr(self, "close_pos", None)
+        return cp if cp is not None else self.goal_position
 
-            # Height variation reward (for interesting coasters)
-            if action in [5, 6, 7, 8, 9, 10, 11, 12, 13, 14]:  # Slope pieces
-                # Reward height changes for variety
-                if not hasattr(self, 'last_height'):
-                    self.last_height = self.current_position[2]
-                height_change = abs(self.current_position[2] - self.last_height)
-                if height_change > 0:
-                    reward += min(height_change * 0.3, 2.0)  # Reward hills and drops
-                self.last_height = self.current_position[2]
+    def _reward_target_direction(self):
+        """The calibrated closing heading (0-3), or None before calibration."""
+        return getattr(self, "close_dir", None)
 
-            # Track variety bonus
-            if not hasattr(self, 'used_piece_types'):
-                self.used_piece_types = set()
-            if action not in self.used_piece_types and action != 31:
-                reward += 1.0  # Bonus for using new piece types
-                self.used_piece_types.add(action)
-            
-            # Track length milestone rewards
-            if self.track_length == 30:
-                reward += 5
-            elif self.track_length == 50:
-                reward += 10
-            elif self.track_length == 75:
-                reward += 15
-            elif self.track_length == 100:
-                reward += 20
-            
-            # Small continuous reward for building longer tracks
-            if self.track_length > 30:
-                reward += 0.1
+    # ----------------------------------------------------- closing-geometry calibration
+    # goal_position is only a guide tile; real closure is the API's isCircuitComplete
+    # flag on a placed piece's endpoint. So Phi's geometric anchor is learned: on the
+    # first completion we capture the pre-close head state and reuse it thereafter.
 
-            # Small reward for forward progress
-            if action != 31:
-                reward += 0.2  # Bonus for building
-            
-            # Reward shaping when close to goal (Solution 4)
-            if current_distance < 10:
-                # Strong incentive to use flat pieces when close to station
-                # Use the actual action taken (not last_action which is from previous step)
-                if action in [0, 13, 14]:  # Flat or transitions to flat
-                    reward += 5
-                    if self.verbose >= 2:
-                        print(f"Good choice near goal: flat piece {action}, bonus +5")
-                elif action != 31:  # Not remove action
-                    reward -= 2
-                    if self.verbose >= 2:
-                        print(f"Poor choice near goal: non-flat piece {action}, penalty -2")
+    @staticmethod
+    def _closing_record_from_history(history):
+        """Pre-close head state + closing-piece geometry from a completed history.
 
-            # Height penalty only for excessive height
-            if self.current_position[2] > 30:
-                reward -= (self.current_position[2] - 30) * 0.1  # Progressive penalty for going too high
-                
+        Uses the completing entry's ``position``/``direction`` (the head the closing
+        piece was placed FROM), not ``next_position`` (the post-close endpoint). The
+        closing ``action``/``track_type`` are kept for the sufficiency check.
+        """
+        if not history:
+            return None
+        entry = history[-1]
+        return {
+            "pos": list(entry["position"]),
+            "dir": int(entry["direction"]),
+            "action": int(entry["action"]),
+            "track_type": int(entry.get("track_type", -1)),
+        }
+
+    def _persist_close_cache(self, record):
+        """Set the process-wide cache and best-effort write it to disk (atomic)."""
+        OpenRCT2Env._close_cache = record
+        path = self._CLOSE_CACHE_PATH
+        try:
+            directory = os.path.dirname(path)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(record, f)
+            os.replace(tmp, path)
+        except OSError:
+            pass  # in-memory cache still set; persistence is best-effort
+
+    def _load_close_cache(self):
+        """Return the calibration record from memory, else from disk, else None.
+
+        Only a VALIDATED record is cached. A corrupted/old file is treated as no cache
+        (returns None without poisoning the in-memory cache), so a later completion can
+        still calibrate and overwrite it — otherwise _maybe_capture would early-exit forever.
+        """
+        if OpenRCT2Env._close_cache is not None:
+            return OpenRCT2Env._close_cache
+        try:
+            with open(self._CLOSE_CACHE_PATH) as f:
+                record = json.load(f)
+        except (OSError, ValueError):
+            return None
+        if not self._valid_close_record(record):
+            return None
+        OpenRCT2Env._close_cache = record
+        return record
+
+    def _maybe_capture_closing_geometry(self):
+        """On the first completion, capture+persist the closing geometry.
+
+        Applied at the NEXT reset (never mid-episode) so Phi stays self-consistent
+        within an episode; a no-op once calibrated.
+        """
+        if OpenRCT2Env._close_cache is not None:
+            return
+        if not getattr(self, "loop_completed", False):
+            return
+        record = self._closing_record_from_history(self.track_builder.history)
+        if record is not None:
+            self._persist_close_cache(record)
+            if getattr(self, "verbose", 0) >= 1:
+                print(f"[calibrate] closing geometry: head={record['pos']} dir={record['dir']} "
+                      f"closing_action={record['action']}")
+
+    @staticmethod
+    def _valid_close_record(cache):
+        """A calibration record is usable only with a 3-D position and a cardinal dir 0-3.
+        Guards against a corrupted/old logs/close_geometry.json producing an IndexError
+        in _potential's heading term."""
+        try:
+            return (cache is not None
+                    and len(cache.get("pos", [])) == 3
+                    and cache.get("dir") in (0, 1, 2, 3))
+        except (TypeError, AttributeError):
+            return False
+
+    def _init_closing_target(self):
+        """Set close_pos/close_dir from calibration if known/valid, else provisional (heading off)."""
+        cache = self._load_close_cache()
+        if self._valid_close_record(cache):
+            self.close_pos = list(cache["pos"])
+            self.close_dir = int(cache["dir"])
         else:
-            # Reduced penalty for failed placement (exploration)
-            reward -= 0.2  # Reduced from -0.5
-            
-        # Update previous distance for next step
-        self.previous_distance = current_distance
-        
-        if self.verbose >= 2:
-            print("Reward was: %.2f (dist: %.1f, track: %d)" % (reward, current_distance, self.track_length))
-        return reward
+            self.close_pos = None
+            self.close_dir = None
+
+    def _potential(self, params):
+        """Potential Phi(s) for PBRS shaping (F = gamma*Phi(s') - Phi(s)).
+
+        Rewards alignment of the build head to the closing state across all three
+        closure axes (horizontal position, height, heading) plus an energy-viability
+        bonus. Pure function of current state + track_builder.history (no API call),
+        bounded in [0, w_xy+w_z+w_dir+w_e], and maximized at the calibrated closing
+        (pos, dir) with positive energy margin. The heading term is omitted until the
+        closing direction is calibrated (avoids a wrong-heading reward wall).
+        """
+        target = self._reward_target_position()
+        px, py, pz = self.current_position
+        tx, ty, tz = target
+        m_xy = min(1.0, float(np.hypot(tx - px, ty - py)) / params.d_xy)
+        m_z = min(1.0, abs(pz - tz) / params.d_z)
+        # numerically-stable logistic of the energy margin -> viability in (0, 1)
+        v = 0.5 * (1.0 + np.tanh(0.5 * self._calculate_energy_margin() / params.e_scale))
+        phi = (params.w_xy * (1.0 - m_xy)
+               + params.w_z * (1.0 - m_z)
+               + params.w_e * v)
+        close_dir = self._reward_target_direction()
+        if close_dir is not None:
+            cur = self.direction_vectors[self.current_direction]
+            tgt = self.direction_vectors[close_dir]
+            cos_theta = cur[0] * tgt[0] + cur[1] * tgt[1]  # unit cardinal vectors
+            m_dir = (1.0 - cos_theta) / 2.0
+            phi += params.w_dir * (1.0 - m_dir)
+        return float(phi)
+
+    def _quality_bonus(self, excitement, intensity, nausea, params):
+        """Graduated, bounded, non-negative ride-quality bonus in [0, R_quality_max].
+
+        Smooth Gaussian bands for excitement/intensity (peaks at exc_target/int_target)
+        and a logistic for nausea (lower is better). Returns 0 when quality is disabled
+        (R_quality_max == 0, phases 1-4) or the ride was not tested (all stats zero), so
+        a completed ride is never punished (completion-first).
+        """
+        if params.R_quality_max <= 0:
+            return 0.0
+        if excitement == 0 and intensity == 0 and nausea == 0:
+            return 0.0
+        q_e = float(np.exp(-((excitement - params.exc_target) ** 2) / (2.0 * params.exc_sigma ** 2)))
+        q_i = float(np.exp(-((intensity - params.int_target) ** 2) / (2.0 * params.int_sigma ** 2)))
+        q_n = 0.5 * (1.0 + np.tanh(0.5 * (params.nausea_max - nausea) / params.nausea_tau))
+        return float(params.R_quality_max
+                     * (params.q_w_exc * q_e + params.q_w_int * q_i + params.q_w_nausea * q_n))
 
     def _calculate_distance_to_start(self):
         point_a = np.array(self.current_position)
-        point_b = np.array(self.goal_position)
+        point_b = np.array(self._reward_target_position())
         distance = float(np.linalg.norm(point_a - point_b))
         return np.array([distance], dtype=np.float32)
 
     def _revert_chain_lift(self, removed_entry):
         """Undo chain-lift bookkeeping when a piece is removed.
 
-        Mirrors the increment in _calculate_reward (which records an early chain lift's
-        endpoint position in chain_lift_positions and bumps chain_lift_count). The old
-        code never reverted this on removal, so counts/positions drifted after
-        remove/auto-backtrack. Guarded so only previously-recorded chain cells decrement.
+        Mirrors the increment in step()'s placement path (which records a chain lift's
+        endpoint in chain_lift_positions and bumps chain_lift_count). Without this,
+        counts/positions would drift after remove/auto-backtrack. Guarded so only
+        previously-recorded chain cells decrement.
         """
         if not removed_entry:
             return
@@ -614,8 +727,8 @@ class OpenRCT2Env(gym.Env):
             stamp(entry["position"], chain=is_chain)
             stamp(entry["next_position"], chain=is_chain)
 
-        # Goal tile.
-        stamp(self.goal_position, marker=True)
+        # Goal / closing-target tile.
+        stamp(self._reward_target_position(), marker=True)
 
         return grid
 
@@ -623,9 +736,10 @@ class OpenRCT2Env(gym.Env):
         current_distance = float(self._calculate_distance_to_start()[0])
 
         # Goal displacement / direction in the egocentric frame.
-        gdx = self.goal_position[0] - self.current_position[0]
-        gdy = self.goal_position[1] - self.current_position[1]
-        gdz = self.goal_position[2] - self.current_position[2]
+        target = self._reward_target_position()
+        gdx = target[0] - self.current_position[0]
+        gdy = target[1] - self.current_position[1]
+        gdz = target[2] - self.current_position[2]
         ego_r, ego_f = self._ego_rotate(gdx, gdy)
         goal_disp = np.clip(
             np.array([ego_r / SCALE, ego_f / SCALE, gdz / H_SCALE], dtype=np.float32),
@@ -649,7 +763,7 @@ class OpenRCT2Env(gym.Env):
         # Distance trend over the position-history window.
         if len(self.position_history) >= 2:
             old_dist = float(np.linalg.norm(
-                np.array(self.position_history[0]) - np.array(self.goal_position)))
+                np.array(self.position_history[0]) - np.array(target)))
             distance_trend = old_dist - current_distance
         else:
             distance_trend = 0.0
@@ -808,8 +922,7 @@ class OpenRCT2Env(gym.Env):
     TURN_FRICTION = 1        # Extra friction for turns
     STATION_HEIGHT = 14      # z-coordinate of station
 
-    # How many recent positions to retain. Must be >= 6 so _detect_turnaround()
-    # (which requires 6 samples) can ever fire; with the old maxlen=5 it never did.
+    # How many recent positions to retain for the observation's distance-trend signal.
     POSITION_HISTORY_MAXLEN = 8
 
     def _calculate_estimated_energy(self):
@@ -886,211 +999,6 @@ class OpenRCT2Env(gym.Env):
         energy_needed = distance * 0.5 + height_deficit * self.UPHILL_COST
 
         return current_energy - energy_needed
-
-    def _calculate_energy_reward(self):
-        """Reward based on energy management."""
-        energy_margin = self._calculate_energy_margin()
-
-        if energy_margin > 50:
-            return 3.0   # Healthy energy reserves
-        elif energy_margin > 20:
-            return 1.0   # Adequate energy
-        elif energy_margin > 0:
-            return 0.5   # Marginal but viable
-        elif energy_margin > -20:
-            return -2.0  # Warning: low energy
-        else:
-            return -5.0  # Critical: likely to stall
-
-    def _detect_lift_hill_pattern(self):
-        """
-        Detect if a proper lift hill pattern was built.
-        Pattern: [chain pieces] -> [transition/drop]
-        Returns a score 0-1 indicating pattern quality.
-        """
-        if len(self.track_pieces) < 5:
-            return 0.0
-
-        # Look for chain lift sequences
-        chain_sequences = []
-        current_sequence = []
-
-        for i, piece in enumerate(self.track_pieces):
-            if piece in [9, 10]:  # Chain lift pieces
-                current_sequence.append(i)
-            elif current_sequence:
-                if len(current_sequence) >= 2:  # Minimum 2 chain pieces for a lift hill
-                    chain_sequences.append(current_sequence.copy())
-                current_sequence = []
-
-        # Don't forget the last sequence if still building
-        if len(current_sequence) >= 2:
-            chain_sequences.append(current_sequence)
-
-        if not chain_sequences:
-            return 0.0
-
-        # Check if chain sequence is followed by drop
-        best_score = 0.0
-        for seq in chain_sequences:
-            end_idx = seq[-1]
-
-            # Check next few pieces for drop pattern
-            drop_score = 0.0
-            for j in range(end_idx + 1, min(end_idx + 5, len(self.track_pieces))):
-                piece = self.track_pieces[j]
-                if piece in [13, 14]:  # Transitions to flat (could precede drop)
-                    drop_score += 0.2
-                elif piece in [6, 8, 12]:  # Drop pieces (down slopes)
-                    drop_score += 0.4
-
-            # Score based on chain length and drop quality
-            chain_length_score = min(len(seq) / 4.0, 1.0)  # Max score at 4 pieces
-            pattern_score = chain_length_score * 0.6 + min(drop_score, 0.4)
-            best_score = max(best_score, pattern_score)
-
-        return best_score
-
-    def _detect_drop_pattern(self):
-        """
-        Detect well-executed drop sequences.
-        Pattern: [transition down] -> [steep descent] -> [recovery/transition up]
-        Returns a score 0-1.
-        """
-        if len(self.track_pieces) < 3:
-            return 0.0
-
-        score = 0.0
-        # Look for descent patterns
-        for i in range(len(self.track_pieces) - 2):
-            # Start of drop: flat to down or steep transitions
-            if self.track_pieces[i] in [12, 27]:  # Flat to down, down 25 to down 60
-                has_descent = False
-                has_recovery = False
-
-                for j in range(i + 1, min(i + 5, len(self.track_pieces))):
-                    if self.track_pieces[j] in [6, 8]:  # Down slopes
-                        has_descent = True
-                    if self.track_pieces[j] in [14, 28]:  # Recovery (down to flat)
-                        has_recovery = True
-
-                if has_descent and has_recovery:
-                    score = max(score, 1.0)
-                elif has_descent:
-                    score = max(score, 0.5)
-
-        return score
-
-    def _detect_turnaround(self):
-        """
-        Detect successful turnaround patterns.
-        Agent changed direction to head back toward station.
-        Returns a score 0-1.
-        """
-        if len(self.position_history) < 6:
-            return 0.0
-
-        positions = list(self.position_history)
-
-        # Calculate direction vectors (using 2D, ignoring height)
-        if len(positions) >= 4:
-            early_direction = np.array(positions[1][:2]) - np.array(positions[0][:2])
-            recent_direction = np.array(positions[-1][:2]) - np.array(positions[-2][:2])
-
-            # Normalize
-            early_norm = np.linalg.norm(early_direction)
-            recent_norm = np.linalg.norm(recent_direction)
-
-            if early_norm > 0 and recent_norm > 0:
-                early_dir = early_direction / early_norm
-                recent_dir = recent_direction / recent_norm
-
-                # Dot product: -1 = opposite directions (good turnaround)
-                dot = np.dot(early_dir, recent_dir)
-
-                if dot < -0.7:  # Heading back (opposite direction)
-                    return 1.0
-                elif dot < -0.3:
-                    return 0.5
-                elif dot < 0:
-                    return 0.2
-
-        return 0.0
-
-    def _get_pattern_rewards(self):
-        """Calculate combined pattern-based rewards."""
-        reward = 0.0
-
-        # Lift hill pattern reward (one-time bonus when detected)
-        lift_hill_score = self._detect_lift_hill_pattern()
-        if lift_hill_score >= 0.8:
-            reward += 15.0  # Excellent lift hill
-        elif lift_hill_score >= 0.5:
-            reward += 8.0   # Good lift hill
-        elif lift_hill_score >= 0.3:
-            reward += 3.0   # Partial lift hill
-
-        # Drop pattern reward
-        drop_score = self._detect_drop_pattern()
-        if drop_score >= 0.8:
-            reward += 10.0
-        elif drop_score >= 0.5:
-            reward += 5.0
-
-        # Turnaround reward
-        turnaround_score = self._detect_turnaround()
-        if turnaround_score >= 0.8:
-            reward += 15.0
-        elif turnaround_score >= 0.5:
-            reward += 7.0
-
-        return reward
-
-    def _calculate_approach_reward(self, action):
-        """
-        Soft approach guidance - rewards for good approach behavior.
-        Uses bonuses only, no penalties (non-restrictive guidance).
-        """
-        distance = self._calculate_distance_to_start()[0]
-
-        # Only apply in approach zone (within 20 units of station)
-        if distance >= 20:
-            return 0.0
-
-        reward = 0.0
-        current_height = self.current_position[2]
-        height_delta = abs(self.STATION_HEIGHT - current_height)
-
-        # Height alignment bonuses (crucial for connection)
-        if height_delta == 0:
-            reward += 5.0   # Perfect height alignment
-        elif height_delta <= 4:
-            reward += 2.0   # Close to correct height
-        elif height_delta <= 8:
-            reward += 1.0   # Getting there
-
-        # Soft guidance toward flat/transition pieces when very close
-        if distance < 10:
-            if action in [0, 13, 14]:  # Flat or transitions to flat
-                reward += 3.0  # Encouraged but not required
-            elif action in [11, 12]:  # Other transitions
-                reward += 1.0  # Also reasonable choices
-
-        # Bonus for facing the right direction when close
-        if distance < 8:
-            # Goal is at [62, 66, 14], station starts at [61, 66, 14]
-            # To connect, agent typically needs to be heading East (direction 1)
-            # But this depends on approach angle, so we check goal direction
-            goal_vector = np.array(self.goal_position[:2]) - np.array(self.current_position[:2])
-            goal_dist = np.linalg.norm(goal_vector)
-            if goal_dist > 0:
-                goal_dir = goal_vector / goal_dist
-                current_dir_vector = np.array(self.direction_vectors[self.current_direction])
-                alignment = np.dot(current_dir_vector, goal_dir)
-                if alignment > 0.7:  # Facing toward goal
-                    reward += 3.0
-
-        return reward
 
     def close(self):
         if self.api_controller:

@@ -6,12 +6,11 @@ would feed garbage into the redesigned observation:
   * energy must be computed from ``track_builder.history`` (agent pieces + their
     endpoint heights), NOT from the ``track_pieces``/``height_history`` pair which is
     index-shifted by the station prefix and is not removal-safe.
-  * ``position_history`` must be long enough for ``_detect_turnaround`` to ever fire.
+  * ``position_history`` must retain enough samples for the observation's distance trend.
   * chain-lift bookkeeping must be reverted on piece removal.
 
 All tests build the env via ``__new__`` so no live OpenRCT2 API connection is needed.
 """
-from collections import deque
 from types import SimpleNamespace
 
 import pytest
@@ -83,21 +82,13 @@ def test_energy_margin_uses_corrected_energy():
     assert env._calculate_energy_margin() == pytest.approx(49.0)
 
 
-# ----------------------------------------------------------------------- turnaround
+# ----------------------------------------------------- position-history window (obs)
 
 
-def test_position_history_window_supports_turnaround():
-    assert OpenRCT2Env.POSITION_HISTORY_MAXLEN >= 6
-
-
-def test_turnaround_signal_not_structurally_dead():
-    env = _bare_env()
-    pos = deque(maxlen=OpenRCT2Env.POSITION_HISTORY_MAXLEN)
-    # out (north) then back (south) -> a clean U-turn
-    for p in ([0, 0, 0], [0, 1, 0], [0, 2, 0], [0, 3, 0], [0, 2, 0], [0, 1, 0], [0, 0, 0]):
-        pos.append(p)
-    env.position_history = pos
-    assert env._detect_turnaround() > 0.5
+def test_position_history_window_supports_distance_trend():
+    # The observation's distance-trend signal compares position_history[0] to the
+    # current head, so the window must retain at least two samples.
+    assert OpenRCT2Env.POSITION_HISTORY_MAXLEN >= 2
 
 
 # ----------------------------------------------------------------- chain-lift revert

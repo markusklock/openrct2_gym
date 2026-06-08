@@ -6,10 +6,10 @@ Trains on multiple OpenRCT2 instances simultaneously for faster learning
 import gymnasium as gym
 import openrct2_gym
 from openrct2_gym.envs.curriculum_wrapper import CurriculumWrapper, AdaptiveCurriculumWrapper
-from openrct2_gym.envs.phased_curriculum_wrapper import PhasedCurriculumWrapper
 from openrct2_gym.envs.improved_phased_curriculum_wrapper import ImprovedPhasedCurriculumWrapper
 from openrct2_gym.envs.wrappers import OpenRCT2Wrapper
 from openrct2_gym.envs.feature_extractor import BuildHistoryExtractor
+from openrct2_gym.envs.openrct2_env import RewardParams
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.maskable.policies import MaskableMultiInputActorCriticPolicy
 from sb3_contrib.common.wrappers import ActionMasker
@@ -24,6 +24,11 @@ import time
 import math
 from typing import List, Callable
 from contextlib import ExitStack
+
+# Single source of truth for the discount factor. PBRS policy-invariance requires the
+# shaping potential to discount with the SAME gamma as PPO, so the reward's
+# RewardParams.gamma and the model's gamma are tied to this one constant.
+GAMMA = RewardParams().gamma
 
 
 def _vecnormalize_path(model_path: str) -> str:
@@ -323,7 +328,7 @@ def mask_fn(env: gym.Env) -> np.ndarray:
     print("Warning: Could not find valid_action_mask method, allowing all actions")
     return np.ones(env.action_space.n, dtype=bool)
 
-def create_curriculum_masked_env(port: int, use_adaptive: bool = False, use_phased: bool = False,
+def create_curriculum_masked_env(port: int, use_adaptive: bool = False,
                                   use_improved: bool = False, verbose: int = 0) -> gym.Env:
     """Create environment with curriculum wrapper and action masking for a specific port"""
     # Base environment with specific port and verbosity
@@ -353,21 +358,6 @@ def create_curriculum_masked_env(port: int, use_adaptive: bool = False, use_phas
             phase5_increase_step=10,
             verbose=verbose
         )
-    elif use_phased:
-        # Use old 3-phase curriculum that focuses on station return first
-        env = PhasedCurriculumWrapper(
-            base_env,
-            phase1_success_threshold=0.5,  # 50% success to advance from phase 1
-            phase2_success_threshold=0.4,  # 40% success to advance from phase 2
-            window_size=50,
-            phase1_max_length=40,  # More room for exploration while learning to return
-            phase2_max_length=80,  # Longer tracks for chain lift building and exploration
-            phase3_initial_length=60,
-            phase3_target_length=120,
-            phase3_increase_step=10,
-            phase3_success_threshold=0.3,
-            verbose=verbose
-        )
     elif use_adaptive:
         env = AdaptiveCurriculumWrapper(
             base_env,
@@ -395,12 +385,12 @@ def create_curriculum_masked_env(port: int, use_adaptive: bool = False, use_phas
     
     return env
 
-def make_env_factory(port: int, use_adaptive: bool = False, use_phased: bool = False,
+def make_env_factory(port: int, use_adaptive: bool = False,
                       use_improved: bool = False, verbose: int = 0) -> Callable[[], gym.Env]:
     """Create a factory function for an environment on a specific port"""
     def _init() -> gym.Env:
         try:
-            env = create_curriculum_masked_env(port, use_adaptive, use_phased, use_improved, verbose)
+            env = create_curriculum_masked_env(port, use_adaptive, use_improved, verbose)
             print(f"✅ Successfully connected to OpenRCT2 on port {port}")
             return env
         except Exception as e:
@@ -415,7 +405,6 @@ def train_parallel_curriculum_masked(
     eval_freq: int,
     model_path: str | None = None,
     use_adaptive: bool = False,
-    use_phased: bool = False,
     use_improved: bool = False,
     use_subproc: bool = False,
     verbose: int = 0,
@@ -439,11 +428,6 @@ def train_parallel_curriculum_masked(
         print("  Phase 4: Circuit Mastery (80 pieces) - Full integration")
         print("  Phase 5: Quality Optimization (80-120 pieces) - E=7-9, I=4.5-6.5, N<4.5")
         print("  + Energy estimation, pattern detection, approach guidance")
-    elif use_phased:
-        print("Using PHASED curriculum learning (3 phases):")
-        print("  Phase 1: Learn to return to station (40 pieces max)")
-        print("  Phase 2: Build chain lifts and explore (80 pieces max)")
-        print("  Phase 3: Optimize ride quality - E=7-9, I=4.5-6.5, N<4.5 (60-120 pieces)")
     elif use_adaptive:
         print("Using adaptive curriculum (50-120 pieces)")
     else:
@@ -453,7 +437,7 @@ def train_parallel_curriculum_masked(
     print("="*60 + "\n")
     
     # Create environment factories for each port
-    env_factories = [make_env_factory(port, use_adaptive, use_phased, use_improved, verbose) for port in ports]
+    env_factories = [make_env_factory(port, use_adaptive, use_improved, verbose) for port in ports]
     
     # Create vectorized environments
     print(f"\n🔌 Connecting to {n_envs} OpenRCT2 instances...")
@@ -525,12 +509,18 @@ def train_parallel_curriculum_masked(
             n_steps=n_steps,
             batch_size=batch_size,
             n_epochs=10,
-            gamma=0.99,
+            gamma=GAMMA,
             gae_lambda=0.95,
             clip_range=0.2,
             ent_coef=0.01,  # Exploration
         )
-    
+
+    # PBRS invariance precondition: the model's discount must match the reward's gamma.
+    # Catches a stale loaded model trained under a different gamma.
+    assert model.gamma == GAMMA, (
+        f"model gamma {model.gamma} != reward gamma {GAMMA}; PBRS invariance would break"
+    )
+
     # Create log directory
     log_dir = f"logs_parallel_curriculum_masked_{n_envs}envs"
     os.makedirs(log_dir, exist_ok=True)
@@ -672,8 +662,8 @@ def train_parallel_curriculum_masked(
         if 'current_phase' in stats:  # Phased curriculum stats
             print("\n📊 Final Phased Curriculum Stats:")
             print(f"  Current phase: {stats['current_phase']}")
-            if stats['current_phase'] == 3 and stats['phase3_stage']:
-                print(f"  Phase 3 stage: {stats['phase3_stage']}")
+            if stats['current_phase'] == 5 and stats.get('phase5_stage'):
+                print(f"  Phase 5 stage: {stats['phase5_stage']}")
             print(f"  Max track length: {stats['current_max_length']}")
             print(f"  Total episodes: {stats['total_episodes']}")
             print(f"  Success rate: {stats['success_rate']:.1%}")
@@ -720,8 +710,6 @@ def main():
                        help="Path to existing MaskablePPO model to continue training")
     parser.add_argument("--adaptive", action="store_true",
                        help="Use adaptive curriculum with dynamic reward scaling")
-    parser.add_argument("--phased", action="store_true",
-                       help="Use phased curriculum focusing on station return first (3 phases)")
     parser.add_argument("--improved", action="store_true",
                        help="Use improved 5-phase curriculum with physics-aware rewards (RECOMMENDED)")
     parser.add_argument("--use-subproc", action="store_true",
@@ -806,7 +794,6 @@ def main():
         args.eval_freq,
         args.model_path,
         args.adaptive,
-        args.phased,
         args.improved,
         args.use_subproc,
         verbose,

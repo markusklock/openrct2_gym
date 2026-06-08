@@ -8,6 +8,8 @@ from collections import deque
 from contextlib import contextmanager
 from typing import Dict, Any, Tuple
 
+from openrct2_gym.envs.openrct2_env import RewardParams
+
 
 class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
     """
@@ -85,15 +87,8 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
         # Verbosity
         self.verbose = verbose
 
-        # Pattern tracking (to give one-time bonuses)
-        self._lift_hill_rewarded = False
-        self._drop_rewarded = False
-        self._turnaround_rewarded = False
-
-        # Store original reward calculation method
-        self._get_base_env()._original_calculate_reward = self._get_base_env()._calculate_reward
-
-        # Update environment settings for current phase
+        # Update environment settings for current phase. The reward is now a single
+        # parametrized function owned by the env; the curriculum only sets parameters.
         self._update_phase_settings()
 
     def _get_base_env(self):
@@ -103,25 +98,50 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
             env = env.env
         return env
 
+    @staticmethod
+    def _phase_reward_params(phase):
+        """Per-phase RewardParams. The PBRS potential (Phi weights/normalizers) is FIXED
+        across phases for global policy-invariance; only the sparse objectives vary:
+        ride-quality scoring and a small living cost turn on in phase 5."""
+        if phase >= 5:
+            return RewardParams(R_quality_max=500.0, step_cost=-0.01)
+        return RewardParams()
+
+    @staticmethod
+    def _history_chain_count(base_env):
+        """Number of chain-lift pieces in the (removal-safe) track history."""
+        history = getattr(base_env.track_builder, 'history', [])
+        return sum(1 for h in history if h.get('action') in (9, 10))
+
+    @staticmethod
+    def _history_has_drop(base_env):
+        """Whether the track history contains a drop/descent piece."""
+        history = getattr(base_env.track_builder, 'history', [])
+        return any(h.get('action') in (6, 8, 12, 14) for h in history)
+
     def _update_phase_settings(self):
-        """Update environment settings based on current phase"""
+        """Update environment settings based on current phase.
+
+        Sets ONLY parameters (reward params, max length, ride-testing) — the reward
+        function itself is the env's single _calculate_reward and is never swapped.
+        """
         base_env = self._get_base_env()
 
         phase_configs = {
-            1: (self.phase1_max_length, self._phase1_reward, True),
-            2: (self.phase2_max_length, self._phase2_reward, True),
-            3: (self.phase3_max_length, self._phase3_reward, True),
-            4: (self.phase4_max_length, self._phase4_reward, True),
-            5: (self.phase5_current_length, self._phase5_reward, False),
+            1: (self.phase1_max_length, True),
+            2: (self.phase2_max_length, True),
+            3: (self.phase3_max_length, True),
+            4: (self.phase4_max_length, True),
+            5: (self.phase5_current_length, False),
         }
 
-        max_length, reward_fn, skip_testing = phase_configs.get(
+        max_length, skip_testing = phase_configs.get(
             self.current_phase,
-            (self.phase5_current_length, self._phase5_reward, False)
+            (self.phase5_current_length, False)
         )
 
         base_env.max_track_length = max_length
-        base_env._calculate_reward = reward_fn
+        base_env.reward_params = self._phase_reward_params(self.current_phase)
         base_env.skip_ride_testing = skip_testing
 
         if self.verbose >= 1:
@@ -134,337 +154,6 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
             }
             print(f"📚 Phase {self.current_phase} ({phase_names.get(self.current_phase, '')}) "
                   f"settings applied: max_length={max_length}, skip_testing={skip_testing}")
-
-    def _phase1_reward(self, success, action):
-        """
-        Phase 1: Return Practice - Focus entirely on navigation back to station.
-        Pure distance-based rewards with loop completion bonus.
-        """
-        base_env = self._get_base_env()
-
-        # Symmetric removal
-        if success and action == 31:
-            if base_env.piece_rewards:
-                return -base_env.piece_rewards.pop()
-            return -1
-
-        reward = 0
-
-        if success and action != 31:
-            reward += 0.5  # Base success reward
-
-            current_distance = base_env._calculate_distance_to_start()[0]
-
-            # Strong distance-based rewards (4x multiplier)
-            if base_env.previous_distance is not None:
-                distance_delta = base_env.previous_distance - current_distance
-                if distance_delta > 0:
-                    reward += distance_delta * 4.0  # Strong reward for getting closer
-                else:
-                    reward += distance_delta * 0.5  # Gentle penalty for moving away
-
-            # Proximity bonuses
-            if current_distance < 20:
-                reward += (20 - current_distance) * 0.3
-            if current_distance < 10:
-                reward += (10 - current_distance) * 0.5
-
-            # Loop completion - main goal
-            if base_env.loop_completed:
-                reward += 300
-        elif not success:
-            reward -= 0.5
-
-        return reward
-
-    def _phase2_reward(self, success, action):
-        """
-        Phase 2: Lift Hill Building - Learn chain lifts and energy management.
-        Strong incentives for chain lifts, energy tracking, reduced distance rewards.
-        """
-        base_env = self._get_base_env()
-
-        # Symmetric removal
-        if success and action == 31:
-            if base_env.piece_rewards:
-                # Track chain lift removal
-                if base_env.track_pieces and base_env.track_pieces[-1] in [9, 10]:
-                    if hasattr(base_env, 'phase2_chain_lift_count') and base_env.phase2_chain_lift_count > 0:
-                        base_env.phase2_chain_lift_count -= 1
-                return -base_env.piece_rewards.pop()
-            return -1
-
-        reward = 0
-
-        if success and action != 31:
-            reward += 0.5  # Base success reward
-
-            # CHAIN LIFT REWARDS - Primary focus
-            if action in [9, 10]:
-                if not hasattr(base_env, 'phase2_chain_lift_count'):
-                    base_env.phase2_chain_lift_count = 0
-                base_env.phase2_chain_lift_count += 1
-
-                # Very strong rewards for chain lifts
-                if base_env.track_length <= 15:
-                    reward += 15  # Big reward for early chain lifts
-                elif base_env.track_length <= 25:
-                    reward += 10
-                else:
-                    reward += 5
-
-                # Consecutive chain lift bonus
-                if len(base_env.track_pieces) >= 2 and base_env.track_pieces[-2] in [9, 10]:
-                    reward += 5  # Building a proper sequence
-
-            # ENERGY REWARDS
-            energy_reward = base_env._calculate_energy_reward()
-            reward += energy_reward * 2.0  # Double weight in this phase
-
-            # LIFT HILL PATTERN (one-time)
-            if not self._lift_hill_rewarded:
-                lift_hill_score = base_env._detect_lift_hill_pattern()
-                if lift_hill_score >= 0.5:
-                    reward += 20
-                    self._lift_hill_rewarded = True
-
-            # Reduced distance rewards (0.5x)
-            current_distance = base_env._calculate_distance_to_start()[0]
-            if base_env.previous_distance is not None:
-                distance_delta = base_env.previous_distance - current_distance
-                if distance_delta > 0:
-                    reward += distance_delta * 0.5
-                else:
-                    reward += distance_delta * 0.1
-
-            # Loop completion with chain lift requirement
-            if base_env.loop_completed:
-                chain_count = getattr(base_env, 'phase2_chain_lift_count', 0)
-                reward += 150
-                reward += chain_count * 10  # Bonus per chain lift
-        elif not success:
-            reward -= 0.5
-
-        return reward
-
-    def _phase3_reward(self, success, action):
-        """
-        Phase 3: Drop & Turn - Learn drops after lift hills and turnarounds.
-        Rewards for drop patterns, turnarounds, continued energy management.
-        """
-        base_env = self._get_base_env()
-
-        # Symmetric removal
-        if success and action == 31:
-            if base_env.piece_rewards:
-                return -base_env.piece_rewards.pop()
-            return -1
-
-        reward = 0
-
-        if success and action != 31:
-            reward += 0.5
-
-            # DROP PATTERN REWARDS
-            if action in [6, 8, 12, 14]:  # Drop pieces
-                if base_env.track_length > 10 and base_env.track_length < 45:
-                    reward += 5  # Reward drops after expected lift hill
-
-                    # Drop pattern bonus (one-time)
-                    if not self._drop_rewarded:
-                        drop_score = base_env._detect_drop_pattern()
-                        if drop_score >= 0.5:
-                            reward += 15
-                            self._drop_rewarded = True
-
-            # TURNAROUND REWARDS (one-time)
-            if not self._turnaround_rewarded:
-                turnaround_score = base_env._detect_turnaround()
-                if turnaround_score >= 0.7:
-                    reward += 20
-                    self._turnaround_rewarded = True
-
-            # Energy management (moderate weight)
-            energy_reward = base_env._calculate_energy_reward()
-            reward += energy_reward * 1.5
-
-            # Distance rewards (moderate)
-            current_distance = base_env._calculate_distance_to_start()[0]
-            if base_env.previous_distance is not None:
-                distance_delta = base_env.previous_distance - current_distance
-                if distance_delta > 0:
-                    reward += distance_delta * 1.5
-                else:
-                    reward += distance_delta * 0.3
-
-            # Loop completion with pattern bonuses
-            if base_env.loop_completed:
-                reward += 200
-                # Pattern bonuses
-                if self._lift_hill_rewarded:
-                    reward += 30
-                if self._drop_rewarded:
-                    reward += 20
-        elif not success:
-            reward -= 0.5
-
-        return reward
-
-    def _phase4_reward(self, success, action):
-        """
-        Phase 4: Circuit Mastery - Full integration of all skills.
-        All rewards active, approach guidance emphasized.
-        """
-        base_env = self._get_base_env()
-
-        # Symmetric removal
-        if success and action == 31:
-            if base_env.piece_rewards:
-                return -base_env.piece_rewards.pop()
-            return -1
-
-        reward = 0
-
-        if success and action != 31:
-            reward += 0.5
-
-            # Energy reward
-            energy_reward = base_env._calculate_energy_reward()
-            reward += energy_reward
-
-            # Pattern rewards (all types, scaled down since probably already earned)
-            if not self._lift_hill_rewarded:
-                if base_env._detect_lift_hill_pattern() >= 0.5:
-                    reward += 10
-                    self._lift_hill_rewarded = True
-
-            if not self._drop_rewarded:
-                if base_env._detect_drop_pattern() >= 0.5:
-                    reward += 8
-                    self._drop_rewarded = True
-
-            if not self._turnaround_rewarded:
-                if base_env._detect_turnaround() >= 0.7:
-                    reward += 10
-                    self._turnaround_rewarded = True
-
-            # APPROACH GUIDANCE (emphasized in this phase)
-            approach_reward = base_env._calculate_approach_reward(action)
-            reward += approach_reward * 2.0  # Double weight
-
-            # Distance rewards (standard)
-            current_distance = base_env._calculate_distance_to_start()[0]
-            if base_env.previous_distance is not None:
-                distance_delta = base_env.previous_distance - current_distance
-                if distance_delta > 0:
-                    reward += distance_delta * 2.0
-                else:
-                    reward += distance_delta * 0.5
-
-            # Variety bonus
-            if action not in base_env.used_piece_types:
-                reward += 0.5
-
-            # Loop completion with full bonuses
-            if base_env.loop_completed:
-                reward += 350
-                # Track length bonus
-                if base_env.track_length > 50:
-                    reward += (base_env.track_length - 50) * 1.0
-        elif not success:
-            reward -= 0.3
-
-        return reward
-
-    def _phase5_reward(self, success, action):
-        """
-        Phase 5: Quality Optimization - Optimize for ride statistics.
-        Scaled down base rewards, ride quality bonus added in step().
-        """
-        base_env = self._get_base_env()
-
-        # Symmetric removal
-        if success and action == 31:
-            if base_env.piece_rewards:
-                return -base_env.piece_rewards.pop()
-            return -1
-
-        # Use phase 4 rewards scaled to 0.6x
-        # Ride quality bonus is added separately in step()
-        reward = 0
-
-        if success and action != 31:
-            reward += 0.3
-
-            # All rewards at reduced scale
-            energy_reward = base_env._calculate_energy_reward()
-            reward += energy_reward * 0.6
-
-            approach_reward = base_env._calculate_approach_reward(action)
-            reward += approach_reward * 0.6
-
-            current_distance = base_env._calculate_distance_to_start()[0]
-            if base_env.previous_distance is not None:
-                distance_delta = base_env.previous_distance - current_distance
-                if distance_delta > 0:
-                    reward += distance_delta * 1.2
-                else:
-                    reward += distance_delta * 0.3
-
-            if base_env.loop_completed:
-                reward += 200  # Reduced completion bonus
-        elif not success:
-            reward -= 0.2
-
-        return reward
-
-    def _calculate_ride_quality_bonus(self, excitement, intensity, nausea):
-        """
-        Calculate bonus reward based on ride quality metrics.
-        Target ranges:
-        - Excitement: 7.0-9.0 (high)
-        - Intensity: 4.5-6.5 (medium-high)
-        - Nausea: <4.5 (low-medium)
-        """
-        bonus = 0
-
-        # EXCITEMENT (target: 7.0-9.0, peak at 8.0)
-        if 7.0 <= excitement <= 9.0:
-            distance_from_optimal = abs(excitement - 8.0)
-            bonus += 200 - (distance_from_optimal * 50)
-        elif 5.0 <= excitement < 7.0:
-            bonus += (excitement - 5.0) / 2.0 * 100
-        elif 9.0 < excitement <= 11.0:
-            bonus += (11.0 - excitement) / 2.0 * 100
-        elif excitement < 5.0:
-            bonus += excitement * 10
-        else:
-            bonus += max(0, 50 - (excitement - 11.0) * 10)
-
-        # INTENSITY (target: 4.5-6.5, peak at 5.5)
-        if 4.5 <= intensity <= 6.5:
-            distance_from_optimal = abs(intensity - 5.5)
-            bonus += 100 - (distance_from_optimal * 25)
-        elif 3.0 <= intensity < 4.5:
-            bonus += (intensity - 3.0) / 1.5 * 50
-        elif 6.5 < intensity <= 8.0:
-            bonus += (8.0 - intensity) / 1.5 * 50
-        elif intensity < 3.0:
-            bonus += intensity * 10
-        else:
-            bonus -= (intensity - 8.0) * 10
-
-        # NAUSEA (target: <4.5, lower is better)
-        if nausea < 2.0:
-            bonus += 100
-        elif 2.0 <= nausea <= 4.5:
-            bonus += (4.5 - nausea) / 2.5 * 100
-        elif 4.5 < nausea <= 6.0:
-            bonus -= (nausea - 4.5) / 1.5 * 50
-        else:
-            bonus -= 50 + (nausea - 6.0) * 25
-
-        return bonus
 
     def _check_phase_advancement(self):
         """Check if we should advance to the next phase"""
@@ -570,16 +259,6 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
         """Reset environment and check for phase advancement"""
         self._check_phase_advancement()
 
-        # Reset pattern tracking for new episode
-        self._lift_hill_rewarded = False
-        self._drop_rewarded = False
-        self._turnaround_rewarded = False
-
-        # Reset phase-specific tracking
-        base_env = self._get_base_env()
-        if hasattr(base_env, 'phase2_chain_lift_count'):
-            base_env.phase2_chain_lift_count = 0
-
         obs, info = self.env.reset(**kwargs)
 
         # Add phase info
@@ -618,35 +297,22 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
             success = getattr(base_env, 'loop_completed', False)
             self.episode_results.append(success)
 
-            # Phase-specific qualified success tracking
+            # Phase-specific qualified success tracking, sourced from the removal-safe
+            # track history (not from reward-time bookkeeping, which no longer exists).
             if self.current_phase == 2:
-                # Need chain lifts
-                chain_count = getattr(base_env, 'phase2_chain_lift_count', 0)
-                qualified = success and chain_count >= 3
+                qualified = success and self._history_chain_count(base_env) >= 3
                 self.episode_qualified_results.append(qualified)
 
             elif self.current_phase == 3:
-                # Need patterns
-                has_patterns = self._lift_hill_rewarded or self._drop_rewarded
+                has_patterns = self._history_chain_count(base_env) >= 2 or self._history_has_drop(base_env)
                 qualified = success and has_patterns
                 self.episode_qualified_results.append(qualified)
 
             if success:
                 self.total_loops_completed += 1
 
-            # Phase 5: Add ride quality bonus
-            if self.current_phase == 5 and success and 'ride_rating' in info:
-                ride_rating = info['ride_rating']
-                excitement = ride_rating.get('excitement', 0)
-                intensity = ride_rating.get('intensity', 0)
-                nausea = ride_rating.get('nausea', 0)
-
-                quality_bonus = self._calculate_ride_quality_bonus(excitement, intensity, nausea)
-                reward += quality_bonus
-
-                info['ride_quality_bonus'] = quality_bonus
-                if self.verbose >= 1 and quality_bonus != 0:
-                    print(f"🎢 Ride Quality: E={excitement:.1f} I={intensity:.1f} N={nausea:.1f} → Bonus: {quality_bonus:+.1f}")
+            # Ride-quality scoring now lives in the env's terminal reward (single
+            # authority); the wrapper no longer adds a quality bonus here.
 
             # Add phase info
             info['learning_phase'] = self.current_phase
