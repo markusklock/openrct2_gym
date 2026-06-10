@@ -105,6 +105,36 @@ def test_full_pipeline_trains_and_stats_roundtrip(monkeypatch, tmp_path):
     fresh.close()
 
 
+def test_ppo_hyperparams_wire_kl_guard_and_entropy(monkeypatch):
+    """The model must train with target_kl (caps destructive updates at curriculum phase
+    transitions; a live run hit approx_kl=2.49 and the policy never recovered) and the
+    raised ent_coef (exploration for the multi-piece hill motif). Built from the same
+    PPO_HYPERPARAMS dict the train script splats into MaskablePPO."""
+    monkeypatch.setattr(oe_mod, "APIController", FakeAPI)
+    from sb3_contrib import MaskablePPO
+
+    assert T.PPO_HYPERPARAMS["target_kl"] == 0.04
+    assert T.PPO_HYPERPARAMS["ent_coef"] == 0.02
+    assert T.PPO_HYPERPARAMS["gamma"] == T.GAMMA
+
+    env = _make_vecnorm_env()
+    model = MaskablePPO(
+        "MultiInputPolicy", env,
+        policy_kwargs=dict(
+            features_extractor_class=BuildHistoryExtractor,
+            features_extractor_kwargs=dict(encoder="gru"),
+            net_arch=dict(pi=[64], vf=[64]),
+            normalize_images=False,
+        ),
+        n_steps=16, batch_size=16, verbose=0,
+        **T.PPO_HYPERPARAMS,
+    )
+    assert model.target_kl == 0.04
+    assert model.ent_coef == 0.02
+    assert model.gamma == T.GAMMA
+    env.close()
+
+
 def test_save_vecnormalize_callback_writes_per_checkpoint_stats(monkeypatch, tmp_path):
     monkeypatch.setattr(oe_mod, "APIController", FakeAPI)
     from sb3_contrib import MaskablePPO

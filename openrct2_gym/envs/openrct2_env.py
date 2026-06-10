@@ -29,11 +29,16 @@ class RewardParams:
     w_e: float = 2.0               # energy viability bonus
     # --- Phi normalizers (decoupled from obs SCALE/H_SCALE; see plan #6) ---
     d_xy: float = 40.0
-    d_z: float = 20.0
+    d_z: float = 60.0              # reach: keeps the come-back-down gradient alive up to +60z
+                                   # (at 20 the m_z term clipped flat above +20z and lost
+                                   # climbers wandered on a zero-gradient plateau)
     e_scale: float = 50.0
     # --- Discovery potential (makes climbing findable; ON in hill phases 2-4, the curriculum
     #     sets w_h=0 for phase 1/5 since an always-on climb pull derails Phase-1 completion) ---
-    w_h: float = 6.0               # banked-elevation weight in Phi (0 disables the term)
+    w_h: float = 3.0               # banked-elevation weight in Phi (0 disables the term).
+                                   # 3, not 6: still tilts climb>flat (~+0.5/z vs the 0.1/z
+                                   # m_z cost) but halves the attractor a wrecked policy can
+                                   # settle into instead of completing
     h_scale: float = 6.0           # elevation normalizer (z-units); saturate at ~a 3-chain hill
     # --- Sparse real objectives ---
     R_complete: float = 1000.0     # fixed completion bonus across all phases

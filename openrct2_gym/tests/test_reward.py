@@ -514,11 +514,16 @@ def test_phase_reward_params_structural_per_phase():
         == (250.0, 0.5, 0.5, 3)                         # integration, target 3
     p5 = W._phase_reward_params(5)
     assert p5.R_struct_max == 0.0 and p5.R_quality_max == 500.0   # struct off, quality on
-    # discovery potential: ON (w_h=6) only in the hill-building phases 2-4; OFF in the
+    # discovery potential: ON only in the hill-building phases 2-4; OFF in the
     # pure-completion phase 1 and the quality phase 5 (an always-on climb pull derails
-    # Phase-1 completion learning).
+    # Phase-1 completion learning). w_h=3 (not 6): a 1M-step run showed the deeper
+    # attractor let a wrecked policy settle into climbing instead of completing.
     assert p1.w_h == 0.0 and p5.w_h == 0.0
-    assert p2.w_h == 6.0 and p3.w_h == 6.0 and p4.w_h == 6.0
+    assert p2.w_h == 3.0 and p3.w_h == 3.0 and p4.w_h == 3.0
+    # d_z=60 keeps the come-back-down gradient alive at high altitude (at d_z=20 the
+    # m_z term clipped flat above +20z and lost climbers wandered with no pull home)
+    for p in (p1, p2, p3, p4, p5):
+        assert p.d_z == 60.0
 
 
 def test_discovery_potential_off_in_phase1_and_5_on_in_phase2():
@@ -734,10 +739,23 @@ def _climb_vs_flat_gap(w_h):
 
 
 def test_climb_step_beats_flat_step_and_discovery_does_the_work():
-    # Load-bearing (feedback #6): compare actual transition REWARDS, and pin that the
-    # discovery term materially widens the climb>flat margin (it must, or w_h is dead).
-    assert _climb_vs_flat_gap(6.0) > 0                            # climb strictly preferred
-    assert _climb_vs_flat_gap(6.0) > _climb_vs_flat_gap(0.0) + 0.5  # discovery does real work
+    # Load-bearing (feedback #6): compare actual transition REWARDS at the DEFAULT w_h,
+    # and pin that the discovery term materially widens the climb>flat margin (it must,
+    # or w_h is dead).
+    w_h_default = RewardParams().w_h
+    assert _climb_vs_flat_gap(w_h_default) > 0                    # climb strictly preferred
+    assert _climb_vs_flat_gap(w_h_default) > _climb_vs_flat_gap(0.0) + 0.4  # discovery does real work
+
+
+def test_height_gradient_reaches_high_altitude():
+    """The m_z pull home must NOT clip flat at moderate altitude: a lost climber at
+    z=+20..+60 above station needs a strictly decreasing Phi as it climbs further
+    (at the old d_z=20 everything above +20z was a flat plateau with no gradient home)."""
+    geo = RewardParams(w_e=0.0, w_h=0.0)   # isolate the height-alignment term
+    phi_34 = _phi_env((0, 0, 34))._potential(geo)   # +20 above station
+    phi_54 = _phi_env((0, 0, 54))._potential(geo)   # +40
+    phi_74 = _phi_env((0, 0, 74))._potential(geo)   # +60
+    assert phi_34 > phi_54 > phi_74                 # gradient still pulls home up high
 
 
 def test_build_tall_and_stall_is_dominated_by_completion():

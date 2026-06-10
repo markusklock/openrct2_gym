@@ -30,6 +30,21 @@ from contextlib import ExitStack
 # RewardParams.gamma and the model's gamma are tied to this one constant.
 GAMMA = RewardParams().gamma
 
+# Fixed PPO hyperparameters, module-level so tests can pin them (n_steps/batch_size are
+# computed per run). target_kl caps the per-rollout update size: curriculum phase
+# transitions shift the reward scale and a live run hit approx_kl=2.49 there, destroying
+# the completion policy beyond recovery. ent_coef=0.02 keeps enough exploration alive to
+# sample the multi-piece hill motif (the policy entered phase 2 with ~0.1 nats entropy).
+PPO_HYPERPARAMS = dict(
+    learning_rate=3e-4,
+    n_epochs=10,
+    gamma=GAMMA,
+    gae_lambda=0.95,
+    clip_range=0.2,
+    ent_coef=0.02,
+    target_kl=0.04,
+)
+
 
 def _vecnormalize_path(model_path: str) -> str:
     """Sibling path for a model's VecNormalize stats (``X.zip`` -> ``X_vecnormalize.pkl``)."""
@@ -516,14 +531,9 @@ def train_parallel_curriculum_masked(
             policy_kwargs=policy_kwargs,
             verbose=1,
             tensorboard_log="./parallel_curriculum_masked_tensorboard/",
-            learning_rate=3e-4,
             n_steps=n_steps,
             batch_size=batch_size,
-            n_epochs=10,
-            gamma=GAMMA,
-            gae_lambda=0.95,
-            clip_range=0.2,
-            ent_coef=0.01,  # Exploration
+            **PPO_HYPERPARAMS,
         )
 
     # PBRS invariance precondition: the model's discount must match the reward's gamma.
