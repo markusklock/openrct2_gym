@@ -514,9 +514,25 @@ def test_phase_reward_params_structural_per_phase():
         == (250.0, 0.5, 0.5, 3)                         # integration, target 3
     p5 = W._phase_reward_params(5)
     assert p5.R_struct_max == 0.0 and p5.R_quality_max == 500.0   # struct off, quality on
-    # discovery potential weights are FIXED across all phases
-    for p in (p1, p2, p3, p4, p5):
-        assert p.w_h == 6.0 and p.h_scale == 6.0
+    # discovery potential: ON (w_h=6) only in the hill-building phases 2-4; OFF in the
+    # pure-completion phase 1 and the quality phase 5 (an always-on climb pull derails
+    # Phase-1 completion learning).
+    assert p1.w_h == 0.0 and p5.w_h == 0.0
+    assert p2.w_h == 6.0 and p3.w_h == 6.0 and p4.w_h == 6.0
+
+
+def test_discovery_potential_off_in_phase1_and_5_on_in_phase2():
+    W = ImprovedPhasedCurriculumWrapper
+    # a track that climbed (banked elevation) so the discovery term would fire if active
+    env = _bare_env(current_position=(0, 0, 20),
+                    history=[{"action": 9, "next_position": [0, 0, 20]}])
+    env.close_pos = [0, 0, 14]
+    env.close_dir = 1
+    phi_p1 = env._potential(W._phase_reward_params(1))   # discovery OFF -> no elevation term
+    phi_p2 = env._potential(W._phase_reward_params(2))   # discovery ON
+    phi_p5 = env._potential(W._phase_reward_params(5))   # discovery OFF
+    assert phi_p2 > phi_p1 + 1.0                         # P2 gains the banked-elevation term
+    assert phi_p5 == pytest.approx(phi_p1)               # P5 has no discovery pull either
 
 
 # ---- structural bonus

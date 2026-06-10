@@ -100,13 +100,17 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
 
     @staticmethod
     def _phase_reward_params(phase):
-        """Per-phase RewardParams. The PBRS potential (Phi weights/normalizers, incl. the
-        elevation-discovery w_h/h_scale) is FIXED across phases for global policy-invariance;
-        only the sparse objectives vary. The structural bonus rewards the lift-hill / drop
-        structure each intermediate phase gates on (chains in P2; chains AND drop in P3/P4);
-        phase 5 turns it off and hands over to ride-quality scoring."""
-        if phase >= 5:
-            return RewardParams(R_quality_max=500.0, step_cost=-0.01)   # struct off, quality on
+        """Per-phase RewardParams. The PBRS geometry weights (w_xy/w_z/w_dir/w_e) are fixed,
+        but the elevation-discovery term (w_h) is ON only in the hill-building phases 2-4 and
+        OFF in phase 1 (pure completion) and phase 5 (quality): an always-on climb pull traps
+        Phase-1 exploration on building hills instead of closing the loop. The structural bonus
+        rewards the structure each intermediate phase gates on (chains in P2; chains AND drop in
+        P3/P4); phase 5 turns both off and hands over to ride-quality scoring.
+
+        Curriculum logic: master completion FIRST (phase 1, no climb distraction), THEN add the
+        hill (phases 2-4, discovery + structural bonus on)."""
+        if phase >= 5:                                                   # quality only; discovery off
+            return RewardParams(R_quality_max=500.0, step_cost=-0.01, w_h=0.0)
         if phase == 2:                                                   # gate: >=3 chains
             return RewardParams(R_struct_max=250.0, struct_chain_target=3,
                                 struct_w_chain=1.0, struct_w_drop=0.0)
@@ -116,7 +120,7 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
         if phase == 4:                                                   # integration: hill + drop
             return RewardParams(R_struct_max=250.0, struct_chain_target=3,
                                 struct_w_chain=0.5, struct_w_drop=0.5)
-        return RewardParams()                                           # phase 1: struct off
+        return RewardParams(w_h=0.0)                                     # phase 1: struct + discovery off
 
     @staticmethod
     def _history_chain_count(base_env):

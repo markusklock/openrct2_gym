@@ -31,8 +31,9 @@ class RewardParams:
     d_xy: float = 40.0
     d_z: float = 20.0
     e_scale: float = 50.0
-    # --- Discovery potential (FIXED across phases; makes climbing findable) ---
-    w_h: float = 6.0               # banked-elevation weight in Phi
+    # --- Discovery potential (makes climbing findable; ON in hill phases 2-4, the curriculum
+    #     sets w_h=0 for phase 1/5 since an always-on climb pull derails Phase-1 completion) ---
+    w_h: float = 6.0               # banked-elevation weight in Phi (0 disables the term)
     h_scale: float = 6.0           # elevation normalizer (z-units); saturate at ~a 3-chain hill
     # --- Sparse real objectives ---
     R_complete: float = 1000.0     # fixed completion bonus across all phases
