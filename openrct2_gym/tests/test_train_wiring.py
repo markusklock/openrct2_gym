@@ -105,17 +105,20 @@ def test_full_pipeline_trains_and_stats_roundtrip(monkeypatch, tmp_path):
     fresh.close()
 
 
-def test_ppo_hyperparams_wire_kl_guard_and_entropy(monkeypatch):
-    """The model must train with target_kl (caps destructive updates at curriculum phase
-    transitions; a live run hit approx_kl=2.49 and the policy never recovered) and the
-    raised ent_coef (exploration for the multi-piece hill motif). Built from the same
-    PPO_HYPERPARAMS dict the train script splats into MaskablePPO."""
+def test_ppo_hyperparams_start_with_phase1_bootstrap_config(monkeypatch):
+    """The model must START with the proven phase-1 bootstrap config: NO target_kl and
+    ent_coef=0.01 (both runs that learned phase 1 used exactly this; adding the KL guard
+    + doubled entropy globally froze phase 1 at 17 completions in 38k episodes -- the
+    rare +1000 completion updates got throttled and the snowball never started). The
+    guarded config is armed by the callback at phase 2 (see the arming test)."""
     monkeypatch.setattr(oe_mod, "APIController", FakeAPI)
     from sb3_contrib import MaskablePPO
 
-    assert T.PPO_HYPERPARAMS["target_kl"] == 0.04
-    assert T.PPO_HYPERPARAMS["ent_coef"] == 0.02
+    assert T.PPO_HYPERPARAMS["target_kl"] is None
+    assert T.PPO_HYPERPARAMS["ent_coef"] == 0.01
     assert T.PPO_HYPERPARAMS["gamma"] == T.GAMMA
+    # the guarded config the callback arms for phases >= 2
+    assert T.OPT_GUARDED == {"target_kl": 0.04, "ent_coef": 0.02}
 
     env = _make_vecnorm_env()
     model = MaskablePPO(
@@ -129,10 +132,33 @@ def test_ppo_hyperparams_wire_kl_guard_and_entropy(monkeypatch):
         n_steps=16, batch_size=16, verbose=0,
         **T.PPO_HYPERPARAMS,
     )
-    assert model.target_kl == 0.04
-    assert model.ent_coef == 0.02
+    assert model.target_kl is None
+    assert model.ent_coef == 0.01
     assert model.gamma == T.GAMMA
     env.close()
+
+
+def test_callback_arms_kl_guard_when_phase2_begins():
+    """The phase-2 transition is where the KL=2.49 catastrophe happened, so the guard
+    (target_kl + raised ent_coef) must arm exactly when the curriculum reaches phase 2 --
+    and stay armed (one-way switch, phases never go backward)."""
+    from types import SimpleNamespace
+    cb = T.ParallelCurriculumMaskableCallback(n_envs=2)
+    cb.model = SimpleNamespace(target_kl=None, ent_coef=0.01)
+
+    cb._maybe_arm_kl_guard({})                          # no phase info -> no-op
+    cb._maybe_arm_kl_guard({'learning_phase': 1})       # phase 1 -> stays in bootstrap config
+    assert cb.model.target_kl is None
+    assert cb.model.ent_coef == 0.01
+
+    cb._maybe_arm_kl_guard({'learning_phase': 2})       # phase 2 -> guard arms
+    assert cb.model.target_kl == 0.04
+    assert cb.model.ent_coef == 0.02
+
+    cb.model.target_kl = 0.99                           # one-way: arming never re-fires
+    cb._maybe_arm_kl_guard({'learning_phase': 3})
+    cb._maybe_arm_kl_guard({'learning_phase': 1})
+    assert cb.model.target_kl == 0.99
 
 
 def test_save_vecnormalize_callback_writes_per_checkpoint_stats(monkeypatch, tmp_path):

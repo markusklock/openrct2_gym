@@ -30,19 +30,25 @@ from contextlib import ExitStack
 # RewardParams.gamma and the model's gamma are tied to this one constant.
 GAMMA = RewardParams().gamma
 
+# Phase-conditional optimizer settings. Phase 1's bootstrap depends on aggressively
+# exploiting rare +1000 completion spikes -- a global target_kl throttled exactly those
+# updates and froze phase 1 (17 completions in 38k episodes, never amplified). Both runs
+# that learned phase 1 used the unguarded config below. The guard (target_kl caps the
+# per-rollout update; a live run hit approx_kl=2.49 at the phase-2 transition and the
+# policy never recovered) plus extra entropy (for the multi-piece hill motif) are armed
+# by ParallelCurriculumMaskableCallback when the curriculum reaches phase 2.
+OPT_PHASE1 = dict(target_kl=None, ent_coef=0.01)    # proven phase-1 bootstrap config
+OPT_GUARDED = dict(target_kl=0.04, ent_coef=0.02)   # phases >= 2 (transition protection)
+
 # Fixed PPO hyperparameters, module-level so tests can pin them (n_steps/batch_size are
-# computed per run). target_kl caps the per-rollout update size: curriculum phase
-# transitions shift the reward scale and a live run hit approx_kl=2.49 there, destroying
-# the completion policy beyond recovery. ent_coef=0.02 keeps enough exploration alive to
-# sample the multi-piece hill motif (the policy entered phase 2 with ~0.1 nats entropy).
+# computed per run). Starts in the phase-1 config; the callback arms OPT_GUARDED later.
 PPO_HYPERPARAMS = dict(
     learning_rate=3e-4,
     n_epochs=10,
     gamma=GAMMA,
     gae_lambda=0.95,
     clip_range=0.2,
-    ent_coef=0.02,
-    target_kl=0.04,
+    **OPT_PHASE1,
 )
 
 
@@ -112,7 +118,23 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
         self.start_time = time.time()
         self.total_steps = 0
         self.last_dashboard_episode = 0  # Track last dashboard print to avoid repeats
-        
+        self._opt_guarded = False  # becomes True once OPT_GUARDED is armed (phase >= 2)
+
+    def _maybe_arm_kl_guard(self, info):
+        """Arm the guarded optimizer config (target_kl + raised ent_coef) the first time
+        the curriculum reaches phase 2. One-way: phase 1 needs the unguarded bootstrap
+        config to amplify rare completion spikes; the guard exists to survive the
+        phase-transition reward shift, which only matters from phase 2 onward."""
+        if self._opt_guarded:
+            return
+        if info.get('learning_phase', 1) < 2:
+            return
+        self.model.target_kl = OPT_GUARDED['target_kl']
+        self.model.ent_coef = OPT_GUARDED['ent_coef']
+        self._opt_guarded = True
+        print(f"🛡️ Phase 2 reached: armed KL guard (target_kl={self.model.target_kl}, "
+              f"ent_coef={self.model.ent_coef})")
+
     def _on_step(self) -> bool:
         # Track total steps for throughput calculation
         self.total_steps += self.n_envs
@@ -203,6 +225,7 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
                 # (in phases 2-3) 'qualified_rate' — surface them so the curriculum's progress
                 # past the lift-hill gate is visible in TensorBoard.
                 _info = self.locals['infos'][env_idx]
+                self._maybe_arm_kl_guard(_info)
                 if 'curriculum_phase' in _info:
                     self.logger.record('curriculum/phase', _info['curriculum_phase'])
                 elif 'learning_phase' in _info:
