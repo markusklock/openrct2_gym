@@ -29,9 +29,12 @@ class RewardParams:
     w_e: float = 2.0               # energy viability bonus
     # --- Phi normalizers (decoupled from obs SCALE/H_SCALE; see plan #6) ---
     d_xy: float = 40.0
-    d_z: float = 60.0              # reach: keeps the come-back-down gradient alive up to +60z
-                                   # (at 20 the m_z term clipped flat above +20z and lost
-                                   # climbers wandered on a zero-gradient plateau)
+    d_z: float = 20.0              # m_z slope = w_z/d_z = 0.3/z. Must stay steep enough that
+                                   # the energy term's chain-lift bump (~+0.47) cannot make
+                                   # climbing profitable where it shouldn't be (at d_z=60 the
+                                   # 0.1/z slope lost to it and phase 1 climbed instead of
+                                   # completing). High-altitude reach comes from m_z being
+                                   # UNCLIPPED, not from a large d_z.
     e_scale: float = 50.0
     # --- Discovery potential (makes climbing findable; ON in hill phases 2-4, the curriculum
     #     sets w_h=0 for phase 1/5 since an always-on climb pull derails Phase-1 completion) ---
@@ -571,15 +574,18 @@ class OpenRCT2Env(gym.Env):
         Rewards alignment of the build head to the closing state across all three
         closure axes (horizontal position, height, heading) plus an energy-viability
         bonus. Pure function of current state + track_builder.history (no API call),
-        bounded in [0, w_xy+w_z+w_dir+w_e], and maximized at the calibrated closing
-        (pos, dir) with positive energy margin. The heading term is omitted until the
-        closing direction is calibrated (avoids a wrong-heading reward wall).
+        bounded ABOVE by w_xy+w_z+w_dir+w_e+w_h and maximized at the calibrated closing
+        (pos, dir) with positive energy margin. The height misalignment m_z is
+        deliberately UNCLIPPED so Phi keeps falling (0.3/z) at any altitude -- a clipped
+        m_z left a zero-gradient plateau above +d_z where lost climbers wandered with no
+        pull home. The heading term is omitted until the closing direction is calibrated
+        (avoids a wrong-heading reward wall).
         """
         target = self._reward_target_position()
         px, py, pz = self.current_position
         tx, ty, tz = target
         m_xy = min(1.0, float(np.hypot(tx - px, ty - py)) / params.d_xy)
-        m_z = min(1.0, abs(pz - tz) / params.d_z)
+        m_z = abs(pz - tz) / params.d_z
         # numerically-stable logistic of the energy margin -> viability in (0, 1)
         v = 0.5 * (1.0 + np.tanh(0.5 * self._calculate_energy_margin() / params.e_scale))
         phi = (params.w_xy * (1.0 - m_xy)

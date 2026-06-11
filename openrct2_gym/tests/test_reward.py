@@ -520,10 +520,13 @@ def test_phase_reward_params_structural_per_phase():
     # attractor let a wrecked policy settle into climbing instead of completing.
     assert p1.w_h == 0.0 and p5.w_h == 0.0
     assert p2.w_h == 3.0 and p3.w_h == 3.0 and p4.w_h == 3.0
-    # d_z=60 keeps the come-back-down gradient alive at high altitude (at d_z=20 the
-    # m_z term clipped flat above +20z and lost climbers wandered with no pull home)
+    # d_z=20 keeps the near-station m_z slope at 0.3/z -- steep enough that the energy
+    # term's chain-lift bump (~+0.47) cannot make climbing profitable in phase 1
+    # (d_z=60 weakened the slope to 0.1/z and the energy term became an accidental
+    # discovery term: a 1M-step run climbed to +75z in phase 1 and never completed).
+    # High-altitude reach comes from m_z being UNCLIPPED instead (see gradient test).
     for p in (p1, p2, p3, p4, p5):
-        assert p.d_z == 60.0
+        assert p.d_z == 20.0
 
 
 def test_discovery_potential_off_in_phase1_and_5_on_in_phase2():
@@ -745,6 +748,36 @@ def test_climb_step_beats_flat_step_and_discovery_does_the_work():
     w_h_default = RewardParams().w_h
     assert _climb_vs_flat_gap(w_h_default) > 0                    # climb strictly preferred
     assert _climb_vs_flat_gap(w_h_default) > _climb_vs_flat_gap(0.0) + 0.4  # discovery does real work
+
+
+def test_phase1_chain_climb_does_not_beat_flat_progress():
+    """Regression for the d_z=60 failure: in phase 1 (w_h=0) a chain-lift climb step must
+    LOSE to a flat step toward the goal, or the energy term turns into an accidental
+    discovery term and the agent climbs instead of completing. Uses the real game
+    geometry (~2z gained per chain piece) and phase-1 params from the curriculum."""
+    p = ImprovedPhasedCurriculumWrapper._phase_reward_params(1)
+    assert p.w_h == 0.0
+    prior = [{"action": 0, "position": [70, 66, 14], "next_position": [69 - i, 66, 14]}
+             for i in range(3)]
+    head0 = [67, 66, 14]
+
+    def make(history, pos):
+        env = _bare_env(current_position=pos, current_direction=3, history=history)
+        env.close_pos = None
+        env.close_dir = None
+        env.reward_params = p
+        return env
+
+    phi_prior = make(prior, head0)._potential(p)
+    flat = make(prior + [{"action": 0, "position": head0, "next_position": [66, 66, 14]}],
+                [66, 66, 14])
+    flat._phi_prev = phi_prior; flat.loop_completed = False
+    r_flat = flat._calculate_reward(True, 0)
+    climb = make(prior + [{"action": 9, "position": head0, "next_position": [66, 66, 16]}],
+                 [66, 66, 16])
+    climb._phi_prev = phi_prior; climb.loop_completed = False
+    r_climb = climb._calculate_reward(True, 9)
+    assert r_flat > r_climb            # flat looping must stay optimal in phase 1
 
 
 def test_height_gradient_reaches_high_altitude():
