@@ -520,6 +520,11 @@ def test_phase_reward_params_structural_per_phase():
     # attractor let a wrecked policy settle into climbing instead of completing.
     assert p1.w_h == 0.0 and p5.w_h == 0.0
     assert p2.w_h == 3.0 and p3.w_h == 3.0 and p4.w_h == 3.0
+    # completion gating: a flat loop earns only completion_hill_floor of R_complete in the
+    # hill phases 2-4 (forces hill-building); full credit in phase 1 (bootstrap) and 5.
+    assert p1.completion_hill_floor == 1.0 and p5.completion_hill_floor == 1.0
+    assert (p2.completion_hill_floor == 0.25 and p3.completion_hill_floor == 0.25
+            and p4.completion_hill_floor == 0.25)
     # d_z=20 keeps the near-station m_z slope at 0.3/z -- steep enough that the energy
     # term's chain-lift bump (~+0.47) cannot make climbing profitable in phase 1
     # (d_z=60 weakened the slope to 0.1/z and the energy term became an accidental
@@ -655,6 +660,40 @@ def test_episode_metrics_expose_struct_and_height_diagnostics(monkeypatch):
     m = info['episode_metrics']
     assert {'chain_count', 'struct_bonus', 'max_gain'}.issubset(m)   # callback's contract
     assert m['chain_count'] >= 1 and m['struct_bonus'] > 0 and m['max_gain'] >= 0
+
+
+# ---- completion gating (force hills: a flat loop is worth little in phases 2-4)
+
+def _complete_payoff(params, chains=0, drops=0):
+    """Total reward for a completing step under `params`, with _phi_prev=0 so the PBRS
+    term is 0 and only the completion payoff (gated R_complete + struct bonus) remains."""
+    env = _struct_env(chains=chains, drops=drops)
+    env.reward_params = params
+    env._phi_prev = 0.0
+    env.loop_completed = True
+    return env._calculate_reward(True, 0)
+
+
+def test_completion_gate_devalues_flat_loops_in_phase2():
+    P = ImprovedPhasedCurriculumWrapper._phase_reward_params(2)
+    flat = _complete_payoff(P, chains=0)
+    full = _complete_payoff(P, chains=3)
+    assert flat == pytest.approx(250.0)        # R_complete * 0.25 floor, no hill
+    assert full == pytest.approx(1250.0)       # R_complete * 1.0 + struct 250
+    assert flat < _complete_payoff(P, chains=1) < full   # partial hill scales between
+
+
+def test_completion_not_gated_in_phase1():
+    P = ImprovedPhasedCurriculumWrapper._phase_reward_params(1)
+    assert _complete_payoff(P, chains=0) == pytest.approx(1000.0)   # flat fully paid in P1
+
+
+def test_gated_flat_completion_still_beats_any_incomplete():
+    # completion-first must survive the gate: even a gated flat completion outranks the
+    # best bounded incomplete return (Phi_max).
+    P = ImprovedPhasedCurriculumWrapper._phase_reward_params(2)
+    phi_max = P.w_xy + P.w_z + P.w_dir + P.w_e + P.w_h
+    assert P.R_complete * P.completion_hill_floor > phi_max
 
 
 # ---- discovery potential (elevation term in Phi)

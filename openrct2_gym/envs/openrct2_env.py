@@ -51,6 +51,11 @@ class RewardParams:
     struct_chain_target: int = 3   # chain-lift count for full chain credit (matches the phase gate)
     struct_w_chain: float = 1.0    # weight on the chain-lift component
     struct_w_drop: float = 0.0     # weight on the drop component
+    # Fraction of R_complete a HILL-LESS completion earns. 1.0 = no gating (P1/P5); 0.25 in
+    # the hill phases means a flat loop pays only 250 while a full hill pays the rest -- a
+    # flat-completer can no longer ignore the lift hill (it leaves 75% of R_complete on the
+    # table). Completion stays first: even the gated floor (250) >> Phi_max (~27).
+    completion_hill_floor: float = 1.0
     exc_target: float = 8.0
     exc_sigma: float = 1.0
     int_target: float = 5.5
@@ -447,9 +452,13 @@ class OpenRCT2Env(gym.Env):
 
         reward += params.step_cost
         if self.loop_completed:
-            reward += params.R_complete
-            # Completion-conditioned structural bonus (lift hill / drop). Computed once and
-            # stored so episode_metrics reports exactly what was added to the reward.
+            # Hill-gated completion: a flat loop earns only completion_hill_floor of
+            # R_complete; building the lift hill earns the rest (plus the structural bonus).
+            # In phases 1/5 the floor is 1.0 so completion is fully paid regardless.
+            gate = params.completion_hill_floor + (1.0 - params.completion_hill_floor) * self._hill_quality(params)
+            reward += params.R_complete * gate
+            # Structural bonus, computed once and stored so episode_metrics reports exactly
+            # what was added to the reward.
             self._last_struct_bonus = self._structural_bonus(params)
             reward += self._last_struct_bonus
 
@@ -627,21 +636,24 @@ class OpenRCT2Env(gym.Env):
         return float(params.R_quality_max
                      * (params.q_w_exc * q_e + params.q_w_int * q_i + params.q_w_nausea * q_n))
 
-    def _structural_bonus(self, params):
-        """Completion-conditioned bonus for building the lift-hill / drop structure each
-        intermediate phase gates on, in [0, R_struct_max]. A pure function of the
-        removal-safe track history (NOT self.chain_lift_count, which is capped/bookkept and
-        can desync from the gate). Only the caller's completion guard makes it a real bonus,
-        so it cannot be place/remove-farmed. Returns 0 when disabled (P1/P5)."""
-        if params.R_struct_max <= 0:
-            return 0.0
+    def _hill_quality(self, params):
+        """Lift-hill / drop quality of the current track in [0, 1], from the removal-safe
+        history (NOT self.chain_lift_count, which is capped/bookkept and can desync from the
+        gate). Used by both the structural bonus and the completion gate."""
         hist = getattr(self.track_builder, "history", None) or []
         chain_count = sum(1 for h in hist if h.get("action") in (9, 10))
         has_drop = any(h.get("action") in (6, 8, 12, 14) for h in hist)
         chain_q = min(chain_count / params.struct_chain_target, 1.0)
         drop_q = 1.0 if has_drop else 0.0
-        quality = min(params.struct_w_chain * chain_q + params.struct_w_drop * drop_q, 1.0)
-        return float(params.R_struct_max * quality)
+        return min(params.struct_w_chain * chain_q + params.struct_w_drop * drop_q, 1.0)
+
+    def _structural_bonus(self, params):
+        """Completion-conditioned bonus for building the lift-hill / drop structure each
+        intermediate phase gates on, in [0, R_struct_max]. Only the caller's completion
+        guard makes it a real bonus, so it cannot be place/remove-farmed. 0 when disabled."""
+        if params.R_struct_max <= 0:
+            return 0.0
+        return float(params.R_struct_max * self._hill_quality(params))
 
     def _calculate_distance_to_start(self):
         point_a = np.array(self.current_position)

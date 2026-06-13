@@ -113,13 +113,16 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
             return RewardParams(R_quality_max=500.0, step_cost=-0.01, w_h=0.0)
         if phase == 2:                                                   # gate: >=3 chains
             return RewardParams(R_struct_max=250.0, struct_chain_target=3,
-                                struct_w_chain=1.0, struct_w_drop=0.0)
+                                struct_w_chain=1.0, struct_w_drop=0.0,
+                                completion_hill_floor=0.25)
         if phase == 3:                                                   # gate: >=2 chains AND drop
             return RewardParams(R_struct_max=250.0, struct_chain_target=2,
-                                struct_w_chain=0.5, struct_w_drop=0.5)
+                                struct_w_chain=0.5, struct_w_drop=0.5,
+                                completion_hill_floor=0.25)
         if phase == 4:                                                   # integration: hill + drop
             return RewardParams(R_struct_max=250.0, struct_chain_target=3,
-                                struct_w_chain=0.5, struct_w_drop=0.5)
+                                struct_w_chain=0.5, struct_w_drop=0.5,
+                                completion_hill_floor=0.25)
         return RewardParams(w_h=0.0)                                     # phase 1: struct + discovery off
 
     @staticmethod
