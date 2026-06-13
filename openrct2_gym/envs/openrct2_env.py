@@ -56,6 +56,13 @@ class RewardParams:
     # flat-completer can no longer ignore the lift hill (it leaves 75% of R_complete on the
     # table). Completion stays first: even the gated floor (250) >> Phi_max (~27).
     completion_hill_floor: float = 1.0
+    # Round-trip milestone: a one-time-per-episode bonus for climbing >= roundtrip_gain above
+    # the station AND returning to ~station height, INDEPENDENT of closing the loop. Teaches
+    # the climb-and-return sub-skill decoupled from completion (a hill is then a reachable
+    # add-on to the agent's closure skill). Kept below the gated completion reward so it never
+    # lures the agent away from completing. 0 disables it (P1/P5).
+    R_roundtrip: float = 0.0
+    roundtrip_gain: float = 4.0    # min elevation (z above station) that counts as "climbed"
     exc_target: float = 8.0
     exc_sigma: float = 1.0
     int_target: float = 5.5
@@ -328,6 +335,7 @@ class OpenRCT2Env(gym.Env):
                 'chain_lift_count': self.chain_lift_count,
                 'chain_count': sum(1 for h in self.track_builder.history if h.get('action') in (9, 10)),
                 'struct_bonus': getattr(self, '_last_struct_bonus', 0.0),
+                'roundtrip': float(getattr(self, '_roundtrip_awarded', False)),
                 'max_gain': max((h['next_position'][2] - self.STATION_HEIGHT
                                  for h in self.track_builder.history), default=0.0),
                 'track_length': self.track_length,
@@ -424,6 +432,8 @@ class OpenRCT2Env(gym.Env):
         if not station_built:
             raise RuntimeError("Failed to build initial station")
 
+        self._roundtrip_awarded = False  # round-trip milestone fires at most once per episode
+
         # Seed the PBRS potential at the true starting head (post-station-build).
         self._phi_prev = self._potential(self.reward_params)
 
@@ -461,6 +471,16 @@ class OpenRCT2Env(gym.Env):
             # what was added to the reward.
             self._last_struct_bonus = self._structural_bonus(params)
             reward += self._last_struct_bonus
+
+        # Round-trip elevation milestone (completion-independent, once per episode): reward
+        # the climb-and-return motion so it can be learned as an add-on to the closure skill.
+        if params.R_roundtrip > 0.0 and not getattr(self, "_roundtrip_awarded", False):
+            max_gain = max((h["next_position"][2] - self.STATION_HEIGHT
+                            for h in self.track_builder.history), default=0.0)
+            if (max_gain >= params.roundtrip_gain
+                    and self.current_position[2] <= self.STATION_HEIGHT + 1):
+                reward += params.R_roundtrip
+                self._roundtrip_awarded = True
 
         if getattr(self, "verbose", 0) >= 2:
             print("Reward was: %.3f (Phi'=%.3f, dist: %.1f, track: %d)" % (

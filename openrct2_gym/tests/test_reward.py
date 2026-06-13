@@ -696,6 +696,63 @@ def test_gated_flat_completion_still_beats_any_incomplete():
     assert P.R_complete * P.completion_hill_floor > phi_max
 
 
+# ---- round-trip elevation milestone (decomposition: teach climb-and-return)
+
+def _roundtrip_env(peak_z, head_z, p):
+    env = _bare_env(current_position=(0, 0, head_z),
+                    history=[{"action": 9, "next_position": [0, 0, peak_z]}])
+    env.reward_params = p
+    env._phi_prev = 0.0          # isolate the milestone delta from PBRS shaping
+    env._roundtrip_awarded = False
+    env.loop_completed = False
+    return env
+
+
+def test_roundtrip_milestone_awarded_on_climb_and_return():
+    p = RewardParams(R_roundtrip=100.0, roundtrip_gain=4.0)
+    env = _roundtrip_env(peak_z=20, head_z=14, p=p)        # climbed +6, back at station height
+    r = env._calculate_reward(True, 0)
+    assert r == pytest.approx(p.gamma * env._potential(p) + 100.0)
+    assert env._roundtrip_awarded is True
+
+
+def test_roundtrip_not_awarded_while_still_elevated():
+    p = RewardParams(R_roundtrip=100.0, roundtrip_gain=4.0)
+    env = _roundtrip_env(peak_z=20, head_z=20, p=p)        # climbed but hasn't returned
+    r = env._calculate_reward(True, 0)
+    assert r == pytest.approx(p.gamma * env._potential(p))  # no milestone
+    assert env._roundtrip_awarded is False
+
+
+def test_roundtrip_not_awarded_without_enough_climb():
+    p = RewardParams(R_roundtrip=100.0, roundtrip_gain=4.0)
+    env = _roundtrip_env(peak_z=16, head_z=14, p=p)        # only +2 < gain 4
+    r = env._calculate_reward(True, 0)
+    assert r == pytest.approx(p.gamma * env._potential(p))
+    assert env._roundtrip_awarded is False
+
+
+def test_roundtrip_awarded_once_per_episode():
+    p = RewardParams(R_roundtrip=100.0, roundtrip_gain=4.0)
+    env = _roundtrip_env(peak_z=20, head_z=14, p=p)
+    env._calculate_reward(True, 0)                          # first -> awarded
+    env._phi_prev = 0.0
+    r2 = env._calculate_reward(True, 0)                     # second -> no re-award
+    assert r2 == pytest.approx(p.gamma * env._potential(p))
+
+
+def test_roundtrip_disabled_and_below_completion_per_phase():
+    assert RewardParams().R_roundtrip == 0.0               # off by default
+    W = ImprovedPhasedCurriculumWrapper
+    assert W._phase_reward_params(1).R_roundtrip == 0.0     # off in phase 1
+    assert W._phase_reward_params(5).R_roundtrip == 0.0     # off in phase 5
+    for ph in (2, 3, 4):
+        P = W._phase_reward_params(ph)
+        assert P.R_roundtrip == 100.0
+        # must stay below the gated flat completion so it never lures the agent off completing
+        assert P.R_roundtrip < P.R_complete * P.completion_hill_floor
+
+
 # ---- discovery potential (elevation term in Phi)
 
 _DISC = RewardParams(w_xy=0.0, w_z=0.0, w_dir=0.0, w_e=0.0, w_h=6.0, h_scale=6.0)  # isolate discovery

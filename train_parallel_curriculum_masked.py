@@ -38,10 +38,12 @@ GAMMA = RewardParams().gamma
 # policy never recovered) plus extra entropy (for the multi-piece hill motif) are armed
 # by ParallelCurriculumMaskableCallback when the curriculum reaches phase 2.
 OPT_PHASE1 = dict(target_kl=None, ent_coef=0.01)    # proven phase-1 bootstrap config
-# Phases >= 2: arm ONLY the KL guard. A doubled ent_coef was tried and backfired -- once
-# completion converged, advantages shrank and the entropy bonus dominated, exploding
-# entropy 0.03->1.5 and destroying the completion policy. Entropy stays at 0.01 always.
-OPT_GUARDED = dict(target_kl=0.04)
+# Phases >= 2: arm the KL guard + a modest entropy FLOOR. ent_coef=0.02 over-explored and
+# exploded entropy (completion destroyed); 0.01 under-explored and imploded (entropy -> 0.02,
+# policy froze on a non-completing near-miss, never sampling chain lifts). 0.015 sits between
+# to keep chain lifts sampled without the explosion. (A proper adaptive entropy controller is
+# the principled fix if this floor proves insufficient.)
+OPT_GUARDED = dict(target_kl=0.04, ent_coef=0.015)
 
 # Fixed PPO hyperparameters, module-level so tests can pin them (n_steps/batch_size are
 # computed per run). Starts in the phase-1 config; the callback arms OPT_GUARDED later.
@@ -256,6 +258,8 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
                             self.logger.record('rewards/struct_bonus', info_metrics['struct_bonus'])
                         if 'max_gain' in info_metrics:
                             self.logger.record('height/max_gain', info_metrics['max_gain'])
+                        if 'roundtrip' in info_metrics:
+                            self.logger.record('height/roundtrip', info_metrics['roundtrip'])
                         if 'remove_count' in info_metrics:
                             self.logger.record('behavior/remove_count', info_metrics['remove_count'])
 

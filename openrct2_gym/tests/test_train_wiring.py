@@ -117,10 +117,10 @@ def test_ppo_hyperparams_start_with_phase1_bootstrap_config(monkeypatch):
     assert T.PPO_HYPERPARAMS["target_kl"] is None
     assert T.PPO_HYPERPARAMS["ent_coef"] == 0.01
     assert T.PPO_HYPERPARAMS["gamma"] == T.GAMMA
-    # the guard the callback arms for phases >= 2 touches ONLY target_kl: a doubled
-    # ent_coef destabilized the converged completion policy (entropy exploded 0.03->1.5,
-    # completion collapsed), so entropy stays at the proven 0.01 in every phase.
-    assert T.OPT_GUARDED == {"target_kl": 0.04}
+    # the guard the callback arms for phases >= 2: target_kl + a modest entropy FLOOR.
+    # ent_coef=0.02 exploded entropy (completion destroyed); 0.01 imploded it (policy froze
+    # on a non-completing near-miss). 0.015 sits between to keep chain lifts sampled.
+    assert T.OPT_GUARDED == {"target_kl": 0.04, "ent_coef": 0.015}
 
     env = _make_vecnorm_env()
     model = MaskablePPO(
@@ -155,7 +155,7 @@ def test_callback_arms_kl_guard_when_phase2_begins():
 
     cb._maybe_arm_kl_guard({'learning_phase': 2})       # phase 2 -> guard arms
     assert cb.model.target_kl == 0.04
-    assert cb.model.ent_coef == 0.01                    # entropy UNCHANGED (no longer doubled)
+    assert cb.model.ent_coef == 0.015                   # modest entropy floor (between 0.01/0.02)
 
     cb.model.target_kl = 0.99                           # one-way: arming never re-fires
     cb._maybe_arm_kl_guard({'learning_phase': 3})
