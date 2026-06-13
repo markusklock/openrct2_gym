@@ -140,6 +140,22 @@ def test_ppo_hyperparams_start_with_phase1_bootstrap_config(monkeypatch):
     env.close()
 
 
+def test_clear_calibration_cache_removes_stale_file(tmp_path, monkeypatch):
+    """A fresh run must drop the persisted closing-geometry cache so it recalibrates from
+    its own first completion (a cache from an old reward regime misguides Phi)."""
+    import json
+    from openrct2_gym.envs.openrct2_env import OpenRCT2Env
+    cache = tmp_path / "close_geometry.json"
+    cache.write_text(json.dumps({"pos": [63, 67, 14], "dir": 3}))
+    monkeypatch.setattr(OpenRCT2Env, "_CLOSE_CACHE_PATH", str(cache))
+    monkeypatch.setattr(OpenRCT2Env, "_close_cache", {"pos": [63, 67, 14], "dir": 3})
+
+    assert T._clear_calibration_cache() is True
+    assert not cache.exists()                    # stale file gone
+    assert OpenRCT2Env._close_cache is None       # in-memory cache reset (DummyVecEnv path)
+    assert T._clear_calibration_cache() is False  # idempotent: nothing to remove
+
+
 def test_callback_arms_kl_guard_when_phase2_begins():
     """The phase-2 transition is where the KL=2.49 catastrophe happened, so the guard
     (target_kl + raised ent_coef) must arm exactly when the curriculum reaches phase 2 --

@@ -9,7 +9,7 @@ from openrct2_gym.envs.curriculum_wrapper import CurriculumWrapper, AdaptiveCurr
 from openrct2_gym.envs.improved_phased_curriculum_wrapper import ImprovedPhasedCurriculumWrapper
 from openrct2_gym.envs.wrappers import OpenRCT2Wrapper
 from openrct2_gym.envs.feature_extractor import BuildHistoryExtractor
-from openrct2_gym.envs.openrct2_env import RewardParams
+from openrct2_gym.envs.openrct2_env import RewardParams, OpenRCT2Env
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.maskable.policies import MaskableMultiInputActorCriticPolicy
 from sb3_contrib.common.wrappers import ActionMasker
@@ -55,6 +55,19 @@ PPO_HYPERPARAMS = dict(
     clip_range=0.2,
     **OPT_PHASE1,
 )
+
+
+def _clear_calibration_cache() -> bool:
+    """Drop any persisted closing-geometry calibration (in-memory class cache + the JSON
+    file shared across SubprocVecEnv workers) so a fresh run recalibrates Phi's closing
+    anchor from its OWN first completion. A cache left over from an earlier reward regime
+    silently misguides Phi in every later run. Returns True if a file was removed."""
+    OpenRCT2Env._close_cache = None
+    try:
+        os.remove(OpenRCT2Env._CLOSE_CACHE_PATH)
+        return True
+    except OSError:
+        return False
 
 
 def _vecnormalize_path(model_path: str) -> str:
@@ -469,6 +482,14 @@ def train_parallel_curriculum_masked(
     """Train agent with curriculum learning AND action masking on multiple parallel environments"""
 
     n_envs = len(ports)
+
+    # A fresh run must NOT inherit a stale closing-geometry calibration from a previous run
+    # (it would anchor Phi at an old/atypical closing state). Clear it unless we're resuming
+    # an existing model, in which case the calibration should stay consistent with it.
+    resuming = bool(model_path and os.path.exists(model_path))
+    if not resuming and _clear_calibration_cache():
+        print("🧭 Fresh run: cleared stale closing-geometry calibration (will recalibrate "
+              "from this run's first completion)")
 
     print("="*60)
     print("🎓 PARALLEL CURRICULUM LEARNING + ACTION MASKING")
