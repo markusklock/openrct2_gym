@@ -38,7 +38,10 @@ GAMMA = RewardParams().gamma
 # policy never recovered) plus extra entropy (for the multi-piece hill motif) are armed
 # by ParallelCurriculumMaskableCallback when the curriculum reaches phase 2.
 OPT_PHASE1 = dict(target_kl=None, ent_coef=0.01)    # proven phase-1 bootstrap config
-OPT_GUARDED = dict(target_kl=0.04, ent_coef=0.02)   # phases >= 2 (transition protection)
+# Phases >= 2: arm ONLY the KL guard. A doubled ent_coef was tried and backfired -- once
+# completion converged, advantages shrank and the entropy bonus dominated, exploding
+# entropy 0.03->1.5 and destroying the completion policy. Entropy stays at 0.01 always.
+OPT_GUARDED = dict(target_kl=0.04)
 
 # Fixed PPO hyperparameters, module-level so tests can pin them (n_steps/batch_size are
 # computed per run). Starts in the phase-1 config; the callback arms OPT_GUARDED later.
@@ -129,11 +132,10 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
             return
         if info.get('learning_phase', 1) < 2:
             return
-        self.model.target_kl = OPT_GUARDED['target_kl']
-        self.model.ent_coef = OPT_GUARDED['ent_coef']
+        for key, value in OPT_GUARDED.items():
+            setattr(self.model, key, value)
         self._opt_guarded = True
-        print(f"🛡️ Phase 2 reached: armed KL guard (target_kl={self.model.target_kl}, "
-              f"ent_coef={self.model.ent_coef})")
+        print(f"🛡️ Phase 2 reached: armed guard {OPT_GUARDED}")
 
     def _on_step(self) -> bool:
         # Track total steps for throughput calculation
