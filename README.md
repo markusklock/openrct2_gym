@@ -20,7 +20,7 @@ The project has evolved significantly from its UI automation origins. It now fea
 - **Potential-based reward (PBRS)**: a single, unified, policy-invariant reward that gives a dense gradient toward closing the circuit — and is provably un-farmable (no place/remove exploit)
 - **Auto-calibrated closing target**: the geometry required to close the circuit is learned from the first completion, so the reward always points at the true closable state
 - **5-phase curriculum learning**: Progressive skill acquisition from navigation to ride quality optimization
-- **Parallel training**: Multiple OpenRCT2 instances on different ports using DummyVecEnv
+- **Parallel training**: Multiple OpenRCT2 instances on different ports using SubprocVecEnv
 - **Action masking**: Prevents invalid track placements
 - **Ride quality optimization**: Phase 5 targets Excitement 7-9, Intensity 4.5-6.5, Nausea <4.5
 - **3D-aware observation + build memory**: an egocentric, forward-aligned 2.5D map (occupancy / signed height / goal+station marker / chain-lift trail) gives spatial awareness, and a structured build-history buffer (last 128 pieces: learned piece-type embedding + per-piece relative geometry) gives the agent memory of what it has built. Both are encoded by a custom feature extractor (`openrct2_gym/envs/feature_extractor.py`) with a GRU over the history and a CNN over the map, plus `VecNormalize` over the continuous scalars.
@@ -63,20 +63,13 @@ pip install -e .
 ### Quick Start - Improved 5-Phase Curriculum (Recommended)
 ```bash
 # Single environment
-python train_parallel_curriculum_masked.py --ports 8080 --improved --timesteps 1000000
+python train.py --ports 8080 --timesteps 1000000
 
 # Multiple parallel environments (faster training)
-python train_parallel_curriculum_masked.py --ports 8080,8081,8082,8083 --improved --timesteps 1000000
+python train.py --ports 8080,8081,8082,8083 --timesteps 1000000
 ```
 
-The `--improved` flag enables the 5-phase curriculum with the potential-based reward (see [Reward System](#reward-system-potential-based-shaping)).
-
-### Alternative Training Options
-
-```bash
-# Standard training with action masking (no curriculum)
-python train_rl_agent_masked.py --timesteps 500000
-```
+`train.py` always uses the improved 5-phase curriculum with the potential-based reward (see [Reward System](#reward-system-potential-based-shaping)). When two or more available ports are provided, training automatically uses `SubprocVecEnv`; with one available port it uses `DummyVecEnv`.
 
 ### Monitor Training Progress
 
@@ -190,7 +183,7 @@ The training scripts provide extensive metrics in Tensorboard:
 - **Auto-calibrated closing target**: the closing geometry is learned from the first completed circuit, so the reward targets the true closable state
 - **Completion-first objective**: a large completion bonus dominates; ride quality is a smooth, bounded bonus in phase 5
 - **5-phase curriculum**: phases now only set parameters — the reward and potential stay identical throughout
-- **Parallel training stability**: DummyVecEnv with retry logic for reliable multi-instance training
+- **Parallel training**: `train.py` uses `SubprocVecEnv` automatically for multi-port training and `DummyVecEnv` for single-port training
 
 ## Future Improvements
 

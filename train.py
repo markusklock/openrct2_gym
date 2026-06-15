@@ -5,7 +5,6 @@ Trains on multiple OpenRCT2 instances simultaneously for faster learning
 """
 import gymnasium as gym
 import openrct2_gym
-from openrct2_gym.envs.curriculum_wrapper import CurriculumWrapper, AdaptiveCurriculumWrapper
 from openrct2_gym.envs.improved_phased_curriculum_wrapper import ImprovedPhasedCurriculumWrapper
 from openrct2_gym.envs.wrappers import OpenRCT2Wrapper
 from openrct2_gym.envs.feature_extractor import BuildHistoryExtractor
@@ -22,7 +21,7 @@ import os
 import argparse
 import time
 import math
-from typing import List, Callable
+from typing import Callable, List, Optional
 from contextlib import ExitStack
 
 # Single source of truth for the discount factor. PBRS policy-invariance requires the
@@ -453,9 +452,9 @@ def mask_fn(env: gym.Env) -> np.ndarray:
     print("Warning: Could not find valid_action_mask method, allowing all actions")
     return np.ones(env.action_space.n, dtype=bool)
 
-def create_curriculum_masked_env(port: int, use_adaptive: bool = False,
-                                  use_improved: bool = False, verbose: int = 0) -> gym.Env:
-    """Create environment with curriculum wrapper and action masking for a specific port"""
+
+def create_curriculum_masked_env(port: int, verbose: int = 0) -> gym.Env:
+    """Create an improved-curriculum environment with action masking for a port."""
     # Base environment with specific port and verbosity
     base_env = gym.make('OpenRCT2-v0', host='localhost', port=port, verbose=verbose)
 
@@ -463,59 +462,38 @@ def create_curriculum_masked_env(port: int, use_adaptive: bool = False,
     # This is crucial for the mask_fn to work
     base_env = OpenRCT2Wrapper(base_env)
 
-    # Apply curriculum wrapper
-    if use_improved:
-        # Use improved 5-phase curriculum with physics-aware rewards
-        env = ImprovedPhasedCurriculumWrapper(
-            base_env,
-            phase1_success_threshold=0.5,   # 50% loop completion
-            phase2_success_threshold=0.4,   # 40% with 3+ chain lifts
-            phase3_success_threshold=0.35,  # 35% with good patterns
-            phase4_success_threshold=0.30,  # 30% clean completions
-            phase5_success_threshold=0.25,  # 25% with quality ratings
-            window_size=50,
-            phase1_max_length=25,   # Return practice
-            phase2_max_length=40,   # Lift hill building
-            phase3_max_length=60,   # Drop & turn
-            phase4_max_length=80,   # Circuit mastery
-            phase5_initial_length=80,
-            phase5_target_length=120,
-            phase5_increase_step=10,
-            verbose=verbose
-        )
-    elif use_adaptive:
-        env = AdaptiveCurriculumWrapper(
-            base_env,
-            initial_max_length=50,
-            target_max_length=120,
-            success_threshold=0.2,  # 20% success to advance
-            window_size=50,
-            increase_step=10
-        )
-    else:
-        env = CurriculumWrapper(
-            base_env,
-            initial_max_length=50,
-            target_max_length=120,
-            success_threshold=0.2,
-            window_size=50,
-            increase_step=10
-        )
-    
+    env = ImprovedPhasedCurriculumWrapper(
+        base_env,
+        phase1_success_threshold=0.5,   # 50% loop completion
+        phase2_success_threshold=0.4,   # 40% with 3+ chain lifts
+        phase3_success_threshold=0.35,  # 35% with good patterns
+        phase4_success_threshold=0.30,  # 30% clean completions
+        phase5_success_threshold=0.25,  # 25% with quality ratings
+        window_size=50,
+        phase1_max_length=25,   # Return practice
+        phase2_max_length=40,   # Lift hill building
+        phase3_max_length=60,   # Drop & turn
+        phase4_max_length=80,   # Circuit mastery
+        phase5_initial_length=80,
+        phase5_target_length=120,
+        phase5_increase_step=10,
+        verbose=verbose,
+    )
+
     # Add Monitor for logging
     env = Monitor(env)
-    
+
     # Add ActionMasker for MaskablePPO
     env = ActionMasker(env, mask_fn)
-    
+
     return env
 
-def make_env_factory(port: int, use_adaptive: bool = False,
-                      use_improved: bool = False, verbose: int = 0) -> Callable[[], gym.Env]:
+
+def make_env_factory(port: int, verbose: int = 0) -> Callable[[], gym.Env]:
     """Create a factory function for an environment on a specific port"""
     def _init() -> gym.Env:
         try:
-            env = create_curriculum_masked_env(port, use_adaptive, use_improved, verbose)
+            env = create_curriculum_masked_env(port, verbose)
             print(f"✅ Successfully connected to OpenRCT2 on port {port}")
             return env
         except Exception as e:
@@ -523,15 +501,26 @@ def make_env_factory(port: int, use_adaptive: bool = False,
             raise
     return _init
 
-def train_parallel_curriculum_masked(
+
+def _create_vector_env(env_factories: List[Callable[[], gym.Env]]):
+    """Use subprocess workers only when there is real multi-port parallelism."""
+    n_envs = len(env_factories)
+    if n_envs > 1:
+        env = SubprocVecEnv(env_factories)
+        print(f"✅ Created {n_envs} parallel environments using SubprocVecEnv")
+        return env
+
+    env = DummyVecEnv(env_factories)
+    print("✅ Created 1 environment using DummyVecEnv")
+    return env
+
+
+def train(
     ports: List[int],
     total_timesteps: int,
     checkpoint_freq: int,
     eval_freq: int,
-    model_path: str | None = None,
-    use_adaptive: bool = False,
-    use_improved: bool = False,
-    use_subproc: bool = False,
+    model_path: Optional[str] = None,
     verbose: int = 0,
     eval_episodes: int = 10,
     disable_eval: bool = False,
@@ -553,41 +542,23 @@ def train_parallel_curriculum_masked(
     print("="*60)
     print(f"Training on {n_envs} parallel OpenRCT2 instances")
     print(f"Ports: {', '.join(map(str, ports))}")
-    if use_improved:
-        print("Using IMPROVED 5-phase curriculum with physics-aware rewards:")
-        print("  Phase 1: Return Practice (25 pieces) - Learn navigation")
-        print("  Phase 2: Lift Hill Building (40 pieces) - Learn chain lifts & energy")
-        print("  Phase 3: Drop & Turn (60 pieces) - Learn drops & turnarounds")
-        print("  Phase 4: Circuit Mastery (80 pieces) - Full integration")
-        print("  Phase 5: Quality Optimization (80-120 pieces) - E=7-9, I=4.5-6.5, N<4.5")
-        print("  + Energy estimation, pattern detection, approach guidance")
-    elif use_adaptive:
-        print("Using adaptive curriculum (50-120 pieces)")
-    else:
-        print("Starting with short tracks (50 pieces)")
-        print("Will gradually increase to 120 pieces")
+    print("Using improved 5-phase curriculum with physics-aware rewards:")
+    print("  Phase 1: Return Practice (25 pieces) - Learn navigation")
+    print("  Phase 2: Lift Hill Building (40 pieces) - Learn chain lifts & energy")
+    print("  Phase 3: Drop & Turn (60 pieces) - Learn drops & turnarounds")
+    print("  Phase 4: Circuit Mastery (80 pieces) - Full integration")
+    print("  Phase 5: Quality Optimization (80-120 pieces) - E=7-9, I=4.5-6.5, N<4.5")
+    print("  + Energy estimation, pattern detection, approach guidance")
     print("Using MaskablePPO to prevent invalid actions")
     print("="*60 + "\n")
-    
+
     # Create environment factories for each port
-    env_factories = [make_env_factory(port, use_adaptive, use_improved, verbose) for port in ports]
-    
+    env_factories = [make_env_factory(port, verbose) for port in ports]
+
     # Create vectorized environments
     print(f"\n🔌 Connecting to {n_envs} OpenRCT2 instances...")
-    if use_subproc and n_envs > 1:
-        # SubprocVecEnv for true parallel execution
-        # Now more stable with retry logic and proper resource cleanup
-        env = SubprocVecEnv(env_factories)
-        print(f"✅ Created {n_envs} parallel environments using SubprocVecEnv")
-    else:
-        # DummyVecEnv runs sequentially (stable but no parallelism)
-        env = DummyVecEnv(env_factories)
-        if n_envs > 1:
-            print(f"✅ Created {n_envs} environments using DummyVecEnv (sequential)")
-            print("   💡 Use --use-subproc for true parallel execution")
-        else:
-            print(f"✅ Created {n_envs} environment using DummyVecEnv")
-    
+    env = _create_vector_env(env_factories)
+
     # Normalize ONLY the continuous 'scalars' key. norm_reward=False preserves the
     # curriculum's tuned absolute reward magnitudes and phase-advancement thresholds.
     # Other keys (map, tokens, mask, already-clipped goal vectors, Discretes) are left
@@ -750,9 +721,9 @@ def train_parallel_curriculum_masked(
             curriculum_env = None
             temp_env = env_instance
 
-            # Navigate through wrappers to find CurriculumWrapper
+            # Navigate through wrappers to find the curriculum wrapper.
             while temp_env is not None:
-                if hasattr(temp_env, 'get_curriculum_stats') or hasattr(temp_env, 'get_phase_stats'):
+                if hasattr(temp_env, 'get_phase_stats'):
                     curriculum_env = temp_env
                     break
                 if hasattr(temp_env, 'env'):
@@ -761,11 +732,7 @@ def train_parallel_curriculum_masked(
                     break
 
             if curriculum_env:
-                # Check if it's a phased curriculum wrapper
-                if hasattr(curriculum_env, 'get_phase_stats'):
-                    stats = curriculum_env.get_phase_stats()
-                else:
-                    stats = curriculum_env.get_curriculum_stats()
+                stats = curriculum_env.get_phase_stats()
 
         # Persist final VecNormalize stats (needed to reload the model for eval/resume)
         # before the env is closed.
@@ -787,36 +754,22 @@ def train_parallel_curriculum_masked(
 
     # Log final curriculum stats if available
     if stats:
-        if 'current_phase' in stats:  # Phased curriculum stats
-            print("\n📊 Final Phased Curriculum Stats:")
-            print(f"  Current phase: {stats['current_phase']}")
-            if stats['current_phase'] == 5 and stats.get('phase5_stage'):
-                print(f"  Phase 5 stage: {stats['phase5_stage']}")
-            print(f"  Max track length: {stats['current_max_length']}")
-            print(f"  Total episodes: {stats['total_episodes']}")
-            print(f"  Success rate: {stats['success_rate']:.1%}")
-            print(f"  Total loops completed: {stats['total_loops_completed']}")
-            
-            if stats['phases_completed']:
-                print("\n  Phase progression:")
-                for phase in stats['phases_completed']:
-                    if 'phase' in phase:
-                        print(f"    Phase {phase['phase']}: "
-                              f"{phase['success_rate']:.1%} success rate, "
-                              f"{phase.get('episodes', 0)} episodes")
-        else:  # Regular curriculum stats
-            print("\n📊 Final Curriculum Stats:")
-            print(f"  Stage reached: {stats['current_stage']}")
-            print(f"  Max track length: {stats.get('max_track_length', stats.get('current_max_length', 'N/A'))}")
-            print(f"  Total episodes: {stats['total_episodes']}")
-            print(f"  Success rate: {stats['success_rate']:.1%}")
-            print(f"  Stages completed: {len(stats.get('stages_completed', []))}")
+        print("\n📊 Final Phased Curriculum Stats:")
+        print(f"  Current phase: {stats['current_phase']}")
+        if stats['current_phase'] == 5 and stats.get('phase5_stage'):
+            print(f"  Phase 5 stage: {stats['phase5_stage']}")
+        print(f"  Max track length: {stats['current_max_length']}")
+        print(f"  Total episodes: {stats['total_episodes']}")
+        print(f"  Success rate: {stats['success_rate']:.1%}")
+        print(f"  Total loops completed: {stats['total_loops_completed']}")
 
-            if stats.get('stages_completed'):
-                print("\n  Stage progression:")
-                for stage in stats['stages_completed']:
-                    print(f"    Stage {stage['stage']}: {stage['max_length']} pieces, "
-                          f"{stage['success_rate']:.1%} success rate")
+        if stats['phases_completed']:
+            print("\n  Phase progression:")
+            for phase in stats['phases_completed']:
+                if 'phase' in phase:
+                    print(f"    Phase {phase['phase']}: "
+                          f"{phase['success_rate']:.1%} success rate, "
+                          f"{phase.get('episodes', 0)} episodes")
 
     return model, env
 
@@ -836,12 +789,6 @@ def main():
                        help="Disable intermediate evaluation entirely (safer for maximum throughput)")
     parser.add_argument("--model-path", type=str,
                        help="Path to existing MaskablePPO model to continue training")
-    parser.add_argument("--adaptive", action="store_true",
-                       help="Use adaptive curriculum with dynamic reward scaling")
-    parser.add_argument("--improved", action="store_true",
-                       help="Use improved 5-phase curriculum with physics-aware rewards (RECOMMENDED)")
-    parser.add_argument("--use-subproc", action="store_true",
-                       help="Use SubprocVecEnv for true parallel execution (test with retry fixes)")
     parser.add_argument("--verbose", type=int, default=None,
                        help="Verbosity level: 0=silent, 1=important, 2=detailed (default: auto)")
     args = parser.parse_args()
@@ -915,15 +862,12 @@ def main():
     if verbose == 0 and len(available_ports) > 1:
         print("\n💡 Tip: Running in silent mode. Use --verbose 1 or 2 for more details")
     
-    model, env = train_parallel_curriculum_masked(
+    model, env = train(
         available_ports,
         args.timesteps,
         args.checkpoint_freq,
         args.eval_freq,
         args.model_path,
-        args.adaptive,
-        args.improved,
-        args.use_subproc,
         verbose,
         args.eval_episodes,
         args.disable_eval or args.eval_freq <= 0,

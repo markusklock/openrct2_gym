@@ -988,12 +988,12 @@ def test_no_terminal_double_count_through_wrapper(monkeypatch):
 # ----------------------------------------------------- gamma single source (test 9)
 
 def test_gamma_single_sourced_to_reward_params(monkeypatch):
-    import train_parallel_curriculum_masked as T
+    import train as T
     # The model discount is sourced from RewardParams (the same class the env uses).
     assert T.GAMMA == RewardParams().gamma
 
     monkeypatch.setattr(oe_mod, "APIController", FakeAPI)
-    env = T.create_curriculum_masked_env(8080, use_improved=True, verbose=0)
+    env = T.create_curriculum_masked_env(8080, verbose=0)
     base = env
     while hasattr(base, "env"):
         base = base.env

@@ -13,7 +13,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from openrct2_gym.envs import openrct2_env as oe_mod
 from openrct2_gym.envs.feature_extractor import BuildHistoryExtractor
 
-import train_parallel_curriculum_masked as T
+import train as T
 
 
 class FakeAPI:
@@ -55,7 +55,7 @@ class FakeAPI:
 
 def _make_vecnorm_env():
     return VecNormalize(
-        DummyVecEnv([lambda: T.create_curriculum_masked_env(8080, use_improved=True, verbose=0)]),
+        DummyVecEnv([lambda: T.create_curriculum_masked_env(8080, verbose=0)]),
         norm_obs=True, norm_reward=False, norm_obs_keys=["scalars"],
     )
 
@@ -63,6 +63,46 @@ def _make_vecnorm_env():
 def test_vecnormalize_path_convention():
     assert T._vecnormalize_path("a/b/final_model.zip") == "a/b/final_model_vecnormalize.pkl"
     assert T._vecnormalize_path("a/b/final_model") == "a/b/final_model_vecnormalize.pkl"
+
+
+def test_vector_env_uses_dummy_for_single_factory(monkeypatch):
+    created = []
+
+    class FakeDummyVecEnv:
+        def __init__(self, factories):
+            created.append(("dummy", len(factories)))
+
+    class FakeSubprocVecEnv:
+        def __init__(self, factories):
+            created.append(("subproc", len(factories)))
+
+    monkeypatch.setattr(T, "DummyVecEnv", FakeDummyVecEnv)
+    monkeypatch.setattr(T, "SubprocVecEnv", FakeSubprocVecEnv)
+
+    env = T._create_vector_env([lambda: None])
+
+    assert isinstance(env, FakeDummyVecEnv)
+    assert created == [("dummy", 1)]
+
+
+def test_vector_env_uses_subproc_for_multiple_factories(monkeypatch):
+    created = []
+
+    class FakeDummyVecEnv:
+        def __init__(self, factories):
+            created.append(("dummy", len(factories)))
+
+    class FakeSubprocVecEnv:
+        def __init__(self, factories):
+            created.append(("subproc", len(factories)))
+
+    monkeypatch.setattr(T, "DummyVecEnv", FakeDummyVecEnv)
+    monkeypatch.setattr(T, "SubprocVecEnv", FakeSubprocVecEnv)
+
+    env = T._create_vector_env([lambda: None, lambda: None])
+
+    assert isinstance(env, FakeSubprocVecEnv)
+    assert created == [("subproc", 2)]
 
 
 def test_unwrap_finds_dummy_vecenv_under_vecnormalize(monkeypatch):
@@ -99,7 +139,7 @@ def test_full_pipeline_trains_and_stats_roundtrip(monkeypatch, tmp_path):
     # Reload the stats onto a fresh env (resume path)
     fresh = VecNormalize.load(
         str(stats_path),
-        DummyVecEnv([lambda: T.create_curriculum_masked_env(8080, use_improved=True, verbose=0)]),
+        DummyVecEnv([lambda: T.create_curriculum_masked_env(8080, verbose=0)]),
     )
     assert "scalars" in fresh.obs_rms
     fresh.close()

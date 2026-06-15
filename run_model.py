@@ -14,7 +14,7 @@ from sb3_contrib import MaskablePPO
 from sb3_contrib.common.maskable.utils import get_action_masks
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
-from train_parallel_curriculum_masked import create_curriculum_masked_env, _vecnormalize_path
+from train import create_curriculum_masked_env, _vecnormalize_path
 
 
 def main():
@@ -25,13 +25,11 @@ def main():
                         help="OpenRCT2 API server port")
     parser.add_argument("--vecnormalize", default=None,
                         help="Path to VecNormalize stats (.pkl). Defaults to the model's sibling file.")
-    parser.add_argument("--improved", action=argparse.BooleanOptionalAction, default=True,
-                        help="Use the improved 5-phase curriculum wrapper (matches recommended training)")
     parser.add_argument("--episodes", type=int, default=1)
     args = parser.parse_args()
 
     env = DummyVecEnv([
-        lambda: create_curriculum_masked_env(args.port, use_improved=args.improved, verbose=1)
+        lambda: create_curriculum_masked_env(args.port, verbose=1)
     ])
 
     stats_path = args.vecnormalize or _vecnormalize_path(args.model)
