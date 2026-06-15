@@ -45,6 +45,19 @@ OPT_PHASE1 = dict(target_kl=None, ent_coef=0.01)    # proven phase-1 bootstrap c
 # the principled fix if this floor proves insufficient.)
 OPT_GUARDED = dict(target_kl=0.04, ent_coef=0.015)
 
+# Adaptive entropy-collapse guard (the principled fix the OPT_GUARDED note foreshadowed).
+# A run silently dies when entropy bleeds to ~0: the softmax saturates, KL->0, gradients
+# vanish, and the deterministic policy then collides off the station for all 256 steps,
+# building nothing. A saturated softmax can't be revived by the entropy bonus alone, so the
+# guard re-injects exploration BEFORE saturation -- the moment entropy crosses ENT_COLLAPSE_LO
+# -- and backs off once it recovers past ENT_COLLAPSE_HI (hysteresis), restoring the phase
+# base so the policy can still sharpen into completions. Tuned to this run's curves: productive
+# entropy stayed >=0.17 (dormant zone); the fatal collapse fell through 0.12 -> 0.0003. The HI
+# ceiling self-limits the boost so it can't "explode" entropy the way a permanent high ent_coef did.
+ENT_COLLAPSE_LO = 0.12      # mean policy entropy (nats) below this => collapsing; boost
+ENT_COLLAPSE_HI = 0.30      # once recovered above this => restore the phase-base ent_coef
+ENT_COLLAPSE_BOOST = 0.05   # temporary high ent_coef; regulated by the HI ceiling, not permanent
+
 # Fixed PPO hyperparameters, module-level so tests can pin them (n_steps/batch_size are
 # computed per run). Starts in the phase-1 config; the callback arms OPT_GUARDED later.
 PPO_HYPERPARAMS = dict(
@@ -137,6 +150,7 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
         self.total_steps = 0
         self.last_dashboard_episode = 0  # Track last dashboard print to avoid repeats
         self._opt_guarded = False  # becomes True once OPT_GUARDED is armed (phase >= 2)
+        self._ent_boosted = False  # True while the entropy-collapse guard holds ent_coef boosted
 
     def _maybe_arm_kl_guard(self, info):
         """Arm the guarded optimizer config (target_kl + raised ent_coef) the first time
@@ -147,10 +161,53 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
             return
         if info.get('learning_phase', 1) < 2:
             return
-        for key, value in OPT_GUARDED.items():
-            setattr(self.model, key, value)
-        self._opt_guarded = True
+        self.model.target_kl = OPT_GUARDED['target_kl']
+        self._opt_guarded = True   # _phase_base_ent_coef() now returns the guarded floor
+        # Raise the live ent_coef to the guarded base -- unless the collapse guard is actively
+        # boosting, in which case the boost survives and recovery restores to this new base.
+        if not self._ent_boosted:
+            self.model.ent_coef = OPT_GUARDED['ent_coef']
         print(f"🛡️ Phase 2 reached: armed guard {OPT_GUARDED}")
+
+    def _phase_base_ent_coef(self):
+        """The ent_coef the entropy guard restores to: the guarded floor once phase 2 has
+        armed, else the phase-1 bootstrap value."""
+        return OPT_GUARDED['ent_coef'] if self._opt_guarded else OPT_PHASE1['ent_coef']
+
+    def _maybe_guard_entropy_collapse(self, entropy):
+        """Hysteresis controller that prevents the silent entropy-collapse freeze.
+
+        ``entropy`` is the mean policy entropy (nats) from the last update; None before the
+        first train(). Boost ent_coef when it falls below ENT_COLLAPSE_LO (re-inject
+        exploration before the softmax saturates -- after that the entropy bonus can't
+        recover it), and restore the phase base once it climbs back above ENT_COLLAPSE_HI.
+        The gap between the two thresholds is the hysteresis band that stops per-rollout
+        thrashing. Pure decision logic (no logger access) so it is server-free testable."""
+        if entropy is None:
+            return
+        if not self._ent_boosted and entropy < ENT_COLLAPSE_LO:
+            self.model.ent_coef = ENT_COLLAPSE_BOOST
+            self._ent_boosted = True
+            print(f"🌀 Entropy collapse guard: entropy={entropy:.3f} < {ENT_COLLAPSE_LO} "
+                  f"-> ent_coef boosted to {ENT_COLLAPSE_BOOST}")
+        elif self._ent_boosted and entropy > ENT_COLLAPSE_HI:
+            base = self._phase_base_ent_coef()
+            self.model.ent_coef = base
+            self._ent_boosted = False
+            print(f"🌀 Entropy recovered: entropy={entropy:.3f} > {ENT_COLLAPSE_HI} "
+                  f"-> ent_coef restored to {base}")
+
+    def _on_rollout_end(self) -> None:
+        """Drive the entropy-collapse guard once per update from the last train()'s entropy.
+
+        SB3 records train/entropy_loss (= -mean_entropy) inside train(); at on_rollout_end it
+        still holds the previous update's value (the logger dump that clears it runs after this
+        hook), so the read is reliable from the second update on (None before the first train()).
+        Also surface the live ent_coef so the guard's action is visible in TensorBoard."""
+        name_to_value = getattr(self.model.logger, 'name_to_value', {})
+        ent_loss = name_to_value.get('train/entropy_loss')
+        self._maybe_guard_entropy_collapse(None if ent_loss is None else -float(ent_loss))
+        self.logger.record('optim/ent_coef', float(self.model.ent_coef))
 
     def _on_step(self) -> bool:
         # Track total steps for throughput calculation

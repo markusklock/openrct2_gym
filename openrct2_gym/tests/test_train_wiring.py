@@ -179,6 +179,124 @@ def test_callback_arms_kl_guard_when_phase2_begins():
     assert cb.model.target_kl == 0.99
 
 
+def test_entropy_collapse_guard_boosts_when_entropy_low():
+    """A run silently freezes when phase-1 entropy bleeds to ~0: the softmax saturates,
+    KL->0, gradients vanish, and the now-deterministic policy collides off the station for
+    all 256 steps building NOTHING (observed at ~1.0M steps: entropy_loss -0.46 -> -0.0003,
+    track_length 13 -> 0, ep_len 29 -> 256). Recovery from a saturated softmax is ~hopeless,
+    so the guard must re-inject exploration BEFORE that -- when entropy drops below the floor."""
+    from types import SimpleNamespace
+    cb = T.ParallelCurriculumMaskableCallback(n_envs=2)
+    cb.model = SimpleNamespace(target_kl=None, ent_coef=0.01)
+    cb._maybe_guard_entropy_collapse(0.02)              # well under the floor -> boost
+    assert cb.model.ent_coef == T.ENT_COLLAPSE_BOOST
+    assert cb._ent_boosted is True
+
+
+def test_entropy_collapse_guard_dormant_in_healthy_band():
+    """No interference during normal convergence: this run's productive entropy stayed
+    >=0.17, so the guard must stay dormant there -- a permanent boost would stop the rare
+    completion snowball from sharpening into a reliable policy."""
+    from types import SimpleNamespace
+    cb = T.ParallelCurriculumMaskableCallback(n_envs=2)
+    cb.model = SimpleNamespace(target_kl=None, ent_coef=0.01)
+    cb._maybe_guard_entropy_collapse(0.20)
+    assert cb.model.ent_coef == 0.01
+    assert cb._ent_boosted is False
+
+
+def test_entropy_collapse_guard_restores_phase_base_after_recovery():
+    """Hysteresis: once entropy climbs back above the recovery threshold, hand ent_coef
+    back to the phase base (the boost is a temporary impulse, not a permanent floor)."""
+    from types import SimpleNamespace
+    cb = T.ParallelCurriculumMaskableCallback(n_envs=2)
+    cb.model = SimpleNamespace(target_kl=None, ent_coef=T.ENT_COLLAPSE_BOOST)
+    cb._ent_boosted = True
+    cb._maybe_guard_entropy_collapse(0.40)              # recovered -> restore
+    assert cb.model.ent_coef == T.OPT_PHASE1['ent_coef']
+    assert cb._ent_boosted is False
+
+
+def test_entropy_collapse_guard_hysteresis_holds_boost_in_band():
+    """Between floor and recovery threshold the state must NOT flip (no per-rollout
+    thrashing): a boosted guard stays boosted until entropy fully recovers."""
+    from types import SimpleNamespace
+    cb = T.ParallelCurriculumMaskableCallback(n_envs=2)
+    cb.model = SimpleNamespace(target_kl=None, ent_coef=T.ENT_COLLAPSE_BOOST)
+    cb._ent_boosted = True
+    cb._maybe_guard_entropy_collapse(0.20)              # in the band -> hold the boost
+    assert cb.model.ent_coef == T.ENT_COLLAPSE_BOOST
+    assert cb._ent_boosted is True
+
+
+def test_entropy_collapse_guard_restore_tracks_phase2_base():
+    """If the phase-2 KL guard armed (raising the base to the guarded floor) while a boost
+    was active, the boost must survive arming and recovery must restore to the PHASE-2 base
+    (0.015), not the phase-1 base."""
+    from types import SimpleNamespace
+    cb = T.ParallelCurriculumMaskableCallback(n_envs=2)
+    cb.model = SimpleNamespace(target_kl=None, ent_coef=0.01)
+    cb._maybe_guard_entropy_collapse(0.02)              # boost in phase 1
+    assert cb.model.ent_coef == T.ENT_COLLAPSE_BOOST
+    cb._maybe_arm_kl_guard({'learning_phase': 2})       # arm while boosted
+    assert cb.model.target_kl == 0.04
+    assert cb.model.ent_coef == T.ENT_COLLAPSE_BOOST    # boost preserved, NOT clobbered to 0.015
+    cb._maybe_guard_entropy_collapse(0.40)              # recover -> restore to phase-2 base
+    assert cb.model.ent_coef == T.OPT_GUARDED['ent_coef']
+    assert cb._ent_boosted is False
+
+
+def test_entropy_collapse_guard_ignores_missing_entropy():
+    """Before the first train() the logged entropy is absent; the guard must no-op."""
+    from types import SimpleNamespace
+    cb = T.ParallelCurriculumMaskableCallback(n_envs=2)
+    cb.model = SimpleNamespace(target_kl=None, ent_coef=0.01)
+    cb._maybe_guard_entropy_collapse(None)
+    assert cb.model.ent_coef == 0.01
+    assert cb._ent_boosted is False
+
+
+def test_entropy_collapse_constants_form_a_valid_hysteresis_band():
+    assert 0.0 < T.ENT_COLLAPSE_LO < T.ENT_COLLAPSE_HI
+    assert T.ENT_COLLAPSE_BOOST > T.OPT_PHASE1['ent_coef']     # boost is an increase ...
+    assert T.ENT_COLLAPSE_BOOST > T.OPT_GUARDED['ent_coef']    # ... above either phase base
+
+
+def test_entropy_guard_reads_live_entropy_at_rollout_end(monkeypatch):
+    """Integration: the guard's one untestable-in-isolation assumption is that SB3 exposes
+    train/entropy_loss at on_rollout_end. Run two real updates with a FakeAPI and confirm the
+    guard is actually driven with a non-None entropy -- if the logger timing were wrong it would
+    only ever see None and silently never fire (wasting a multi-hour run to discover that)."""
+    monkeypatch.setattr(oe_mod, "APIController", FakeAPI)
+    from sb3_contrib import MaskablePPO
+
+    seen = []
+    orig = T.ParallelCurriculumMaskableCallback._maybe_guard_entropy_collapse
+
+    def spy(self, entropy):
+        seen.append(entropy)
+        return orig(self, entropy)
+
+    monkeypatch.setattr(T.ParallelCurriculumMaskableCallback, "_maybe_guard_entropy_collapse", spy)
+
+    env = _make_vecnorm_env()
+    model = MaskablePPO(
+        "MultiInputPolicy", env,
+        policy_kwargs=dict(
+            features_extractor_class=BuildHistoryExtractor,
+            features_extractor_kwargs=dict(encoder="gru"),
+            net_arch=dict(pi=[64], vf=[64]),
+            normalize_images=False,
+        ),
+        n_steps=16, batch_size=16, n_epochs=1, verbose=0,
+    )
+    cb = T.ParallelCurriculumMaskableCallback(n_envs=1)
+    model.learn(total_timesteps=32, callback=cb)   # two rollouts: the 2nd sees the 1st's entropy
+    env.close()
+    assert seen, "_on_rollout_end never drove the entropy guard"
+    assert any(e is not None for e in seen), f"guard only ever saw None entropy: {seen}"
+
+
 def test_save_vecnormalize_callback_writes_per_checkpoint_stats(monkeypatch, tmp_path):
     monkeypatch.setattr(oe_mod, "APIController", FakeAPI)
     from sb3_contrib import MaskablePPO
