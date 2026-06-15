@@ -520,11 +520,12 @@ def test_phase_reward_params_structural_per_phase():
     # attractor let a wrecked policy settle into climbing instead of completing.
     assert p1.w_h == 0.0 and p5.w_h == 0.0
     assert p2.w_h == 3.0 and p3.w_h == 3.0 and p4.w_h == 3.0
-    # completion gating: a flat loop earns only completion_hill_floor of R_complete in the
-    # hill phases 2-4 (forces hill-building); full credit in phase 1 (bootstrap) and 5.
+    # completion gating: a flat loop earns NOTHING in the hill phases 2-4 (floor=0, so the only
+    # road to reward is building chain lifts) -- removes the flat-loop local optimum that parked
+    # the agent at 87% flat completion with zero hills; full credit in phase 1 (bootstrap) and 5.
     assert p1.completion_hill_floor == 1.0 and p5.completion_hill_floor == 1.0
-    assert (p2.completion_hill_floor == 0.25 and p3.completion_hill_floor == 0.25
-            and p4.completion_hill_floor == 0.25)
+    assert (p2.completion_hill_floor == 0.0 and p3.completion_hill_floor == 0.0
+            and p4.completion_hill_floor == 0.0)
     # d_z=20 keeps the near-station m_z slope at 0.3/z -- steep enough that the energy
     # term's chain-lift bump (~+0.47) cannot make climbing profitable in phase 1
     # (d_z=60 weakened the slope to 0.1/z and the energy term became an accidental
@@ -678,7 +679,7 @@ def test_completion_gate_devalues_flat_loops_in_phase2():
     P = ImprovedPhasedCurriculumWrapper._phase_reward_params(2)
     flat = _complete_payoff(P, chains=0)
     full = _complete_payoff(P, chains=3)
-    assert flat == pytest.approx(250.0)        # R_complete * 0.25 floor, no hill
+    assert flat == pytest.approx(0.0)          # floor=0: a flat loop earns NOTHING (kills the trap)
     assert full == pytest.approx(1250.0)       # R_complete * 1.0 + struct 250
     assert flat < _complete_payoff(P, chains=1) < full   # partial hill scales between
 
@@ -688,12 +689,15 @@ def test_completion_not_gated_in_phase1():
     assert _complete_payoff(P, chains=0) == pytest.approx(1000.0)   # flat fully paid in P1
 
 
-def test_gated_flat_completion_still_beats_any_incomplete():
-    # completion-first must survive the gate: even a gated flat completion outranks the
-    # best bounded incomplete return (Phi_max).
+def test_hill_completion_beats_incomplete_flat_does_not_in_phase2():
+    # Completion-first is now hill-conditioned. With the flat floor removed, a flat completion
+    # is intentionally worth ~0 -- no longer privileged over an incomplete episode (that is what
+    # kills the flat-loop trap) -- but a real hill completion still dominates the best bounded
+    # incomplete return (Phi_max via PBRS telescoping).
     P = ImprovedPhasedCurriculumWrapper._phase_reward_params(2)
     phi_max = P.w_xy + P.w_z + P.w_dir + P.w_e + P.w_h
-    assert P.R_complete * P.completion_hill_floor > phi_max
+    assert _complete_payoff(P, chains=3) > phi_max                 # a hill completion dominates
+    assert _complete_payoff(P, chains=0) == pytest.approx(0.0)     # flat no longer privileged
 
 
 # ---- round-trip elevation milestone (decomposition: teach climb-and-return)
@@ -749,8 +753,10 @@ def test_roundtrip_disabled_and_below_completion_per_phase():
     for ph in (2, 3, 4):
         P = W._phase_reward_params(ph)
         assert P.R_roundtrip == 100.0
-        # must stay below the gated flat completion so it never lures the agent off completing
-        assert P.R_roundtrip < P.R_complete * P.completion_hill_floor
+        # must stay below a real hill completion (R_complete) so climb-and-return is a stepping
+        # stone, never a substitute for closing the hill loop. (It now intentionally EXCEEDS a
+        # flat completion, which pays 0 -- that is what lures the agent off the flat-loop trap.)
+        assert P.R_roundtrip < P.R_complete
 
 
 # ---- discovery potential (elevation term in Phi)
