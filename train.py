@@ -3,6 +3,15 @@
 Parallel training script with curriculum learning AND proper action masking using MaskablePPO
 Trains on multiple OpenRCT2 instances simultaneously for faster learning
 """
+# Thread caps MUST be set before NumPy/Torch are imported (they are pulled in transitively by
+# the openrct2_gym / sb3 imports below). Without this, a 20-worker SubprocVecEnv run on one host
+# spawns 20 competing BLAS/OMP thread pools and oversubscribes the cores. Forked workers inherit
+# these; the main process's PPO-update thread count is set explicitly in train().
+import os
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
 import gymnasium as gym
 import openrct2_gym
 from openrct2_gym.envs.improved_phased_curriculum_wrapper import ImprovedPhasedCurriculumWrapper
@@ -17,7 +26,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNorm
 from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback
 from stable_baselines3.common.monitor import Monitor
 import numpy as np
-import os
+import torch
 import argparse
 import time
 import math
@@ -54,8 +63,12 @@ OPT_GUARDED = dict(target_kl=0.04, ent_coef=0.015)
 # entropy stayed >=0.17 (dormant zone); the fatal collapse fell through 0.12 -> 0.0003. The HI
 # ceiling self-limits the boost so it can't "explode" entropy the way a permanent high ent_coef did.
 ENT_COLLAPSE_LO = 0.12      # mean policy entropy (nats) below this => collapsing; boost
-ENT_COLLAPSE_HI = 0.30      # once recovered above this => restore the phase-base ent_coef
-ENT_COLLAPSE_BOOST = 0.05   # temporary high ent_coef; regulated by the HI ceiling, not permanent
+ENT_COLLAPSE_HI = 0.30      # once recovered above this => (eventually) restore the phase-base ent_coef
+ENT_COLLAPSE_BOOST = 0.03   # temporary ent_coef while boosted. 0.03 not 0.05: 0.05 over-corrected
+                            # -- it spiked approx_kl (~0.15) and cratered the closure skill (ep_rew
+                            # 227->159) every time it fired, a destructive limit cycle.
+# Stabilizers on top of the LO/HI hysteresis band, to stop the boost<->relax thrash:
+ENT_BOOST_MIN_HOLD = 3      # min updates to HOLD the boost before any relax (rides out the overshoot)
 
 # Fixed PPO hyperparameters, module-level so tests can pin them (n_steps/batch_size are
 # computed per run). Starts in the phase-1 config; the callback arms OPT_GUARDED later.
@@ -72,9 +85,10 @@ PPO_HYPERPARAMS = dict(
 def _clear_calibration_cache() -> bool:
     """Drop any persisted closing-geometry calibration (in-memory class cache + the JSON
     file shared across SubprocVecEnv workers) so a fresh run recalibrates Phi's closing
-    anchor from its OWN first completion. A cache left over from an earlier reward regime
-    silently misguides Phi in every later run. Returns True if a file was removed."""
+    anchor from its OWN reproducible completions. A cache left over from an earlier reward
+    regime silently misguides Phi in every later run. Returns True if a file was removed."""
     OpenRCT2Env._close_cache = None
+    OpenRCT2Env._close_records = []   # drop accumulated completion records too (fresh run)
     try:
         os.remove(OpenRCT2Env._CLOSE_CACHE_PATH)
         return True
@@ -150,6 +164,7 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
         self.last_dashboard_episode = 0  # Track last dashboard print to avoid repeats
         self._opt_guarded = False  # becomes True once OPT_GUARDED is armed (phase >= 2)
         self._ent_boosted = False  # True while the entropy-collapse guard holds ent_coef boosted
+        self._ent_boost_calls = 0  # updates elapsed since the current boost armed (min-hold counter)
 
     def _maybe_arm_kl_guard(self, info):
         """Arm the guarded optimizer config (target_kl + raised ent_coef) the first time
@@ -173,28 +188,40 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
         armed, else the phase-1 bootstrap value."""
         return OPT_GUARDED['ent_coef'] if self._opt_guarded else OPT_PHASE1['ent_coef']
 
-    def _maybe_guard_entropy_collapse(self, entropy):
-        """Hysteresis controller that prevents the silent entropy-collapse freeze.
+    def _maybe_guard_entropy_collapse(self, entropy, kl=None):
+        """Hysteresis controller that prevents the silent entropy-collapse freeze WITHOUT the
+        destructive boost<->relax limit cycle the bare LO/HI band produced.
 
-        ``entropy`` is the mean policy entropy (nats) from the last update; None before the
-        first train(). Boost ent_coef when it falls below ENT_COLLAPSE_LO (re-inject
-        exploration before the softmax saturates -- after that the entropy bonus can't
-        recover it), and restore the phase base once it climbs back above ENT_COLLAPSE_HI.
-        The gap between the two thresholds is the hysteresis band that stops per-rollout
-        thrashing. Pure decision logic (no logger access) so it is server-free testable."""
+        ``entropy`` is the mean policy entropy (nats) from the last update (None before the first
+        train()); ``kl`` is the last update's approx_kl (None to skip the KL check). Boost ent_coef
+        when entropy falls below ENT_COLLAPSE_LO (re-inject exploration before the softmax saturates).
+        Relax back to the phase base only once ALL hold conditions are met: entropy recovered past
+        ENT_COLLAPSE_HI, the boost has been held >= ENT_BOOST_MIN_HOLD updates (rides out the
+        overshoot instead of relaxing on a single recovery sample), and approx_kl is below target_kl
+        (don't hand control back mid-explosion). Pure decision logic (args, no logger access) so it
+        is server-free testable."""
         if entropy is None:
             return
-        if not self._ent_boosted and entropy < ENT_COLLAPSE_LO:
-            self.model.ent_coef = ENT_COLLAPSE_BOOST
-            self._ent_boosted = True
-            print(f"🌀 Entropy collapse guard: entropy={entropy:.3f} < {ENT_COLLAPSE_LO} "
-                  f"-> ent_coef boosted to {ENT_COLLAPSE_BOOST}")
-        elif self._ent_boosted and entropy > ENT_COLLAPSE_HI:
+        if not self._ent_boosted:
+            if entropy < ENT_COLLAPSE_LO:
+                self.model.ent_coef = ENT_COLLAPSE_BOOST
+                self._ent_boosted = True
+                self._ent_boost_calls = 0
+                print(f"🌀 Entropy collapse guard: entropy={entropy:.3f} < {ENT_COLLAPSE_LO} "
+                      f"-> ent_coef boosted to {ENT_COLLAPSE_BOOST}")
+            return
+        # Currently boosted: count this update toward the min-hold, then test all relax conditions.
+        self._ent_boost_calls += 1
+        target_kl = getattr(self.model, "target_kl", None)
+        kl_ok = kl is None or target_kl is None or kl < target_kl
+        if (entropy > ENT_COLLAPSE_HI
+                and self._ent_boost_calls >= ENT_BOOST_MIN_HOLD
+                and kl_ok):
             base = self._phase_base_ent_coef()
             self.model.ent_coef = base
             self._ent_boosted = False
             print(f"🌀 Entropy recovered: entropy={entropy:.3f} > {ENT_COLLAPSE_HI} "
-                  f"-> ent_coef restored to {base}")
+                  f"(held {self._ent_boost_calls} updates) -> ent_coef restored to {base}")
 
     def _on_rollout_end(self) -> None:
         """Drive the entropy-collapse guard once per update from the last train()'s entropy.
@@ -205,46 +232,37 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
         Also surface the live ent_coef so the guard's action is visible in TensorBoard."""
         name_to_value = getattr(self.model.logger, 'name_to_value', {})
         ent_loss = name_to_value.get('train/entropy_loss')
-        self._maybe_guard_entropy_collapse(None if ent_loss is None else -float(ent_loss))
+        approx_kl = name_to_value.get('train/approx_kl')
+        self._maybe_guard_entropy_collapse(
+            None if ent_loss is None else -float(ent_loss),
+            kl=None if approx_kl is None else float(approx_kl),
+        )
         self.logger.record('optim/ent_coef', float(self.model.ent_coef))
 
     def _on_step(self) -> bool:
         # Track total steps for throughput calculation
         self.total_steps += self.n_envs
         
-        # Get environment through vectorized wrapper
-        env = self.model.get_env()
+        # Per-step metrics are read from the step info dict (already transferred by the step
+        # barrier), NOT via env.get_attr()/env.env_method(). Each of those is a separate
+        # SubprocVecEnv collective -- a synchronized round-trip to all workers -- so issuing
+        # three of them on every vector step adds three needless barriers at 20x parallelism.
+        # We log only the first env's values, exactly as before.
+        infos = self.locals.get('infos') or []
+        first_info = infos[0] if infos else {}
 
-        # Retrieve metrics from each subprocess using VecEnv helper methods
-        try:
-            track_lengths = env.get_attr('track_length')
-            if track_lengths and track_lengths[0] is not None:
-                # Log only from first env to reduce clutter
-                self.logger.record('metrics/track_length', track_lengths[0])
-        except (AttributeError, NotImplementedError):
-            if self.verbose:
-                print("Warning: track_length attribute not available in environments")
+        track_length = first_info.get('track_length')
+        if track_length is not None:
+            self.logger.record('metrics/track_length', track_length)
 
-        try:
-            distances = env.env_method('_calculate_distance_to_start')
-            if distances and distances[0] is not None:
-                dist = distances[0]
-                # Method may return tuple/list/array; extract numeric distance
-                if isinstance(dist, (list, tuple, np.ndarray)):
-                    dist = dist[0]
-                self.logger.record('metrics/current_distance', dist)
-        except (AttributeError, NotImplementedError):
-            if self.verbose:
-                print("Warning: _calculate_distance_to_start method not available in environments")
+        current_distance = first_info.get('current_distance')
+        if current_distance is not None:
+            self.logger.record('metrics/current_distance', current_distance)
 
-        try:
-            collision_counts = env.get_attr('collision_count')
-            if collision_counts and collision_counts[0] is not None:
-                self.logger.record('metrics/collision_count', collision_counts[0])
-        except (AttributeError, NotImplementedError):
-            if self.verbose:
-                print("Warning: collision_count attribute not available in environments")
-        
+        collision_count = first_info.get('collision_count')
+        if collision_count is not None:
+            self.logger.record('metrics/collision_count', collision_count)
+
         self.total_actions += self.n_envs
         
         # Check for episode ends across all environments
@@ -294,9 +312,9 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
                     self.logger.record(f'success/env_{env_idx}_completion_rate', env_success_rate)
                 
                 # Log curriculum info if available (from first env that completes).
-                # The improved 5-phase wrapper emits 'learning_phase'/'curriculum_phase' and
-                # (in phases 2-3) 'qualified_rate' — surface them so the curriculum's progress
-                # past the lift-hill gate is visible in TensorBoard.
+                # The improved 5-phase wrapper emits 'learning_phase'/'curriculum_phase',
+                # Phase-2 sub-stage diagnostics, and (in phases 2-3) 'qualified_rate' so
+                # progress past each lift-hill gate is visible in TensorBoard.
                 _info = self.locals['infos'][env_idx]
                 self._maybe_arm_kl_guard(_info)
                 if 'curriculum_phase' in _info:
@@ -307,6 +325,18 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
                     self.logger.record('curriculum/max_length', _info['max_track_length'])
                 if 'qualified_rate' in _info:
                     self.logger.record('curriculum/qualified_rate', _info['qualified_rate'])
+                for key in (
+                    'phase2_stage',
+                    'phase2_threshold',
+                    'phase2_summit_rate',
+                    'phase2_roundtrip_rate',
+                    'phase2_chain1_completion_rate',
+                    'phase2_chain2_completion_rate',
+                    'phase2_chain3_completion_rate',
+                    'completed_chain_count',
+                ):
+                    if key in _info:
+                        self.logger.record(f'curriculum/{key}', _info[key])
                 
                 # Episode metrics provided via info dict before reset
                 info_metrics = self.locals['infos'][env_idx].get('episode_metrics', {})
@@ -329,6 +359,10 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
                             self.logger.record('height/max_gain', info_metrics['max_gain'])
                         if 'roundtrip' in info_metrics:
                             self.logger.record('height/roundtrip', info_metrics['roundtrip'])
+                        if 'summit' in info_metrics:
+                            self.logger.record('height/summit', info_metrics['summit'])
+                        if 'return_potential' in info_metrics:
+                            self.logger.record('rewards/return_potential', info_metrics['return_potential'])
                         if 'remove_count' in info_metrics:
                             self.logger.record('behavior/remove_count', info_metrics['remove_count'])
 
@@ -390,7 +424,10 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
             print(f"│ Episodes: {self.total_episode_count:,} | Success: {overall_success_rate:.1%} ({self.total_loop_completed}/{self.total_episode_count})".ljust(dashboard_width + 1) + "│")
             print(f"│ Throughput: {steps_per_second:.1f} steps/s | {episodes_per_second:.2f} eps/s".ljust(dashboard_width + 1) + "│")
             
-            # Get curriculum info from first environment if available
+            # Get curriculum info from first environment if available. get_env() just returns the
+            # VecEnv reference (no worker round-trip / IPC barrier, unlike get_attr/env_method), and
+            # .envs only exists for DummyVecEnv -- under SubprocVecEnv this block is simply skipped.
+            env = self.model.get_env()
             if hasattr(env, 'envs') and len(env.envs) > 0:
                 wrapped_env = env.envs[0]
                 temp_env = wrapped_env
@@ -465,7 +502,9 @@ def create_curriculum_masked_env(port: int, verbose: int = 0) -> gym.Env:
     env = ImprovedPhasedCurriculumWrapper(
         base_env,
         phase1_success_threshold=0.5,   # 50% loop completion
-        phase2_success_threshold=0.4,   # 40% with 3+ chain lifts
+        phase2_roundtrip_threshold=0.30,  # 30% with one-chain climb-and-return
+        phase2_chain1_success_threshold=0.30,  # 30% completion with >=1 chain
+        phase2_success_threshold=0.4,   # 40% completion with >=3 chain lifts
         phase3_success_threshold=0.35,  # 35% with good patterns
         phase4_success_threshold=0.30,  # 30% clean completions
         phase5_success_threshold=0.25,  # 25% with quality ratings
@@ -524,6 +563,7 @@ def train(
     verbose: int = 0,
     eval_episodes: int = 10,
     disable_eval: bool = False,
+    target_rollout: int = 2048,
 ):
     """Train agent with curriculum learning AND action masking on multiple parallel environments"""
 
@@ -544,13 +584,24 @@ def train(
     print(f"Ports: {', '.join(map(str, ports))}")
     print("Using improved 5-phase curriculum with physics-aware rewards:")
     print("  Phase 1: Return Practice (25 pieces) - Learn navigation")
-    print("  Phase 2: Lift Hill Building (40 pieces) - Learn chain lifts & energy")
+    print("  Phase 2: Lift Hill Building (40 pieces) - staged chain roundtrip/completion gates")
     print("  Phase 3: Drop & Turn (60 pieces) - Learn drops & turnarounds")
     print("  Phase 4: Circuit Mastery (80 pieces) - Full integration")
     print("  Phase 5: Quality Optimization (80-120 pieces) - E=7-9, I=4.5-6.5, N<4.5")
     print("  + Energy estimation, pattern detection, approach guidance")
     print("Using MaskablePPO to prevent invalid actions")
     print("="*60 + "\n")
+
+    # Intermediate evaluation reaches into the env wrappers to suppress curriculum-stat updates
+    # during eval episodes, via _unwrap_to_vecenv_with_envs(). That returns None under
+    # SubprocVecEnv (n_envs > 1, no .envs), so the suppression silently no-ops and eval episodes
+    # pollute curriculum advancement -- besides adding long synchronized rollouts. Recommend
+    # --disable-eval for any multi-env run, and especially at ~20 instances.
+    if not disable_eval and n_envs > 1:
+        print(f"⚠️  Intermediate eval is ON with {n_envs} parallel envs (SubprocVecEnv): eval-mode "
+              "curriculum-stat suppression cannot reach the wrappers and will be skipped, so eval "
+              "episodes will pollute curriculum stats. Re-run with --disable-eval for clean, "
+              "faster training at scale.\n")
 
     # Create environment factories for each port
     env_factories = [make_env_factory(port, verbose) for port in ports]
@@ -575,7 +626,13 @@ def train(
     # IMPORTANT: Do NOT create a separate eval env on the same ports.
     # We will evaluate using the training env between learn chunks to avoid
     # corrupting in-progress episodes on shared API ports.
-    
+
+    # Limit the main process's intra-op threads for the PPO update. The SubprocVecEnv workers
+    # (already spawned above) run only env code -- not Torch ops -- and inherit OMP/BLAS=1 from
+    # the env vars set at import time, so this configures only the trainer and avoids thread
+    # oversubscription on a many-core host running 20 game instances + 20 workers.
+    torch.set_num_threads(min(8, os.cpu_count() or 8))
+
     # Create or load model
     if model_path and os.path.exists(model_path):
         print(f"Loading MaskablePPO model from {model_path}")
@@ -589,9 +646,10 @@ def train(
             normalize_images=False,
         )
         
-        # Adjust n_steps and batch_size ensuring train_batch_size % batch_size == 0
-        # Aim for rollout size around 2048, but keep n_steps >= 128
-        target_rollout = 2048
+        # Adjust n_steps and batch_size ensuring train_batch_size % batch_size == 0.
+        # Aim for ~target_rollout transitions per PPO update (CLI --target-rollout, default
+        # 2048), keeping n_steps >= 128. At high n_envs n_steps shrinks (2048/20 -> 128); raise
+        # target_rollout to hold n_steps >= 256 (e.g. 5120 with 20 envs -> base 256).
         base = target_rollout // max(1, n_envs)
         # Align to 64 for better batch divisibility and keep >= 128
         n_steps = max(128, (base // 64) * 64 if base >= 64 else 128)
@@ -756,6 +814,8 @@ def train(
     if stats:
         print("\n📊 Final Phased Curriculum Stats:")
         print(f"  Current phase: {stats['current_phase']}")
+        if stats['current_phase'] == 2 and stats.get('phase2_stage'):
+            print(f"  Phase 2 stage: {stats['phase2_stage']}")
         if stats['current_phase'] == 5 and stats.get('phase5_stage'):
             print(f"  Phase 5 stage: {stats['phase5_stage']}")
         print(f"  Max track length: {stats['current_max_length']}")
@@ -791,6 +851,9 @@ def main():
                        help="Path to existing MaskablePPO model to continue training")
     parser.add_argument("--verbose", type=int, default=None,
                        help="Verbosity level: 0=silent, 1=important, 2=detailed (default: auto)")
+    parser.add_argument("--target-rollout", type=int, default=2048,
+                       help="Target transitions per PPO update; n_steps ~= target_rollout/n_envs "
+                            "(min 128). Raise (e.g. 5120) to keep n_steps>=256 at many envs.")
     args = parser.parse_args()
     
     # Parse ports
@@ -871,6 +934,7 @@ def main():
         verbose,
         args.eval_episodes,
         args.disable_eval or args.eval_freq <= 0,
+        args.target_rollout,
     )
     # Training function already evaluates between chunks and closes env.
     # No additional evaluation here to avoid interfering with API ports.

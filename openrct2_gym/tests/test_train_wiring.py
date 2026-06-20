@@ -246,13 +246,16 @@ def test_entropy_collapse_guard_dormant_in_healthy_band():
 
 
 def test_entropy_collapse_guard_restores_phase_base_after_recovery():
-    """Hysteresis: once entropy climbs back above the recovery threshold, hand ent_coef
-    back to the phase base (the boost is a temporary impulse, not a permanent floor)."""
+    """Hysteresis: once entropy climbs back above the recovery threshold AND the boost has been
+    held for the min-hold window, hand ent_coef back to the phase base (the boost is a temporary
+    impulse, not a permanent floor)."""
     from types import SimpleNamespace
     cb = T.ParallelCurriculumMaskableCallback(n_envs=2)
     cb.model = SimpleNamespace(target_kl=None, ent_coef=T.ENT_COLLAPSE_BOOST)
     cb._ent_boosted = True
-    cb._maybe_guard_entropy_collapse(0.40)              # recovered -> restore
+    cb._ent_boost_calls = 0
+    for _ in range(T.ENT_BOOST_MIN_HOLD):              # recovered; ride out the min-hold -> restore
+        cb._maybe_guard_entropy_collapse(0.40)
     assert cb.model.ent_coef == T.OPT_PHASE1['ent_coef']
     assert cb._ent_boosted is False
 
@@ -281,7 +284,8 @@ def test_entropy_collapse_guard_restore_tracks_phase2_base():
     cb._maybe_arm_kl_guard({'learning_phase': 2})       # arm while boosted
     assert cb.model.target_kl == 0.04
     assert cb.model.ent_coef == T.ENT_COLLAPSE_BOOST    # boost preserved, NOT clobbered to 0.015
-    cb._maybe_guard_entropy_collapse(0.40)              # recover -> restore to phase-2 base
+    for _ in range(T.ENT_BOOST_MIN_HOLD):              # recover -> restore to phase-2 base
+        cb._maybe_guard_entropy_collapse(0.40)
     assert cb.model.ent_coef == T.OPT_GUARDED['ent_coef']
     assert cb._ent_boosted is False
 
@@ -313,9 +317,9 @@ def test_entropy_guard_reads_live_entropy_at_rollout_end(monkeypatch):
     seen = []
     orig = T.ParallelCurriculumMaskableCallback._maybe_guard_entropy_collapse
 
-    def spy(self, entropy):
+    def spy(self, entropy, kl=None):
         seen.append(entropy)
-        return orig(self, entropy)
+        return orig(self, entropy, kl=kl)
 
     monkeypatch.setattr(T.ParallelCurriculumMaskableCallback, "_maybe_guard_entropy_collapse", spy)
 
@@ -335,6 +339,95 @@ def test_entropy_guard_reads_live_entropy_at_rollout_end(monkeypatch):
     env.close()
     assert seen, "_on_rollout_end never drove the entropy guard"
     assert any(e is not None for e in seen), f"guard only ever saw None entropy: {seen}"
+
+
+def test_on_step_logs_metrics_from_infos_without_vecenv_ipc():
+    """Per-step metric logging must read track_length/current_distance/collision_count from
+    self.locals['infos'][0] -- already transferred by the step barrier -- NOT via SubprocVecEnv
+    get_attr/env_method collectives. Each of those is an extra synchronized round-trip to ALL
+    workers on EVERY vector step; with 20 envs that is three needless barriers per step."""
+    from types import SimpleNamespace
+
+    cb = T.ParallelCurriculumMaskableCallback(n_envs=2)
+
+    class _SpyEnv:
+        def __init__(self):
+            self.get_attr_calls = []
+            self.env_method_calls = []
+
+        def get_attr(self, name, *a, **k):
+            self.get_attr_calls.append(name)
+            return [0, 0]
+
+        def env_method(self, name, *a, **k):
+            self.env_method_calls.append(name)
+            return [(0.0,), (0.0,)]
+
+    spy = _SpyEnv()
+    recorded = {}
+    logger = SimpleNamespace(record=lambda key, val, *a, **k: recorded.__setitem__(key, val))
+    cb.model = SimpleNamespace(get_env=lambda: spy, logger=logger, ent_coef=0.01, target_kl=None)
+
+    cb.locals = {
+        'dones': [False, False],
+        'infos': [
+            {'track_length': 7, 'current_distance': 3.5, 'collision_count': 2},
+            {'track_length': 9, 'current_distance': 1.0, 'collision_count': 0},
+        ],
+    }
+
+    assert cb._on_step() is True
+    assert spy.get_attr_calls == []      # no get_attr IPC barrier
+    assert spy.env_method_calls == []    # no env_method IPC barrier
+    assert recorded['metrics/track_length'] == 7        # first-env value, straight from infos
+    assert recorded['metrics/current_distance'] == 3.5
+    assert recorded['metrics/collision_count'] == 2
+
+
+def test_on_step_dashboard_milestone_renders_without_ipc_or_nameerror():
+    """The dashboard block (fires at episode milestones) reads env.envs for the DummyVecEnv
+    curriculum line, so `env` must still be defined there after we dropped the per-step metric
+    IPC. Regression guard for the NameError crash when removing env = self.model.get_env(): it
+    only surfaces once enough episodes complete to trip the milestone, which the no-done metric
+    test never reached. Still must issue no get_attr/env_method collectives."""
+    from types import SimpleNamespace
+
+    cb = T.ParallelCurriculumMaskableCallback(n_envs=2)
+    # Arrange just below the milestone (10*n_envs = 20) so this step crosses it.
+    cb.total_episode_count = 19
+    cb.episode_counts = [10, 9]
+    cb.loop_completed_counts = [0, 0]
+    cb.total_loop_completed = 0
+    cb.last_dashboard_episode = 0
+
+    class _SpyEnv:
+        def __init__(self):
+            self.get_attr_calls = []
+            self.env_method_calls = []
+
+        def get_attr(self, name, *a, **k):
+            self.get_attr_calls.append(name)
+            return [0, 0]
+
+        def env_method(self, name, *a, **k):
+            self.env_method_calls.append(name)
+            return [(0.0,), (0.0,)]
+
+    spy = _SpyEnv()  # SubprocVecEnv-like: no .envs attribute
+    logger = SimpleNamespace(record=lambda key, val, *a, **k: None)
+    cb.model = SimpleNamespace(get_env=lambda: spy, logger=logger, ent_coef=0.01, target_kl=None)
+
+    cb.locals = {
+        'dones': [True, False],   # one episode completes -> total_episode_count 19 -> 20 -> milestone
+        'infos': [
+            {'loop_completed': False, 'track_length': 25, 'current_distance': 4.0, 'collision_count': 1},
+            {'track_length': 25, 'current_distance': 4.0, 'collision_count': 0},
+        ],
+    }
+
+    assert cb._on_step() is True       # must NOT raise NameError when the dashboard renders
+    assert spy.get_attr_calls == []
+    assert spy.env_method_calls == []
 
 
 def test_save_vecnormalize_callback_writes_per_checkpoint_stats(monkeypatch, tmp_path):

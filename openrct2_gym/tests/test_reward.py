@@ -8,6 +8,7 @@ Note: ``FakeAPI`` hardcodes ``isCircuitComplete=False``, so completion / termina
 completion-first tests use the ``__new__`` + hand-set ``loop_completed`` path.
 """
 from collections import deque
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -23,13 +24,16 @@ DIRS = [(0, 1), (1, 0), (0, -1), (-1, 0)]  # N, E, S, W
 
 @pytest.fixture(autouse=True)
 def _isolate_close_cache(tmp_path):
-    """Isolate the process-wide calibration cache + its file per test."""
+    """Isolate the process-wide calibration cache + record buffer + its file per test."""
     orig_cache = OpenRCT2Env._close_cache
     orig_path = OpenRCT2Env._CLOSE_CACHE_PATH
+    orig_records = OpenRCT2Env._close_records
     OpenRCT2Env._close_cache = None
+    OpenRCT2Env._close_records = []
     OpenRCT2Env._CLOSE_CACHE_PATH = str(tmp_path / "close_geometry.json")
     yield
     OpenRCT2Env._close_cache = orig_cache
+    OpenRCT2Env._close_records = orig_records
     OpenRCT2Env._CLOSE_CACHE_PATH = orig_path
 
 
@@ -266,24 +270,97 @@ def test_closing_record_captures_preclose_head_not_endpoint():
     assert rec["track_type"] == 9
 
 
-def test_maybe_capture_persists_once_to_cache_and_file():
+def _rec(pos, d, action=13, track_type=9):
+    return {"pos": list(pos), "dir": d, "action": action, "track_type": track_type}
+
+
+def test_robust_close_anchor_requires_consistency():
+    """A trustworthy anchor needs >= _CLOSE_MIN_CONSISTENT completions sharing a direction --
+    so a single fluky closure (or a few that disagree) never locks Phi's target."""
+    assert OpenRCT2Env._robust_close_anchor([]) is None
+    assert OpenRCT2Env._robust_close_anchor([_rec([61, 68, 14], 2), _rec([61, 68, 14], 2)]) is None
+    # 3 records but no 3 agree on direction
+    assert OpenRCT2Env._robust_close_anchor(
+        [_rec([61, 68, 14], 0), _rec([61, 68, 14], 1), _rec([61, 68, 14], 2)]) is None
+
+
+def test_robust_close_anchor_median_pos_modal_dir_ignores_fluke():
+    """With >=3 completions agreeing on direction, the anchor is that direction + the group's
+    median position; an offset/other-direction outlier among them is ignored."""
+    records = [_rec([61, 68, 14], 2), _rec([61, 68, 14], 2), _rec([62, 68, 14], 2),  # consistent
+               _rec([99, 99, 14], 1)]                                                # fluke
+    anchor = OpenRCT2Env._robust_close_anchor(records)
+    assert anchor["dir"] == 2                     # modal direction (fluke outvoted)
+    assert anchor["pos"] == [61, 68, 14]          # median of the dir-2 group, not the [99,99] fluke
+
+
+def test_maybe_capture_locks_only_after_consistent_completions():
+    """The fix: ONE completion no longer locks the anchor (locking a fluky first closure poisoned
+    whole runs). It takes >= _CLOSE_MIN_CONSISTENT agreeing completions; then the robust anchor
+    persists to cache + file."""
     import json, os
     env = _bare_env()
-    env.track_builder = SimpleNamespace(history=_completing_history())
     env.loop_completed = True
-
+    env.track_builder = SimpleNamespace(history=_completing_history())  # pre-close head [61,68,14] dir 2
     env._maybe_capture_closing_geometry()
+    assert OpenRCT2Env._close_cache is None                 # one completion is not enough
+    assert not os.path.exists(OpenRCT2Env._CLOSE_CACHE_PATH)
+    for _ in range(OpenRCT2Env._CLOSE_MIN_CONSISTENT - 1):  # reach the consistency threshold
+        env.track_builder = SimpleNamespace(history=_completing_history())
+        env._maybe_capture_closing_geometry()
     assert OpenRCT2Env._close_cache["pos"] == [61, 68, 14]
+    assert OpenRCT2Env._close_cache["dir"] == 2
     assert os.path.exists(OpenRCT2Env._CLOSE_CACHE_PATH)
     with open(OpenRCT2Env._CLOSE_CACHE_PATH) as f:
         assert json.load(f)["dir"] == 2
 
-    # second completion must NOT overwrite the first calibration
+
+def test_maybe_capture_single_fluke_does_not_poison_then_consistent_wins():
+    """A lone fluky first closure does not lock; subsequent consistent closures set the real
+    anchor and outvote the fluke -- the exact failure that stuck 4 runs is prevented."""
+    fluke = _completing_history()
+    fluke[-1]["position"] = [63, 65, 14]
+    fluke[-1]["direction"] = 1
+    env = _bare_env()
+    env.loop_completed = True
+    env.track_builder = SimpleNamespace(history=fluke)
+    env._maybe_capture_closing_geometry()                   # 1 fluke -> no lock
+    assert OpenRCT2Env._close_cache is None
+    for _ in range(OpenRCT2Env._CLOSE_MIN_CONSISTENT):      # consistent good closures
+        env.track_builder = SimpleNamespace(history=_completing_history())
+        env._maybe_capture_closing_geometry()
+    assert OpenRCT2Env._close_cache["dir"] == 2             # consistent closure won
+    assert OpenRCT2Env._close_cache["pos"] == [61, 68, 14]  # not the [63,65,14] fluke
+
+
+def test_maybe_capture_locked_anchor_not_overwritten():
+    """Once a robust anchor locks, later completions don't overwrite it (Phi stays stable)."""
+    env = _bare_env()
+    env.loop_completed = True
+    for _ in range(OpenRCT2Env._CLOSE_MIN_CONSISTENT):
+        env.track_builder = SimpleNamespace(history=_completing_history())
+        env._maybe_capture_closing_geometry()
+    assert OpenRCT2Env._close_cache["pos"] == [61, 68, 14]
     other = _completing_history()
     other[-1]["position"] = [99, 99, 14]
     env.track_builder = SimpleNamespace(history=other)
     env._maybe_capture_closing_geometry()
-    assert OpenRCT2Env._close_cache["pos"] == [61, 68, 14]
+    assert OpenRCT2Env._close_cache["pos"] == [61, 68, 14]  # unchanged once locked
+
+
+def test_probe_log_closing_coerces_numpy_and_never_raises():
+    """The closing-geometry probe must coerce numpy ints (json can't serialize int64) and must
+    never raise -- an unguarded TypeError here crashed a real training run. Writes a valid line."""
+    import json, os
+    env = _bare_env()
+    entry = {"position": [np.int64(62), np.int64(66), np.int64(14)], "direction": np.int64(0),
+             "action": np.int64(13), "track_type": np.int64(9),
+             "next_position": [np.int64(61), np.int64(66), np.int64(14)], "next_direction": np.int64(0)}
+    env._probe_log_closing(entry)                       # must not raise on numpy types
+    path = os.path.join(os.path.dirname(OpenRCT2Env._CLOSE_CACHE_PATH), "closing_probe.jsonl")
+    rec = json.loads(open(path).read().strip())
+    assert rec["pos"] == [62, 66, 14] and rec["next_direction"] == 0
+    env._probe_log_closing({"position": None, "direction": None})   # malformed -> still no raise
 
 
 def test_maybe_capture_noop_without_completion():
@@ -315,14 +392,18 @@ def test_init_closing_target_applies_calibration():
     assert env._reward_target_direction() == 3
 
 
-def test_init_closing_target_provisional_without_cache():
+def test_init_closing_target_provisional_uses_station_entry_axis():
+    """No calibration yet: close_pos still falls back to the guide tile, but close_dir is now the
+    DETERMINISTIC station-entry axis (North=0, confirmed by the closing-geometry probe: every
+    completion enters BeginStation [61,66,14] heading North). So the heading reward term is ON from
+    step 1 instead of None-until-calibration -- breaking the chicken-and-egg that stalled bootstrap."""
     OpenRCT2Env._close_cache = None
     env = _bare_env(goal_position=(62, 66, 14))
     env._init_closing_target()
     assert env.close_pos is None
-    assert env.close_dir is None
-    assert list(env._reward_target_position()) == [62, 66, 14]   # provisional
-    assert env._reward_target_direction() is None
+    assert env.close_dir == 0                                    # North = station-entry axis
+    assert list(env._reward_target_position()) == [62, 66, 14]   # provisional guide tile
+    assert env._reward_target_direction() == 0
 
 
 # ------------------------------------------------------- PBRS reward (tests 2,3,5,10)
@@ -503,9 +584,15 @@ def test_phase_reward_params_structural_per_phase():
     W = ImprovedPhasedCurriculumWrapper
     p1 = W._phase_reward_params(1)
     assert p1.R_struct_max == 0.0                       # struct off in P1
-    p2 = W._phase_reward_params(2)
-    assert (p2.R_struct_max, p2.struct_w_chain, p2.struct_w_drop, p2.struct_chain_target) \
-        == (250.0, 1.0, 0.0, 3)                         # chains only, target 3 (matches >=3 gate)
+    p2a = W._phase_reward_params(2, phase2_stage=1)
+    p2b = W._phase_reward_params(2, phase2_stage=2)
+    p2c = W._phase_reward_params(2, phase2_stage=3)
+    assert (p2a.R_struct_max, p2a.struct_w_chain, p2a.struct_w_drop, p2a.struct_chain_target) \
+        == (250.0, 1.0, 0.0, 1)                         # stage 2.1: one-chain bridge
+    assert (p2b.R_struct_max, p2b.struct_w_chain, p2b.struct_w_drop, p2b.struct_chain_target) \
+        == (250.0, 1.0, 0.0, 1)                         # stage 2.2: one-chain completion
+    assert (p2c.R_struct_max, p2c.struct_w_chain, p2c.struct_w_drop, p2c.struct_chain_target) \
+        == (250.0, 1.0, 0.0, 3)                         # stage 2.3: tighten to >=3 chains
     p3 = W._phase_reward_params(3)
     assert (p3.R_struct_max, p3.struct_w_chain, p3.struct_w_drop, p3.struct_chain_target) \
         == (250.0, 0.5, 0.5, 2)                         # chains AND drop, target 2 (matches >=2 gate)
@@ -519,19 +606,29 @@ def test_phase_reward_params_structural_per_phase():
     # Phase-1 completion learning). w_h=3 (not 6): a 1M-step run showed the deeper
     # attractor let a wrecked policy settle into climbing instead of completing.
     assert p1.w_h == 0.0 and p5.w_h == 0.0
-    assert p2.w_h == 3.0 and p3.w_h == 3.0 and p4.w_h == 3.0
-    # completion gating: a flat loop earns NOTHING in the hill phases 2-4 (floor=0, so the only
-    # road to reward is building chain lifts) -- removes the flat-loop local optimum that parked
-    # the agent at 87% flat completion with zero hills; full credit in phase 1 (bootstrap) and 5.
+    # strong discovery pull to FIND the chain climb in 2.1, relaxing once learned so it cannot
+    # recreate the climb-away attractor in later stages
+    assert p2a.w_h == 6.0 and p2b.w_h == 4.0 and p2c.w_h == 3.0
+    assert p3.w_h == 3.0 and p4.w_h == 3.0
+    # completion gating (closure-first): phase 2 keeps a real flat-completion floor so closing a
+    # loop always out-pays an unclosed climb (the phase-1 skill survives while hills are added);
+    # phase 3/4 remove that floor once the bridge is done so structure is required.
     assert p1.completion_hill_floor == 1.0 and p5.completion_hill_floor == 1.0
-    assert (p2.completion_hill_floor == 0.0 and p3.completion_hill_floor == 0.0
-            and p4.completion_hill_floor == 0.0)
+    assert p2a.completion_hill_floor == pytest.approx(0.2)   # 2.1 restores the closure floor
+    assert p2b.completion_hill_floor == 0.25                 # 2.2 keeps a slightly higher floor
+    assert p2c.completion_hill_floor == 0.10
+    assert p3.completion_hill_floor == 0.0 and p4.completion_hill_floor == 0.0
+    # descent/return shaping (w_return): ON in the hill phases 2-4 to make the RETURN learnable,
+    # OFF in phase 1 (pure completion) and phase 5 (quality), mirroring the discovery term w_h.
+    assert p2a.w_return == 6.0 and p2b.w_return == 4.0 and p2c.w_return == 3.0
+    assert p3.w_return == 3.0 and p4.w_return == 3.0
+    assert p1.w_return == 0.0 and p5.w_return == 0.0
     # d_z=20 keeps the near-station m_z slope at 0.3/z -- steep enough that the energy
     # term's chain-lift bump (~+0.47) cannot make climbing profitable in phase 1
     # (d_z=60 weakened the slope to 0.1/z and the energy term became an accidental
     # discovery term: a 1M-step run climbed to +75z in phase 1 and never completed).
     # High-altitude reach comes from m_z being UNCLIPPED instead (see gradient test).
-    for p in (p1, p2, p3, p4, p5):
+    for p in (p1, p2a, p2b, p2c, p3, p4, p5):
         assert p.d_z == 20.0
 
 
@@ -675,13 +772,62 @@ def _complete_payoff(params, chains=0, drops=0):
     return env._calculate_reward(True, 0)
 
 
-def test_completion_gate_devalues_flat_loops_in_phase2():
-    P = ImprovedPhasedCurriculumWrapper._phase_reward_params(2)
+def test_completion_gate_keeps_small_flat_floor_in_phase2_stage2():
+    # Stage 2.1 restores the closure floor (0.2, see test_phase2_stage1_restores_closure_floor);
+    # stage 2.2 keeps a slightly higher floor (0.25) once the gate is completion-based again.
+    P = ImprovedPhasedCurriculumWrapper._phase_reward_params(2, phase2_stage=2)
     flat = _complete_payoff(P, chains=0)
-    full = _complete_payoff(P, chains=3)
-    assert flat == pytest.approx(0.0)          # floor=0: a flat loop earns NOTHING (kills the trap)
+    full = _complete_payoff(P, chains=1)
+    assert flat == pytest.approx(250.0)        # floor=.25: keeps the learned closing skill alive
     assert full == pytest.approx(1250.0)       # R_complete * 1.0 + struct 250
-    assert flat < _complete_payoff(P, chains=1) < full   # partial hill scales between
+    assert flat < full
+
+
+def test_phase2_final_stage_tightens_to_three_chains():
+    P = ImprovedPhasedCurriculumWrapper._phase_reward_params(2, phase2_stage=3)
+    flat = _complete_payoff(P, chains=0)
+    one_chain = _complete_payoff(P, chains=1)
+    full = _complete_payoff(P, chains=3)
+    assert flat == pytest.approx(100.0)        # mostly devalued, but not zeroed out
+    assert flat < one_chain < full
+    assert full == pytest.approx(1250.0)
+
+
+def test_phase2_w_h_relaxes_across_stages():
+    """Change D: a strong chain-discovery pull to FIND the climb in stage 2.1, relaxing once
+    learned so it cannot recreate the climb-away attractor in later stages."""
+    W = ImprovedPhasedCurriculumWrapper
+    assert W._phase_reward_params(2, phase2_stage=1).w_h == 6.0
+    assert W._phase_reward_params(2, phase2_stage=2).w_h == 4.0
+    assert W._phase_reward_params(2, phase2_stage=3).w_h == 3.0
+    assert W._phase_reward_params(1).w_h == 0.0 and W._phase_reward_params(5).w_h == 0.0
+
+
+def test_phase2_stage1_restores_closure_floor():
+    """Closure-first repair: stage 2.1's flat-completion floor is RESTORED (0.2) so a closed
+    loop always out-pays an unclosed climb -- the agent keeps the loop-closing skill while it
+    learns to add a hill. (Reverses the 0.05 de-valuation that drove the climb-only collapse:
+    flat-close paid 50 < the ~100 a climb-and-stop banked, so the agent abandoned closure.)"""
+    W = ImprovedPhasedCurriculumWrapper
+    assert W._phase_reward_params(2, phase2_stage=1).completion_hill_floor == pytest.approx(0.2)
+    assert W._phase_reward_params(2, phase2_stage=2).completion_hill_floor == 0.25  # unchanged
+    assert W._phase_reward_params(2, phase2_stage=3).completion_hill_floor == 0.10  # unchanged
+    flat = _complete_payoff(W._phase_reward_params(2, phase2_stage=1), chains=0)
+    assert flat == pytest.approx(200.0)       # closing a flat loop is worth something again
+
+
+def test_phase2_summit_payout_disabled_in_bridge_stages():
+    """Closure-first: the one-shot R_summit payout is REMOVED (0) so 'climb and stop' is no
+    longer a satisfying terminal that out-pays closing. The dense w_h discovery term still
+    makes the first climb learnable, and R_roundtrip rewards the climb-and-descend. (The
+    phase2_summit_rate diagnostic is unaffected -- it is computed from chain gain, not this
+    payout; see test_phase2_summit_signal_tracks_chain_climb.)"""
+    W = ImprovedPhasedCurriculumWrapper
+    assert W._phase_reward_params(2, phase2_stage=1).R_summit == 0.0
+    assert W._phase_reward_params(2, phase2_stage=2).R_summit == 0.0
+    assert W._phase_reward_params(2, phase2_stage=3).R_summit == 0.0
+    assert W._phase_reward_params(1).R_summit == 0.0
+    assert W._phase_reward_params(5).R_summit == 0.0
 
 
 def test_completion_not_gated_in_phase1():
@@ -690,14 +836,14 @@ def test_completion_not_gated_in_phase1():
 
 
 def test_hill_completion_beats_incomplete_flat_does_not_in_phase2():
-    # Completion-first is now hill-conditioned. With the flat floor removed, a flat completion
-    # is intentionally worth ~0 -- no longer privileged over an incomplete episode (that is what
-    # kills the flat-loop trap) -- but a real hill completion still dominates the best bounded
-    # incomplete return (Phi_max via PBRS telescoping).
-    P = ImprovedPhasedCurriculumWrapper._phase_reward_params(2)
+    # Completion-first is now hill-conditioned, but Phase 2 keeps a small flat-completion floor
+    # to avoid erasing the Phase-1 skill while it introduces chain lifts. A real hill completion
+    # still dominates the best bounded incomplete return (Phi_max via PBRS telescoping).
+    P = ImprovedPhasedCurriculumWrapper._phase_reward_params(2, phase2_stage=3)
     phi_max = P.w_xy + P.w_z + P.w_dir + P.w_e + P.w_h
     assert _complete_payoff(P, chains=3) > phi_max                 # a hill completion dominates
-    assert _complete_payoff(P, chains=0) == pytest.approx(0.0)     # flat no longer privileged
+    assert _complete_payoff(P, chains=0) > phi_max                 # completion remains alive
+    assert _complete_payoff(P, chains=0) < _complete_payoff(P, chains=1)
 
 
 # ---- round-trip elevation milestone (decomposition: teach climb-and-return)
@@ -745,18 +891,93 @@ def test_roundtrip_awarded_once_per_episode():
     assert r2 == pytest.approx(p.gamma * env._potential(p))
 
 
+def test_roundtrip_requires_chain_lift_not_plain_climb():
+    """Change B: a plain (non-chain) climb-and-return earns NO round-trip milestone and does
+    NOT burn the once-per-episode flag, so a later chain climb in the same episode can still
+    qualify. Aligns the env award with the wrapper's chain_count>=1 gate."""
+    p = RewardParams(R_roundtrip=100.0, roundtrip_gain=4.0)
+    env = _bare_env(current_position=(0, 0, 14),
+                    history=[{"action": 0, "next_position": [0, 0, 20]}])  # plain climb +6, returned
+    env.reward_params = p
+    env._phi_prev = 0.0
+    env._roundtrip_awarded = False
+    env.loop_completed = False
+    r = env._calculate_reward(True, 0)
+    assert r == pytest.approx(p.gamma * env._potential(p))   # no milestone
+    assert env._roundtrip_awarded is False                   # flag not burned
+
+
 def test_roundtrip_disabled_and_below_completion_per_phase():
     assert RewardParams().R_roundtrip == 0.0               # off by default
     W = ImprovedPhasedCurriculumWrapper
     assert W._phase_reward_params(1).R_roundtrip == 0.0     # off in phase 1
     assert W._phase_reward_params(5).R_roundtrip == 0.0     # off in phase 5
-    for ph in (2, 3, 4):
-        P = W._phase_reward_params(ph)
-        assert P.R_roundtrip == 100.0
+    assert W._phase_reward_params(2, phase2_stage=1).R_roundtrip == 300.0
+    assert W._phase_reward_params(2, phase2_stage=2).R_roundtrip == 300.0
+    assert W._phase_reward_params(2, phase2_stage=3).R_roundtrip == 200.0
+    for P in (
+        W._phase_reward_params(2, phase2_stage=1),
+        W._phase_reward_params(2, phase2_stage=2),
+        W._phase_reward_params(2, phase2_stage=3),
+        W._phase_reward_params(3),
+        W._phase_reward_params(4),
+    ):
         # must stay below a real hill completion (R_complete) so climb-and-return is a stepping
-        # stone, never a substitute for closing the hill loop. (It now intentionally EXCEEDS a
-        # flat completion, which pays 0 -- that is what lures the agent off the flat-loop trap.)
+        # stone, never a substitute for closing the hill loop.
         assert P.R_roundtrip < P.R_complete
+
+
+# ---- summit milestone (reachable first half of the round-trip bridge)
+
+def test_summit_milestone_awarded_on_chain_climb_without_return():
+    """Change C: a chain climb to >= roundtrip_gain earns R_summit ONCE, independent of
+    returning or completing -- the reachable stepping stone before the full round-trip."""
+    p = RewardParams(R_summit=80.0, R_roundtrip=300.0, roundtrip_gain=4.0)
+    assert p.R_summit < p.R_roundtrip
+    env = _bare_env(current_position=(0, 0, 20),        # still elevated: no return
+                    history=[{"action": 9, "next_position": [0, 0, 20]}])
+    env.reward_params = p
+    env._phi_prev = 0.0
+    env._summit_awarded = False
+    env._roundtrip_awarded = False
+    env.loop_completed = False
+    r = env._calculate_reward(True, 9)
+    assert r == pytest.approx(p.gamma * env._potential(p) + 80.0)
+    assert env._summit_awarded is True
+    assert env._roundtrip_awarded is False             # not returned -> no round-trip
+
+
+def test_summit_not_awarded_for_plain_or_small_climb():
+    p = RewardParams(R_summit=80.0, roundtrip_gain=4.0)
+    plain = _bare_env(current_position=(0, 0, 20),
+                      history=[{"action": 0, "next_position": [0, 0, 20]}])   # plain, no chain
+    plain.reward_params = p
+    plain._phi_prev = 0.0
+    plain._summit_awarded = False
+    plain.loop_completed = False
+    assert plain._calculate_reward(True, 0) == pytest.approx(p.gamma * plain._potential(p))
+    assert plain._summit_awarded is False
+    small = _bare_env(current_position=(0, 0, 16),
+                      history=[{"action": 9, "next_position": [0, 0, 16]}])   # chain but only +2
+    small.reward_params = p
+    small._phi_prev = 0.0
+    small._summit_awarded = False
+    small.loop_completed = False
+    assert small._calculate_reward(True, 9) == pytest.approx(p.gamma * small._potential(p))
+
+
+def test_summit_awarded_once_per_episode():
+    p = RewardParams(R_summit=80.0, roundtrip_gain=4.0)
+    env = _bare_env(current_position=(0, 0, 20),
+                    history=[{"action": 9, "next_position": [0, 0, 20]}])
+    env.reward_params = p
+    env._phi_prev = 0.0
+    env._summit_awarded = False
+    env.loop_completed = False
+    env._calculate_reward(True, 9)                       # first -> awarded
+    env._phi_prev = 0.0
+    r2 = env._calculate_reward(True, 9)                  # second -> no re-award
+    assert r2 == pytest.approx(p.gamma * env._potential(p))
 
 
 # ---- discovery potential (elevation term in Phi)
@@ -765,10 +986,11 @@ _DISC = RewardParams(w_xy=0.0, w_z=0.0, w_dir=0.0, w_e=0.0, w_h=6.0, h_scale=6.0
 
 
 def _peak_env(peak_z, head_z=None):
-    """Bare env whose history reaches `peak_z`; head height defaults to peak."""
+    """Bare env whose history reaches `peak_z` via a CHAIN-LIFT piece (discovery is
+    chain-specific); head height defaults to peak."""
     head_z = peak_z if head_z is None else head_z
     return _bare_env(current_position=(0, 0, head_z),
-                     history=[{"action": 0, "next_position": [0, 0, peak_z]}])
+                     history=[{"action": 9, "next_position": [0, 0, peak_z]}])
 
 
 def test_discovery_potential_increases_and_saturates():
@@ -782,14 +1004,34 @@ def test_discovery_potential_increases_and_saturates():
 
 def test_discovery_potential_banks_peak_after_descent():
     env = _bare_env(current_position=(0, 0, 14),
-                    history=[{"action": 0, "next_position": [0, 0, 30]},   # climbed
+                    history=[{"action": 9, "next_position": [0, 0, 30]},   # chain-climbed
                              {"action": 6, "next_position": [0, 0, 14]}])  # back to station height
-    assert env._potential(_DISC) == pytest.approx(6.0)   # banked peak, NOT 0 despite head at z=14
+    assert env._potential(_DISC) == pytest.approx(6.0)   # banked chain peak, NOT 0 despite head at z=14
 
 
 def test_discovery_potential_empty_history_no_raise():
     env = _bare_env(history=[])              # max() of empty would raise without the guard
     assert env._potential(_DISC) == pytest.approx(0.0)
+
+
+def test_discovery_is_chain_specific():
+    """Change A: only chain-lift pieces (actions 9/10) earn the discovery term. An
+    identical-geometry plain climb (action 5/0, same track_type) earns ZERO discovery, so
+    the agent has a real gradient toward the chain flag the Phase-2 gate counts."""
+    plain = _bare_env(current_position=(0, 0, 20),
+                      history=[{"action": 0, "next_position": [0, 0, 20]}])
+    chain = _bare_env(current_position=(0, 0, 20),
+                      history=[{"action": 9, "next_position": [0, 0, 20]}])
+    assert plain._potential(_DISC) == pytest.approx(0.0)   # plain climb: no discovery
+    assert chain._potential(_DISC) == pytest.approx(6.0)   # chain climb: full discovery (gain 6)
+
+
+def test_chain_max_gain_helper_filters_non_chain_pieces():
+    """_chain_max_gain banks the highest elevation reached via chain pieces only."""
+    env = _bare_env(history=[{"action": 0, "next_position": [0, 0, 30]},   # plain climb to +16
+                             {"action": 9, "next_position": [0, 0, 18]}])  # chain climb to +4
+    assert env._chain_max_gain() == pytest.approx(4.0)     # only the chain piece counts
+    assert _bare_env(history=[])._chain_max_gain() == pytest.approx(0.0)
 
 
 class ClimbingAPI(FakeAPI):
@@ -911,6 +1153,207 @@ def test_build_tall_and_stall_is_dominated_by_completion():
     assert discounted < 30.0                 # bounded by ~Phi_max, nowhere near +1000
 
 
+# ============================================================================
+# Closure-first redesign: descent shaping (w_return) + the reachability ladder.
+# The descent term is PBRS-clean and gated to be 0 at/above the summit threshold
+# height (STATION_HEIGHT + roundtrip_gain), rising to w_return only on the return.
+# ============================================================================
+
+def _return_only(w_return=5.0, roundtrip_gain=4.0):
+    """Params isolating the descent-shaping term: all other Phi weights zeroed."""
+    return RewardParams(w_xy=0.0, w_z=0.0, w_dir=0.0, w_e=0.0, w_h=0.0,
+                        w_return=w_return, roundtrip_gain=roundtrip_gain)
+
+
+def _climbed_env(head_z, peak_z=20):
+    """Bare env that chain-climbed to peak_z (gain = peak_z - STATION_HEIGHT), head at head_z."""
+    return _bare_env(current_position=(0, 0, head_z),
+                     history=[{"action": 9, "next_position": [0, 0, peak_z]}])
+
+
+def test_return_potential_zero_above_threshold_rises_on_descent():
+    """The descent-shaping term is 0 at/above the summit threshold height (14 + 4 = 18) and
+    rises monotonically to w_return as the head returns to station height (14) -- the
+    continuous downhill gradient that was missing (descent had no per-step shaping)."""
+    p = _return_only(w_return=5.0)
+    above = _climbed_env(head_z=22)._potential(p)
+    at_thresh = _climbed_env(head_z=18)._potential(p)
+    mid = _climbed_env(head_z=16)._potential(p)
+    home = _climbed_env(head_z=14)._potential(p)
+    assert above == pytest.approx(0.0)
+    assert at_thresh == pytest.approx(0.0)
+    assert 0.0 < mid < home
+    assert home == pytest.approx(5.0)
+
+
+def test_return_potential_gated_on_chain_climb():
+    """The term stays 0 until a CHAIN climb reaches roundtrip_gain: a head at station with no
+    prior chain hill (or only a plain climb) earns no return shaping -- so it never rewards
+    digging below the station without having built a hill first."""
+    p = _return_only(w_return=5.0)
+    no_climb = _bare_env(current_position=(0, 0, 14), history=[])._potential(p)
+    plain = _bare_env(current_position=(0, 0, 14),
+                      history=[{"action": 0, "next_position": [0, 0, 20]}])._potential(p)
+    chained = _climbed_env(head_z=14)._potential(p)
+    assert no_climb == pytest.approx(0.0)
+    assert plain == pytest.approx(0.0)
+    assert chained == pytest.approx(5.0)
+
+
+def test_crossing_roundtrip_threshold_creates_no_return_reward():
+    """High-priority review point: the term is 0 both just-below the gate (chain gain < 4) and
+    exactly AT the summit threshold height, so the gate turning on injects NO positive Phi jump
+    (F = gamma*Phi' - Phi) -- it cannot re-pay the summit. Only the descent below the threshold
+    earns shaping."""
+    p = _return_only(w_return=5.0)
+    below_gate = _bare_env(current_position=(0, 0, 16),
+                           history=[{"action": 9, "next_position": [0, 0, 16]}])._potential(p)
+    at_gate = _climbed_env(head_z=18, peak_z=18)._potential(p)   # gate flips on here
+    above = _climbed_env(head_z=22, peak_z=22)._potential(p)
+    descending = _climbed_env(head_z=17, peak_z=20)._potential(p)
+    assert below_gate == pytest.approx(0.0)   # gain 2 < 4 -> gate off
+    assert at_gate == pytest.approx(0.0)      # gate on but term 0 -> no jump, no summit re-pay
+    assert above == pytest.approx(0.0)
+    assert descending > 0.0                   # only the descent earns the shaping
+
+
+def test_return_shaping_telescopes_and_is_not_farmable():
+    """The descent term is part of Phi, so a descend-then-ascend round trip telescopes to
+    (gamma-1)*Phi < 0 -- the agent cannot farm reward by bobbing up and down. Descending pays
+    as-you-go (that gradient is the point); only the closed cycle must be non-positive."""
+    p = _return_only(w_return=5.0)
+    env = _climbed_env(head_z=18)             # chain peak 20 (gate on); head at summit (term 0)
+    env.reward_params = p
+    env.loop_completed = False
+    env._phi_prev = env._potential(p)         # Phi(z=18) == 0
+    env.current_position = [0, 0, 14]         # descend to station: term rises
+    r_down = env._calculate_reward(True, 0)
+    env.current_position = [0, 0, 18]         # ascend back to summit: term falls
+    r_up = env._calculate_reward(True, 0)
+    assert r_down > 0.0 and r_up < 0.0
+    assert r_down + r_up == pytest.approx((p.gamma - 1.0) * 5.0)   # telescopes, net < 0
+
+
+def test_return_shaping_weight_enabled_in_hill_phases_off_elsewhere():
+    """w_return gates the descent shaping: >0 in the hill phases 2-4, 0 in phase 1 (pure
+    completion) and phase 5 (quality), mirroring the discovery term w_h."""
+    W = ImprovedPhasedCurriculumWrapper
+    assert RewardParams().w_return == 0.0                        # off by default
+    for stage in (1, 2, 3):
+        assert W._phase_reward_params(2, phase2_stage=stage).w_return > 0.0
+    assert W._phase_reward_params(3).w_return > 0.0
+    assert W._phase_reward_params(4).w_return > 0.0
+    assert W._phase_reward_params(1).w_return == 0.0
+    assert W._phase_reward_params(5).w_return == 0.0
+
+
+def test_return_shaping_cannot_affect_phase1_or_phase5():
+    """Regression guard / evidence: the descent term is inert outside the hill phases. Even for a
+    chain-climbed env sitting at station height -- where the term is MAXIMAL when enabled -- it
+    contributes exactly 0 under phase-1 and phase-5 params, while it IS positive under phase-2.1.
+    So a Phase-1 training collapse can never be attributable to this change (the Phase-1 reward is
+    byte-for-byte unchanged)."""
+    W = ImprovedPhasedCurriculumWrapper
+    env = _climbed_env(head_z=14)             # climbed (gain 6) then returned: max shaping if on
+    assert env._return_potential(W._phase_reward_params(1)) == 0.0
+    assert env._return_potential(W._phase_reward_params(5)) == 0.0
+    assert env._return_potential(W._phase_reward_params(2, phase2_stage=1)) > 0.0
+
+
+def _no_geo(P):
+    """Stage params with the dense Phi geometry weights zeroed, so _calculate_reward returns
+    essentially only the sparse ladder rewards (completion floor, struct, roundtrip, summit)."""
+    return replace(P, w_xy=0.0, w_z=0.0, w_dir=0.0, w_e=0.0, w_h=0.0)
+
+
+def _ladder_rung(P, *, chains, head_z, completed):
+    hist = [{"action": 9, "next_position": [0, 0, 20]} for _ in range(chains)]  # gain 6 >= 4
+    env = _bare_env(current_position=(0, 0, head_z), history=hist)
+    env.reward_params = _no_geo(P)
+    env._phi_prev = 0.0
+    env._summit_awarded = False
+    env._roundtrip_awarded = False
+    env.loop_completed = completed
+    return env._calculate_reward(True, 9 if chains else 0)
+
+
+def test_phase2_stage1_reward_ladder_is_monotone():
+    """The core fix: stage-2.1 sparse rewards form a monotone, reachable ladder
+    climb-only < flat-close < climb-and-descend < hill-close. So the gradient always points
+    PAST flat looping toward the hill round-trip (closure-first AND anti-flat-only), while a
+    closed loop always out-pays an unclosed climb. On the pre-fix params (floor 0.05,
+    R_summit 100) a climb-and-stop out-pays a flat close, so this fails."""
+    P = ImprovedPhasedCurriculumWrapper._phase_reward_params(2, phase2_stage=1)
+    climb_only = _ladder_rung(P, chains=1, head_z=20, completed=False)     # elevated, no close
+    flat_close = _ladder_rung(P, chains=0, head_z=14, completed=True)      # flat loop closed
+    climb_descend = _ladder_rung(P, chains=1, head_z=14, completed=False)  # returned, not closed
+    hill_close = _ladder_rung(P, chains=1, head_z=14, completed=True)      # hill loop closed
+    assert climb_only < flat_close < climb_descend < hill_close
+
+
+def test_episode_metrics_expose_return_potential(monkeypatch):
+    """Diagnostic-per-term: episode_metrics carries return_potential so training can watch the
+    return gradient fire (gate flag w_return + a logged diagnostic, per the reward-design prefs)."""
+    monkeypatch.setattr(oe_mod, "APIController", CompletingAPI)
+    env = OpenRCT2Env(verbose=0)
+    env.skip_ride_testing = True
+    env.reward_params = RewardParams(w_return=5.0, roundtrip_gain=4.0)
+    env.reset()
+    info = {}
+    for _ in range(6):
+        _, _, terminated, truncated, info = env.step(9)   # chain lifts -> completes
+        if terminated or truncated:
+            break
+    assert 'return_potential' in info['episode_metrics']
+
+
+# ============================================================================
+# Near-closure densification: a steep local Phi bonus driving last-piece closure
+# in the cold-start (the gentle w_xy approach term is too flat to bootstrap it).
+# ============================================================================
+
+def _close_only(w_close=8.0, close_range=3.0, close_z_range=2.0):
+    """Params isolating the near-closure bonus: all other Phi weights zeroed."""
+    return RewardParams(w_xy=0.0, w_z=0.0, w_dir=0.0, w_e=0.0, w_h=0.0, w_return=0.0,
+                        w_close=w_close, close_range=close_range, close_z_range=close_z_range)
+
+
+def test_close_bonus_off_by_default():
+    """Off by default so the frozen-Phi tests are unaffected; only the curriculum turns it on."""
+    assert RewardParams().w_close == 0.0
+    assert _phi_env((0, 0, 14))._potential(_close_only(w_close=0.0)) == pytest.approx(0.0)
+
+
+def test_close_bonus_zero_beyond_range():
+    """Strictly local: zero beyond close_range tiles (XY) or close_z_range (height)."""
+    p = _close_only(w_close=8.0, close_range=3.0, close_z_range=2.0)   # target = close_pos (0,0,14)
+    assert _phi_env((10, 0, 14))._potential(p) == pytest.approx(0.0)   # 10 tiles away (>3)
+    assert _phi_env((0, 0, 20))._potential(p) == pytest.approx(0.0)    # +6 above station (>2)
+
+
+def test_close_bonus_ramps_steeply_to_target():
+    """Within range it ramps monotonically (and steeply) to w_close at the exact closing tile."""
+    p = _close_only(w_close=8.0, close_range=3.0)
+    phis = [_phi_env((d, 0, 14))._potential(p) for d in (3, 2, 1, 0)]
+    assert phis[0] == pytest.approx(0.0)             # at the range edge
+    assert phis[0] < phis[1] < phis[2] < phis[3]     # steep monotonic climb in the final tiles
+    assert phis[3] == pytest.approx(8.0)             # full bonus at the closing tile
+    assert (phis[3] - phis[2]) > 1.0                 # steeper than the 0.25/tile w_xy approach
+
+
+def test_close_bonus_enabled_in_completion_phases_off_in_phase5():
+    """The curriculum turns the densified closure signal ON in the completion phases 1-4 (to drive
+    the cold-start bootstrap) and OFF in phase 5 (completion already mastered there)."""
+    W = ImprovedPhasedCurriculumWrapper
+    assert W._phase_reward_params(1).w_close > 0.0
+    assert W._phase_reward_params(2, phase2_stage=1).w_close > 0.0
+    assert W._phase_reward_params(2, phase2_stage=2).w_close > 0.0
+    assert W._phase_reward_params(2, phase2_stage=3).w_close > 0.0
+    assert W._phase_reward_params(3).w_close > 0.0
+    assert W._phase_reward_params(4).w_close > 0.0
+    assert W._phase_reward_params(5).w_close == 0.0
+
+
 def test_phase_switch_keeps_single_reward_method_and_only_changes_params(monkeypatch):
     monkeypatch.setattr(oe_mod, "APIController", FakeAPI)
     base = OpenRCT2Env(verbose=0)
@@ -932,20 +1375,96 @@ def test_p3_qualified_requires_chains_and_drop():
     W = ImprovedPhasedCurriculumWrapper
     w = W.__new__(W)                          # no __init__/env needed for the predicate
 
-    def base(actions):
+    def base(actions, roundtrip=False, current_z=14):
         return SimpleNamespace(track_builder=SimpleNamespace(
-            history=[{"action": a} for a in actions]))
+            history=[{"action": a, "next_position": [0, 0, 20 if a in (9, 10) else current_z]}
+                     for a in actions]),
+            current_position=[0, 0, current_z],
+            _roundtrip_awarded=roundtrip)
 
     w.current_phase = 3
     assert w._is_qualified(base([9, 9, 6]), True) is True     # 2 chains AND a drop
     assert w._is_qualified(base([9, 9]), True) is False       # chains, no drop
-    assert w._is_qualified(base([6]), True) is False          # drop only (was True under old OR gate)
+    assert w._is_qualified(base([6]), True) is False          # drop only
     assert w._is_qualified(base([9, 9, 6]), False) is False   # not completed
     w.current_phase = 2
-    assert w._is_qualified(base([9, 9, 9]), True) is True     # P2: >=3 chains
+    w.phase2_stage = 1
+    assert w._is_qualified(base([9], roundtrip=True), False) is True    # P2.1: no completion needed
+    assert w._is_qualified(base([0], roundtrip=True), False) is False   # must include a chain
+    w.phase2_stage = 2
+    assert w._is_qualified(base([9]), True) is True            # P2.2: >=1 chain completion
+    assert w._is_qualified(base([9]), False) is False
+    w.phase2_stage = 3
+    assert w._is_qualified(base([9, 9, 9]), True) is True      # P2.3: >=3 chains
     assert w._is_qualified(base([9, 9]), True) is False
     w.current_phase = 4
     assert w._is_qualified(base([9, 9, 6]), True) is None     # no structural gate
+
+
+def test_phase2_summit_signal_tracks_chain_climb():
+    W = ImprovedPhasedCurriculumWrapper
+    w = W.__new__(W)
+    w.current_phase = 2
+    w.phase2_stage = 1
+    chain = SimpleNamespace(
+        track_builder=SimpleNamespace(history=[{"action": 9, "next_position": [0, 0, 20]}]),
+        current_position=[0, 0, 20],            # chain-climbed +6, still elevated (no return)
+        _summit_awarded=False, _roundtrip_awarded=False, STATION_HEIGHT=14)
+    sig = w._phase2_signals(chain, success=False)
+    assert sig['phase2_summit'] is True         # summit = chain climb past threshold, no return needed
+    assert sig['phase2_roundtrip'] is False      # did not return -> no round-trip
+    plain = SimpleNamespace(
+        track_builder=SimpleNamespace(history=[{"action": 0, "next_position": [0, 0, 20]}]),
+        current_position=[0, 0, 20],
+        _summit_awarded=False, _roundtrip_awarded=False, STATION_HEIGHT=14)
+    assert w._phase2_signals(plain, success=False)['phase2_summit'] is False   # plain climb earns no summit
+
+
+def test_phase2_substage_advancement_sequence():
+    W = ImprovedPhasedCurriculumWrapper
+    w = W.__new__(W)
+    w.current_phase = 2
+    w.phase2_stage = 1
+    w.phase2_roundtrip_threshold = 0.30
+    w.phase2_chain1_success_threshold = 0.30
+    w.phase2_success_threshold = 0.40
+    w._track_stats = True
+    w.verbose = 0
+    w.phases_completed = []
+    w.phase_episode_count = 50
+    w.total_loops_completed = 0
+    w.phase2_summit_results = deque(maxlen=50)
+    w.phase2_roundtrip_results = deque(maxlen=50)
+    w.phase2_chain1_completion_results = deque(maxlen=50)
+    w.phase2_chain2_completion_results = deque(maxlen=50)
+    w.phase2_chain3_completion_results = deque(maxlen=50)
+    updates = []
+    w._update_phase_settings = lambda: updates.append(w.phase2_stage)
+
+    def fill_window(qualified_count):
+        w.episode_results = deque([False] * 50, maxlen=50)
+        w.episode_qualified_results = deque(
+            [True] * qualified_count + [False] * (50 - qualified_count),
+            maxlen=50,
+        )
+
+    fill_window(15)                            # 30% -> leave stage 2.1
+    assert w._check_phase_advancement() is True
+    assert w.current_phase == 2 and w.phase2_stage == 2
+    assert w.phases_completed[-1]['phase'] == "2.1"
+
+    w.phase_episode_count = 50
+    fill_window(15)                            # 30% -> leave stage 2.2
+    assert w._check_phase_advancement() is True
+    assert w.current_phase == 2 and w.phase2_stage == 3
+    assert w.phases_completed[-1]['phase'] == "2.2"
+
+    w.phase_episode_count = 50
+    fill_window(20)                            # 40% -> leave phase 2
+    assert w._check_phase_advancement() is True
+    assert w.current_phase == 3
+    assert w.phases_completed[-1]['phase'] == "2.3"
+    assert updates == [2, 3, 3]
 
 
 def test_history_based_qualified_predicates():
@@ -1001,6 +1520,49 @@ def test_gamma_single_sourced_to_reward_params(monkeypatch):
     assert base.reward_params.gamma == T.GAMMA
 
 
+# ----------------------------------------------- entropy-collapse guard (Change E)
+
+def _make_guard_cb(ent_coef=0.015, target_kl=0.04):
+    import train as T
+    cb = T.ParallelCurriculumMaskableCallback.__new__(T.ParallelCurriculumMaskableCallback)
+    cb._opt_guarded = True            # phase >= 2: base restores to the guarded floor
+    cb._ent_boosted = False
+    cb._ent_boost_calls = 0
+    cb.model = SimpleNamespace(ent_coef=ent_coef, target_kl=target_kl)
+    return cb
+
+
+def test_entropy_guard_boost_is_gentler():
+    import train as T
+    assert T.ENT_COLLAPSE_BOOST == 0.03      # gentler than the old 0.05 that cratered closure
+    cb = _make_guard_cb()
+    cb._maybe_guard_entropy_collapse(0.05)   # below LO -> boost
+    assert cb._ent_boosted and cb.model.ent_coef == T.ENT_COLLAPSE_BOOST
+
+
+def test_entropy_guard_holds_boost_through_cooldown():
+    import train as T
+    cb = _make_guard_cb()
+    cb._maybe_guard_entropy_collapse(0.05)               # boost
+    cb._maybe_guard_entropy_collapse(0.40, kl=0.0)       # recovered immediately -> must NOT relax yet
+    assert cb._ent_boosted and cb.model.ent_coef == T.ENT_COLLAPSE_BOOST
+    for _ in range(T.ENT_BOOST_MIN_HOLD):                # ride out the min-hold
+        cb._maybe_guard_entropy_collapse(0.40, kl=0.0)
+    assert not cb._ent_boosted                           # now relaxes
+    assert cb.model.ent_coef == T.OPT_GUARDED['ent_coef']
+
+
+def test_entropy_guard_relax_is_kl_aware():
+    import train as T
+    cb = _make_guard_cb(target_kl=0.04)
+    cb._maybe_guard_entropy_collapse(0.05)               # boost
+    for _ in range(T.ENT_BOOST_MIN_HOLD + 1):
+        cb._maybe_guard_entropy_collapse(0.40, kl=0.20)  # recovered + hold elapsed BUT KL too high
+    assert cb._ent_boosted                               # do not hand back control mid-explosion
+    cb._maybe_guard_entropy_collapse(0.40, kl=0.0)       # KL safe now -> relax
+    assert not cb._ent_boosted
+
+
 # ----------------------------------------------- review-driven coverage (edge paths)
 
 class FlakyAPI(FakeAPI):
@@ -1038,10 +1600,13 @@ def test_calibration_seeds_phi_prev_with_calibrated_target_next_reset(monkeypatc
     monkeypatch.setattr(oe_mod, "APIController", CompletingAPI)
     env = OpenRCT2Env(verbose=0)
     env.skip_ride_testing = True         # calibration still captured on completion
-    env.reset()
-    assert env.close_pos is None         # provisional in the first episode
-    _drive_to_terminal(env)              # completes -> calibration captured
-    assert OpenRCT2Env._close_cache is not None
+    # Robust calibration: one completion no longer locks the anchor -- it takes several
+    # consistent (reproducible) closures, so a fluky first closure can't poison Phi.
+    for _ in range(OpenRCT2Env._CLOSE_MIN_CONSISTENT):
+        env.reset()
+        assert env.close_pos is None     # provisional until the anchor locks
+        _drive_to_terminal(env)          # completes -> a closing record is recorded
+    assert OpenRCT2Env._close_cache is not None   # enough agreeing closures -> locked
     captured_pos = list(OpenRCT2Env._close_cache["pos"])
     captured_dir = OpenRCT2Env._close_cache["dir"]
 
@@ -1083,8 +1648,8 @@ def test_corrupted_calibration_record_is_ignored():
     OpenRCT2Env._close_cache = None
     env = _bare_env(goal_position=(62, 66, 14))
     env._init_closing_target()
-    assert env.close_pos is None         # corrupted -> ignored, falls back to provisional
-    assert env.close_dir is None
+    assert env.close_pos is None         # corrupted -> ignored, falls back to provisional guide tile
+    assert env.close_dir == 0            # provisional dir is the deterministic station-entry axis (North)
 
 
 def test_quality_gate_only_fires_on_all_zero():
@@ -1108,10 +1673,11 @@ def test_corrupted_calibration_does_not_block_recalibration():
     assert env.close_pos is None                       # ignored -> provisional
     assert OpenRCT2Env._close_cache is None            # bad record not cached -> capture unblocked
 
-    # a subsequent real completion now calibrates (self-repair)
-    env.track_builder = SimpleNamespace(history=_completing_history())
+    # subsequent reproducible completions now calibrate (self-repair)
     env.loop_completed = True
-    env._maybe_capture_closing_geometry()
+    for _ in range(OpenRCT2Env._CLOSE_MIN_CONSISTENT):
+        env.track_builder = SimpleNamespace(history=_completing_history())
+        env._maybe_capture_closing_geometry()
     assert OpenRCT2Env._close_cache is not None
     assert OpenRCT2Env._close_cache["pos"] == [61, 68, 14]
 

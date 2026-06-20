@@ -63,6 +63,27 @@ class RewardParams:
     # lures the agent away from completing. 0 disables it (P1/P5).
     R_roundtrip: float = 0.0
     roundtrip_gain: float = 4.0    # min elevation (z above station) that counts as "climbed"
+    # Summit milestone: the reachable FIRST HALF of the round-trip — a one-time-per-episode
+    # bonus for chain-climbing >= roundtrip_gain above the station, INDEPENDENT of returning or
+    # completing. Pays the climb before the return so the climb-and-return conjunction becomes a
+    # gradient (place chain -> climb -> summit -> learn return -> round-trip). Kept strictly
+    # below R_roundtrip so the return is still worth learning. 0 disables it (P1/P5/P3/P4).
+    R_summit: float = 0.0
+    # Descent/return shaping (PBRS Phi term): a climb-gated potential that is 0 at/above the
+    # summit threshold height (STATION_HEIGHT + roundtrip_gain) -- so crossing the threshold
+    # injects no Phi jump and cannot re-pay the summit -- and rises to w_return as the head
+    # returns to station height. This is the dense downhill gradient that lets the agent LEARN
+    # the return (ascent had w_h; descent had no per-step shaping). 0 disables it (P1/P5); >0 in
+    # the hill phases 2-4. Part of the single policy-invariant Phi, so it telescopes.
+    w_return: float = 0.0
+    # Near-closure densification: a STEEP, local Phi bonus in the final `close_range` tiles (at
+    # station height) so the agent gets a strong gradient to COMMIT to the closing tile instead of
+    # drifting near it and churning. The gentle w_xy term (0.25/tile over 40) is too flat to drive
+    # the last-piece closure in a cold start. Pure state function -> PBRS-clean. 0 disables it; the
+    # curriculum turns it on in the completion phases 1-4 (off in phase 5, completion already mastered).
+    w_close: float = 0.0
+    close_range: float = 3.0       # XY tiles within which the bonus ramps (steeply) to w_close
+    close_z_range: float = 2.0     # height tolerance (z) for the bonus
     exc_target: float = 8.0
     exc_sigma: float = 1.0
     int_target: float = 5.5
@@ -82,6 +103,11 @@ class OpenRCT2Env(gym.Env):
     # (DummyVecEnv) and backed by a JSON file for SubprocVecEnv / later runs.
     _close_cache = None
     _CLOSE_CACHE_PATH = "logs/close_geometry.json"
+    # Robust calibration: accumulate completion closing-records and lock the anchor only once
+    # several completions AGREE (a reproducible closure, not a one-off fluke). Replaces locking
+    # the first completion, which poisoned Phi for whole runs when that closure was atypical.
+    _close_records = []
+    _CLOSE_MIN_CONSISTENT = 3
     def __init__(self, render_mode=None, host="localhost", port=8080, verbose=1):
         super(OpenRCT2Env, self).__init__()
         self.render_mode = render_mode
@@ -260,7 +286,12 @@ class OpenRCT2Env(gym.Env):
             'original_action': original_action if auto_backtracked else action,
             'collision_count': self.collision_count,
             'consecutive_failures': self.consecutive_failures,
-            'loop_completed': self.loop_completed
+            'loop_completed': self.loop_completed,
+            # Surface per-step metrics here so the training callback can log them from
+            # self.locals['infos'] instead of issuing SubprocVecEnv get_attr/env_method
+            # collectives (extra synchronized round-trips to all workers every step).
+            'track_length': self.track_length,
+            'current_distance': current_distance,
         }
         
         if self.verbose >= 2 and (self.steps % 10 == 0 or auto_backtracked):  # Log less frequently or when backtracking
@@ -288,8 +319,11 @@ class OpenRCT2Env(gym.Env):
                     if self.verbose >= 2:
                         print(f"🎢 Ride test started: {test_result.get('payload', '')}")
 
-                    # Smart polling for ride stats (max 10 seconds for training efficiency)
-                    ride_rating = self._poll_for_ride_stats(max_wait=10)
+                    # Smart polling for ride stats. Early-exits as soon as non-zero stats land,
+                    # so this cap only bites when the test never produces stats. Bounded at 5s
+                    # (was 10) to limit how long a completing worker can stall the synchronized
+                    # vector-step barrier in phase 5 (phases 1-4 skip ride testing entirely).
+                    ride_rating = self._poll_for_ride_stats(max_wait=5)
                 else:
                     if self.verbose >= 1:
                         print(f"⚠️ Failed to start ride test: {test_result.get('error')}")
@@ -336,6 +370,8 @@ class OpenRCT2Env(gym.Env):
                 'chain_count': sum(1 for h in self.track_builder.history if h.get('action') in (9, 10)),
                 'struct_bonus': getattr(self, '_last_struct_bonus', 0.0),
                 'roundtrip': float(getattr(self, '_roundtrip_awarded', False)),
+                'summit': float(getattr(self, '_summit_awarded', False)),
+                'return_potential': float(self._return_potential(self.reward_params)),
                 'max_gain': max((h['next_position'][2] - self.STATION_HEIGHT
                                  for h in self.track_builder.history), default=0.0),
                 'track_length': self.track_length,
@@ -418,21 +454,24 @@ class OpenRCT2Env(gym.Env):
         self.used_piece_types = set()  # Track variety of pieces used
         # Don't reset ride stats - keep them for learning across episodes
 
-        # Delete all rides to ensure clean state
-        # This is more reliable than tracking individual rides across resets
-        self.api_controller.delete_all_rides()
+        # Reset the episode. Prefer the batched server-side endpoint (one round-trip:
+        # demolish-all + create-ride + build-station) since under heavy parallelism every
+        # synchronized vector-step waits on the slowest worker's reset. Fall back to the
+        # legacy multi-call path for older plugins or on failure.
+        reset_episode = getattr(self.api_controller, "reset_episode", None)
+        payload = reset_episode(
+            station_length=self.station_length,
+            start=tuple(self.station_start_position),
+            start_direction=0,
+        ) if callable(reset_episode) else None
 
-        # Create new ride
-        ride_id = self.api_controller.create_ride()
-        if ride_id is None:
-            raise RuntimeError("Failed to create new ride")
-        
-        # Build initial station (this will update current_position to end of station)
-        station_built = self._build_initial_station()
-        if not station_built:
-            raise RuntimeError("Failed to build initial station")
+        if payload is not None:
+            self._apply_batched_reset(payload)
+        else:
+            self._legacy_reset()
 
         self._roundtrip_awarded = False  # round-trip milestone fires at most once per episode
+        self._summit_awarded = False     # summit milestone fires at most once per episode
 
         # Seed the PBRS potential at the true starting head (post-station-build).
         self._phi_prev = self._potential(self.reward_params)
@@ -472,15 +511,24 @@ class OpenRCT2Env(gym.Env):
             self._last_struct_bonus = self._structural_bonus(params)
             reward += self._last_struct_bonus
 
-        # Round-trip elevation milestone (completion-independent, once per episode): reward
-        # the climb-and-return motion so it can be learned as an add-on to the closure skill.
+        # Round-trip elevation milestone (completion-independent, once per episode): reward the
+        # CHAIN climb-and-return motion so it can be learned as an add-on to the closure skill.
+        # Keyed on _chain_max_gain (not all-history) so it requires an actual chain lift -- this
+        # matches the wrapper's chain_count>=1 qualifier and stops a non-chain climb from farming
+        # the bonus or burning the once-per-episode flag.
         if params.R_roundtrip > 0.0 and not getattr(self, "_roundtrip_awarded", False):
-            max_gain = max((h["next_position"][2] - self.STATION_HEIGHT
-                            for h in self.track_builder.history), default=0.0)
-            if (max_gain >= params.roundtrip_gain
+            if (self._chain_max_gain() >= params.roundtrip_gain
                     and self.current_position[2] <= self.STATION_HEIGHT + 1):
                 reward += params.R_roundtrip
                 self._roundtrip_awarded = True
+
+        # Summit milestone (the reachable first half of the round-trip, once per episode):
+        # reward chain-climbing to the threshold even before returning, so the climb is a
+        # gradient the agent can follow out of the flat-loop optimum.
+        if params.R_summit > 0.0 and not getattr(self, "_summit_awarded", False):
+            if self._chain_max_gain() >= params.roundtrip_gain:
+                reward += params.R_summit
+                self._summit_awarded = True
 
         if getattr(self, "verbose", 0) >= 2:
             print("Reward was: %.3f (Phi'=%.3f, dist: %.1f, track: %d)" % (
@@ -558,22 +606,81 @@ class OpenRCT2Env(gym.Env):
         OpenRCT2Env._close_cache = record
         return record
 
-    def _maybe_capture_closing_geometry(self):
-        """On the first completion, capture+persist the closing geometry.
+    @staticmethod
+    def _robust_close_anchor(records):
+        """A trustworthy closing anchor from accumulated completion records, or None.
 
-        Applied at the NEXT reset (never mid-episode) so Phi stays self-consistent
-        within an episode; a no-op once calibrated.
+        Locks an anchor only once >= _CLOSE_MIN_CONSISTENT completions share the SAME closing
+        direction -- i.e. the agent has REPRODUCED that closure, so it is a reliable target, not
+        a one-off fluke. Uses the per-axis median position and modal closing piece of that
+        direction group, so an occasional offset/odd closure is ignored. This replaces locking
+        the first (often atypical) completion, which poisoned Phi for entire runs.
         """
-        if OpenRCT2Env._close_cache is not None:
-            return
+        from collections import Counter
+        if len(records) < OpenRCT2Env._CLOSE_MIN_CONSISTENT:
+            return None
+        best_dir, best_n = Counter(r["dir"] for r in records).most_common(1)[0]
+        if best_n < OpenRCT2Env._CLOSE_MIN_CONSISTENT:
+            return None
+        group = [r for r in records if r["dir"] == best_dir]
+        pos = [int(round(float(np.median([r["pos"][i] for r in group])))) for i in range(3)]
+        action = Counter(r["action"] for r in group).most_common(1)[0][0]
+        track_type = Counter(r["track_type"] for r in group).most_common(1)[0][0]
+        return {"pos": pos, "dir": int(best_dir), "action": int(action), "track_type": int(track_type)}
+
+    def _maybe_capture_closing_geometry(self):
+        """Accumulate completion closing-geometries; lock Phi's anchor only once several
+        completions AGREE (see _robust_close_anchor), so a single fluky first closure can no
+        longer poison Phi for the rest of the run.
+
+        Applied at the NEXT reset (never mid-episode) so Phi stays self-consistent within an
+        episode; a no-op once the anchor is locked.
+        """
         if not getattr(self, "loop_completed", False):
             return
+        if not self.track_builder.history:
+            return
+        self._probe_log_closing(self.track_builder.history[-1])   # TEMP: empirical closing-geometry probe
+        if OpenRCT2Env._close_cache is not None:
+            return
         record = self._closing_record_from_history(self.track_builder.history)
-        if record is not None:
-            self._persist_close_cache(record)
+        if record is None:
+            return
+        # rebind to a new list (don't mutate the shared class default); cap so it cannot grow
+        # unbounded if completions never agree
+        OpenRCT2Env._close_records = (OpenRCT2Env._close_records + [record])[-50:]
+        anchor = self._robust_close_anchor(OpenRCT2Env._close_records)
+        if anchor is not None:
+            self._persist_close_cache(anchor)
             if getattr(self, "verbose", 0) >= 1:
-                print(f"[calibrate] closing geometry: head={record['pos']} dir={record['dir']} "
-                      f"closing_action={record['action']}")
+                print(f"[calibrate] closing geometry locked after "
+                      f"{len(OpenRCT2Env._close_records)} completions: "
+                      f"head={anchor['pos']} dir={anchor['dir']} closing_action={anchor['action']}")
+
+    def _probe_log_closing(self, entry):
+        """TEMP instrumentation: append every completion's full closing geometry to a JSONL beside
+        the calibration cache, so the deterministic closing connection (esp. next_direction, the
+        heading INTO the station) can be confirmed empirically from real completions.
+
+        Numpy ints must be coerced (json can't serialize int64), and this MUST NOT raise -- it is
+        optional instrumentation, so any failure is swallowed rather than crashing the env worker."""
+        def _i(v):
+            return None if v is None else int(v)
+        def _l(v):
+            return [int(x) for x in (v if v is not None else [])]
+        try:
+            path = os.path.join(os.path.dirname(self._CLOSE_CACHE_PATH) or ".", "closing_probe.jsonl")
+            with open(path, "a") as f:
+                f.write(json.dumps({
+                    "pos": _l(entry.get("position")),
+                    "dir": _i(entry.get("direction")),
+                    "action": _i(entry.get("action")),
+                    "track_type": _i(entry.get("track_type")),
+                    "next_position": _l(entry.get("next_position")),
+                    "next_direction": _i(entry.get("next_direction")),
+                }) + "\n")
+        except Exception:
+            pass   # instrumentation must never break training
 
     @staticmethod
     def _valid_close_record(cache):
@@ -588,14 +695,19 @@ class OpenRCT2Env(gym.Env):
             return False
 
     def _init_closing_target(self):
-        """Set close_pos/close_dir from calibration if known/valid, else provisional (heading off)."""
+        """Set close_pos/close_dir from calibration if known/valid, else the DETERMINISTIC station
+        geometry. close_dir defaults to the station-entry axis (North = _STATION_ENTRY_DIR), which a
+        closing-geometry probe confirmed is invariant (every completion enters BeginStation heading
+        North), so the Phi heading term guides the closing approach from step 1 instead of staying
+        off until a completion calibrates it (the chicken-and-egg that stalled Phase-1 bootstrap).
+        Calibration can still refine close_pos/close_dir from real completions."""
         cache = self._load_close_cache()
         if self._valid_close_record(cache):
             self.close_pos = list(cache["pos"])
             self.close_dir = int(cache["dir"])
         else:
-            self.close_pos = None
-            self.close_dir = None
+            self.close_pos = None                       # -> provisional guide tile (goal_position)
+            self.close_dir = self._STATION_ENTRY_DIR    # North: confirmed deterministic entry axis
 
     def _potential(self, params):
         """Potential Phi(s) for PBRS shaping (F = gamma*Phi(s') - Phi(s)).
@@ -620,15 +732,22 @@ class OpenRCT2Env(gym.Env):
         phi = (params.w_xy * (1.0 - m_xy)
                + params.w_z * (1.0 - m_z)
                + params.w_e * v)
-        # Discovery term: banked peak elevation gained above the station. A pure function of
-        # the removal-safe history (max recomputes lower on remove, so it telescopes), it makes
-        # climbing findable without penalizing the descent/return (max doesn't fall on the way
-        # down). The `if hist:` guard handles empty/None history (max() of empty would raise).
-        hist = getattr(self.track_builder, "history", None)
-        if hist:
-            max_gain = max(h["next_position"][2] - self.STATION_HEIGHT for h in hist)
-            max_gain = min(max(max_gain, 0.0), params.h_scale)
-            phi += params.w_h * (max_gain / params.h_scale)
+        # Discovery term: highest elevation banked via CHAIN-LIFT pieces (a plain climb of the
+        # same geometry earns nothing here). Keying on the chain flag makes action 9/10 strictly
+        # better than the identical-geometry plain climb 5/11, so the dense gradient points at the
+        # chain lift the Phase-2 gate actually counts. Pure function of the removal-safe history
+        # (max recomputes lower on remove, so it telescopes; descent doesn't lower the banked peak).
+        chain_gain = min(self._chain_max_gain(), params.h_scale)
+        phi += params.w_h * (chain_gain / params.h_scale)
+        # Descent/return shaping: 0 at/above the summit (no double-pay), rising on the way home.
+        phi += self._return_potential(params)
+        # Steep, local near-closure bonus: ramps to w_close only in the final close_range tiles at
+        # station height, so the agent gets a strong gradient to COMMIT to the closing tile that the
+        # gentle w_xy approach term (~0.25/tile) cannot supply in a cold start. Pure state function.
+        if params.w_close > 0.0:
+            near_xy = max(0.0, 1.0 - float(np.hypot(tx - px, ty - py)) / params.close_range)
+            near_z = max(0.0, 1.0 - abs(pz - tz) / params.close_z_range)
+            phi += params.w_close * near_xy * near_z
         close_dir = self._reward_target_direction()
         if close_dir is not None:
             cur = self.direction_vectors[self.current_direction]
@@ -637,6 +756,21 @@ class OpenRCT2Env(gym.Env):
             m_dir = (1.0 - cos_theta) / 2.0
             phi += params.w_dir * (1.0 - m_dir)
         return float(phi)
+
+    def _return_potential(self, params):
+        """Climb-gated descent-shaping component of Phi (PBRS).
+
+        Returns 0 until a CHAIN climb reaches roundtrip_gain, and 0 at/above the summit threshold
+        height (STATION_HEIGHT + roundtrip_gain) -- so the gate turning on at the summit injects NO
+        Phi jump (it cannot re-pay the summit milestone) -- then rises linearly to w_return as the
+        head returns to station height. Pure function of (current z, removal-safe _chain_max_gain),
+        so it telescopes like the rest of Phi. Exposed as a method so it doubles as a loggable
+        diagnostic (rewards/return_potential)."""
+        if params.w_return <= 0.0 or self._chain_max_gain() < params.roundtrip_gain:
+            return 0.0
+        threshold_z = self.STATION_HEIGHT + params.roundtrip_gain
+        progress = (threshold_z - self.current_position[2]) / params.roundtrip_gain
+        return float(params.w_return * min(max(progress, 0.0), 1.0))
 
     def _quality_bonus(self, excitement, intensity, nausea, params):
         """Graduated, bounded, non-negative ride-quality bonus in [0, R_quality_max].
@@ -655,6 +789,17 @@ class OpenRCT2Env(gym.Env):
         q_n = 0.5 * (1.0 + np.tanh(0.5 * (params.nausea_max - nausea) / params.nausea_tau))
         return float(params.R_quality_max
                      * (params.q_w_exc * q_e + params.q_w_int * q_i + params.q_w_nausea * q_n))
+
+    def _chain_max_gain(self):
+        """Highest elevation (z above station) reached via CHAIN-LIFT pieces (actions 9/10) in
+        the removal-safe history; 0.0 if none. Single source of truth for every chain-elevation
+        incentive — the discovery potential, the round-trip milestone, and the summit milestone
+        all key on this so a chain lift is strictly rewarded over an identical-geometry plain
+        climb (which shares the same track_type but lacks the chain flag the Phase-2 gate counts)."""
+        hist = getattr(self.track_builder, "history", None) or []
+        gains = [h["next_position"][2] - self.STATION_HEIGHT
+                 for h in hist if h.get("action") in (9, 10)]
+        return max(max(gains, default=0.0), 0.0)
 
     def _hill_quality(self, params):
         """Lift-hill / drop quality of the current track in [0, 1], from the removal-safe
@@ -948,6 +1093,31 @@ class OpenRCT2Env(gym.Env):
             print(f"⚠️ Ride test timeout after {max_wait}s")
         return {'excitement': 0, 'intensity': 0, 'nausea': 0}
     
+    def _apply_batched_reset(self, payload):
+        """Apply a server-side resetEpisode payload (one round-trip): set the post-station head,
+        preserve the station prefix in track_pieces (the legacy path appends one placeholder per
+        station piece, and downstream index math such as the station-shifted
+        track_pieces/height_history pairing relies on it), and seed the valid-piece cache so the
+        first action needs no separate getValidNextPieces round-trip."""
+        endpoint = payload["finalEndpoint"]
+        self.current_position = [endpoint["x"], endpoint["y"], endpoint["z"]]
+        self.current_direction = endpoint["direction"]
+        self.track_pieces = [0] * self.station_length
+        self.track_builder._cache_valid_from_payload(
+            {"validNextPieces": payload.get("validNextPieces")}
+        )
+
+    def _legacy_reset(self):
+        """Fallback reset for older plugins (no resetEpisode). Always starts from a clean slate --
+        delete_all_rides() first -- so a partially-applied batched reset cannot leave the ride in a
+        dirty state, then creates the ride and builds the station via individual API calls."""
+        self.api_controller.delete_all_rides()
+        ride_id = self.api_controller.create_ride()
+        if ride_id is None:
+            raise RuntimeError("Failed to create new ride")
+        if not self._build_initial_station():
+            raise RuntimeError("Failed to build initial station")
+
     def _build_initial_station(self):
         # Build station pieces
         current_x, current_y, current_z = self.station_start_position
@@ -1007,6 +1177,7 @@ class OpenRCT2Env(gym.Env):
     UPHILL_COST = 5          # Extra cost climbing without chain
     TURN_FRICTION = 1        # Extra friction for turns
     STATION_HEIGHT = 14      # z-coordinate of station
+    _STATION_ENTRY_DIR = 0   # cardinal dir the train enters BeginStation with (North; station built startDir=0)
 
     # How many recent positions to retain for the observation's distance-trend signal.
     POSITION_HISTORY_MAXLEN = 8
