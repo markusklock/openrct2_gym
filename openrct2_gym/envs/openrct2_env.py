@@ -417,13 +417,12 @@ class OpenRCT2Env(gym.Env):
         # API hardcodes the station start at [61, 66, 14] - we must match this
         self.station_start_position = [61, 66, 14]  # Where the first station piece is (matches API)
         self.current_position = self.station_start_position.copy()
-        # Set goal one tile east of station start to guide proper connection
-        # Agent needs to place a piece at this position to connect to BeginStation
-        self.goal_position = [
-            self.station_start_position[0] + 1,     # X + 1 (one tile east)
-            self.station_start_position[1],      # Same Y
-            self.station_start_position[2]       # Same Z
-        ]
+        # Goal = the station's dock endpoint itself. verify_goal_position.py confirmed the API
+        # closes the circuit AT station_start (heading startDir), NOT one tile east. The old
+        # +1-east offset assumed a straight-in closure; real loops dock from many approaches, so the
+        # invariant target is the dock endpoint, not a staging tile (which also made the provisional
+        # goal disagree with the calibrated close_pos by a tile).
+        self.goal_position = list(self.station_start_position)
         # Phi's geometric anchor: calibrated closing head if known, else provisional.
         self._init_closing_target()
         self.current_direction = 0
@@ -720,7 +719,9 @@ class OpenRCT2Env(gym.Env):
         deliberately UNCLIPPED so Phi keeps falling (0.3/z) at any altitude -- a clipped
         m_z left a zero-gradient plateau above +d_z where lost climbers wandered with no
         pull home. The heading term is omitted until the closing direction is calibrated
-        (avoids a wrong-heading reward wall).
+        (avoids a wrong-heading reward wall) and is COUPLED to the dock (gated by near_xy):
+        it only rewards aligning to the closing heading as the head docks, leaving the agent
+        free to turn while routing the loop.
         """
         target = self._reward_target_position()
         px, py, pz = self.current_position
@@ -744,17 +745,27 @@ class OpenRCT2Env(gym.Env):
         # Steep, local near-closure bonus: ramps to w_close only in the final close_range tiles at
         # station height, so the agent gets a strong gradient to COMMIT to the closing tile that the
         # gentle w_xy approach term (~0.25/tile) cannot supply in a cold start. Pure state function.
+        # Near-dock position proximity (steep ramp over the final close_range tiles). Used for the
+        # close bonus AND to COUPLE the heading term to the dock (below).
+        near_xy = (max(0.0, 1.0 - float(np.hypot(tx - px, ty - py)) / params.close_range)
+                   if params.close_range > 0.0 else 1.0)
         if params.w_close > 0.0:
-            near_xy = max(0.0, 1.0 - float(np.hypot(tx - px, ty - py)) / params.close_range)
             near_z = max(0.0, 1.0 - abs(pz - tz) / params.close_z_range)
             phi += params.w_close * near_xy * near_z
+        # Heading alignment to the dock entry axis, COUPLED to the dock via near_xy: ~0 while routing
+        # (so the agent is free to turn through the loop) and only rewarded for aligning to the
+        # closing heading AS the head docks. Additive (it never multiplies the pull-to-dock), so a
+        # curved closing approach -- which arrives a few tiles out heading some non-entry direction
+        # (verify_goal_position.py: head was heading W two tiles from the dock before the closing
+        # right-curve) -- is not penalised on its position bonus. Pure state function -> PBRS-clean.
+        # (Was a GLOBAL heading reward, which fought the mid-loop turns the agent must make.)
         close_dir = self._reward_target_direction()
         if close_dir is not None:
             cur = self.direction_vectors[self.current_direction]
             tgt = self.direction_vectors[close_dir]
             cos_theta = cur[0] * tgt[0] + cur[1] * tgt[1]  # unit cardinal vectors
             m_dir = (1.0 - cos_theta) / 2.0
-            phi += params.w_dir * (1.0 - m_dir)
+            phi += params.w_dir * (1.0 - m_dir) * near_xy
         return float(phi)
 
     def _return_potential(self, params):

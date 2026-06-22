@@ -66,7 +66,7 @@ This is a Gymnasium environment for training RL agents to build roller coasters 
 - Retry logic with exponential backoff for reliability
 
 **openrct2_gym/envs/improved_phased_curriculum_wrapper.py**: 5-phase curriculum learning
-- Phase 1: Return Practice (25 pieces) - Learn navigation
+- Phase 1: Return Practice (40 pieces) - Learn navigation
 - Phase 2: Lift Hill Building (40 pieces) - Learn chain lifts and energy
 - Phase 3: Drop & Turn (60 pieces) - Learn drops and turnarounds
 - Phase 4: Circuit Mastery (80 pieces) - Full integration
@@ -101,17 +101,26 @@ This is a Gymnasium environment for training RL agents to build roller coasters 
    - Energy estimation: chain lifts add energy, drops convert to speed
    - Pattern detection: rewards for lift hills, drops, turnarounds
    - Soft approach guidance: bonuses for correct height/direction near station
-   - **Deterministic closing heading**: the station is built with `startDir=0`, so every circuit
-     re-enters BeginStation heading North; Φ is handed this closing heading (`_STATION_ENTRY_DIR`)
-     from step 1. This is critical for Phase-1 bootstrap — otherwise the heading term stays off until
-     a completion calibrates it (a chicken-and-egg that stalled the cold start). The full closing
-     geometry is still refined from real completions (anchor locked only after ≥3 agree).
+   - **Goal = the station dock; deterministic, dock-coupled closing heading**: `goal_position` is the
+     station's dock endpoint itself (verified by `verify_goal_position.py` — the API closes the circuit
+     AT `station_start`, not one tile east as the old guide assumed). The station is built with
+     `startDir=0`, so every circuit re-enters BeginStation heading North; Φ is handed this closing
+     heading (`_STATION_ENTRY_DIR`) from step 1, and the heading reward is **coupled to the dock**
+     (gated by the near-closure factor) so the agent is free to turn while routing and only must align
+     as it docks. Deterministic heading is critical for Phase-1 bootstrap — otherwise the heading term
+     stays off until a completion calibrates it (a chicken-and-egg that stalled the cold start). The
+     full closing geometry is still refined from real completions (anchor locked only after ≥3 agree).
+   - **Phase-2 hill-discovery bootstrap**: the climb-and-return milestone is made *discoverable* by
+     annealing `roundtrip_gain` (1→1→4 z across sub-stages 2.1/2.2/2.3) plus a small one-time summit
+     breadcrumb (`R_summit` 120→60→0), with a raised early-Phase-2 entropy floor
+     (`PHASE2_EARLY_ENT_COEF=0.018` in `train.py`) so exploration survives long enough to find the climb.
    - Ride quality optimization in Phase 5 (Excitement 7-9, Intensity 4.5-6.5, Nausea <4.5)
 
 3. **5-Phase Curriculum Learning**:
    - Phases focus on specific skills before combining them
    - Trusts API's `isCircuitComplete` flag (no artificial restrictions)
-   - Progressive track length limits (25 → 40 → 60 → 80 → 120)
+   - Progressive track length limits (40 → 40 → 60 → 80 → 120; Phase 1 raised 25→40 to give the agent
+     room to route a loop back to the station before truncation)
 
 4. **Action Space**: 32 discrete actions (30 track pieces + remove + flat), with action masking to prevent invalid placements
 

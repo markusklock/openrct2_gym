@@ -52,6 +52,13 @@ OPT_PHASE1 = dict(target_kl=None, ent_coef=0.01)    # proven phase-1 bootstrap c
 # to keep chain lifts sampled without the explosion. (A proper adaptive entropy controller is
 # the principled fix if this floor proves insufficient.)
 OPT_GUARDED = dict(target_kl=0.04, ent_coef=0.015)
+# Early-Phase-2 entropy floor: the chain-hill discovery (2.1) AND integration (2.2) stages need
+# MORE exploration than the guarded base (0.015 under-explores -- it never samples, then abandons,
+# the chain), but a permanent 0.02 floor already "over-explored and exploded entropy (completion
+# destroyed)" (the OPT_GUARDED note above). 0.018 sits just under that redline; it is the resting
+# floor while phase==2 and phase2_stage in (1, 2), dropping back to OPT_GUARDED at stage 2.3. Watch
+# optim/ent_coef vs the completion rate and back toward 0.015 if closure degrades.
+PHASE2_EARLY_ENT_COEF = 0.018
 
 # Adaptive entropy-collapse guard (the principled fix the OPT_GUARDED note foreshadowed).
 # A run silently dies when entropy bleeds to ~0: the softmax saturates, KL->0, gradients
@@ -165,6 +172,8 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
         self._opt_guarded = False  # becomes True once OPT_GUARDED is armed (phase >= 2)
         self._ent_boosted = False  # True while the entropy-collapse guard holds ent_coef boosted
         self._ent_boost_calls = 0  # updates elapsed since the current boost armed (min-hold counter)
+        self._phase = 1            # latest curriculum phase seen on a step info (drives the ent floor)
+        self._phase2_stage = None  # latest Phase-2 sub-stage seen (raises the floor only in stage 2.1)
 
     def _maybe_arm_kl_guard(self, info):
         """Arm the guarded optimizer config (target_kl + raised ent_coef) the first time
@@ -180,13 +189,25 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
         # Raise the live ent_coef to the guarded base -- unless the collapse guard is actively
         # boosting, in which case the boost survives and recovery restores to this new base.
         if not self._ent_boosted:
-            self.model.ent_coef = OPT_GUARDED['ent_coef']
+            self.model.ent_coef = self._phase_base_ent_coef()
         print(f"🛡️ Phase 2 reached: armed guard {OPT_GUARDED}")
 
     def _phase_base_ent_coef(self):
-        """The ent_coef the entropy guard restores to: the guarded floor once phase 2 has
-        armed, else the phase-1 bootstrap value."""
-        return OPT_GUARDED['ent_coef'] if self._opt_guarded else OPT_PHASE1['ent_coef']
+        """The ent_coef the entropy guard restores to: the phase-1 bootstrap value until the guard
+        arms, then the guarded floor -- raised to PHASE2_EARLY_ENT_COEF through the early Phase-2
+        chain stages (sub-stages 2.1 discovery and 2.2 integration), dropping back at 2.3."""
+        if not self._opt_guarded:
+            return OPT_PHASE1['ent_coef']
+        if self._phase == 2 and self._phase2_stage in (1, 2):
+            return PHASE2_EARLY_ENT_COEF
+        return OPT_GUARDED['ent_coef']
+
+    def _rebaseline_ent_coef(self):
+        """Snap the resting ent_coef to the current phase base when NOT actively boosted, so a stage
+        advance (2.1 -> 2.2) lowers the floor on the next rollout. The collapse-guard owns ent_coef
+        while boosted, so a live boost is left untouched."""
+        if not self._ent_boosted:
+            self.model.ent_coef = self._phase_base_ent_coef()
 
     def _maybe_guard_entropy_collapse(self, entropy, kl=None):
         """Hysteresis controller that prevents the silent entropy-collapse freeze WITHOUT the
@@ -237,7 +258,9 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
             None if ent_loss is None else -float(ent_loss),
             kl=None if approx_kl is None else float(approx_kl),
         )
+        self._rebaseline_ent_coef()   # drop the resting floor when the stage advances (2.1 -> 2.2)
         self.logger.record('optim/ent_coef', float(self.model.ent_coef))
+        self.logger.record('optim/phase2_stage', float(self._phase2_stage or 0))
 
     def _on_step(self) -> bool:
         # Track total steps for throughput calculation
@@ -316,6 +339,12 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
                 # Phase-2 sub-stage diagnostics, and (in phases 2-3) 'qualified_rate' so
                 # progress past each lift-hill gate is visible in TensorBoard.
                 _info = self.locals['infos'][env_idx]
+                # Capture phase/stage BEFORE arming: _maybe_arm_kl_guard sets ent_coef via
+                # _phase_base_ent_coef (which keys on these), and it early-returns once armed -- so
+                # this independent capture is also what keeps _phase2_stage current for the
+                # rollout-end re-baseline after the guard is armed.
+                self._phase = _info.get('learning_phase', self._phase)
+                self._phase2_stage = _info.get('phase2_stage', self._phase2_stage)
                 self._maybe_arm_kl_guard(_info)
                 if 'curriculum_phase' in _info:
                     self.logger.record('curriculum/phase', _info['curriculum_phase'])
@@ -328,6 +357,8 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
                 for key in (
                     'phase2_stage',
                     'phase2_threshold',
+                    'phase2_roundtrip_gain',
+                    'phase2_summit_reward',
                     'phase2_summit_rate',
                     'phase2_roundtrip_rate',
                     'phase2_chain1_completion_rate',
@@ -509,7 +540,7 @@ def create_curriculum_masked_env(port: int, verbose: int = 0) -> gym.Env:
         phase4_success_threshold=0.30,  # 30% clean completions
         phase5_success_threshold=0.25,  # 25% with quality ratings
         window_size=50,
-        phase1_max_length=25,   # Return practice
+        phase1_max_length=40,   # Return practice (raised 25->40: give the agent room to finish the loop)
         phase2_max_length=40,   # Lift hill building
         phase3_max_length=60,   # Drop & turn
         phase4_max_length=80,   # Circuit mastery

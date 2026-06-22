@@ -15,7 +15,7 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
     """
     Wrapper that implements 5-phase curriculum learning with physics-aware rewards.
 
-    Phase 1: "Return Practice" (25 pieces) - Focus on navigation
+    Phase 1: "Return Practice" (40 pieces) - Focus on navigation
     Phase 2: "Lift Hill Building" (40 pieces) - Learn chain lifts and energy
     Phase 3: "Drop & Turn" (60 pieces) - Learn drops and turnarounds
     Phase 4: "Circuit Mastery" (80 pieces) - Full integration
@@ -31,7 +31,7 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                  phase5_success_threshold=0.25,  # 25% with quality ratings
                  window_size=100,
                  # Track length per phase
-                 phase1_max_length=25,
+                 phase1_max_length=40,
                  phase2_max_length=40,
                  phase3_max_length=60,
                  phase4_max_length=80,
@@ -135,8 +135,12 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                 # ~20% loop-closing it entered Phase 2 with and collapsed to climb-only.) The hill
                 # bonus stays additive on top. Strong discovery pull (w_h=6) finds the climb; dense
                 # descent shaping (w_return=6) makes the RETURN learnable; round-trip pays reaching
-                # station height. No summit payout (R_summit=0) so 'climb and stop' is never a
-                # satisfying terminal.
+                # station height. The annealed roundtrip_gain (1 z here and through 2.2; only 2.3
+                # demands the full 4-z hill) makes that round-trip reachable from a flat-loop policy,
+                # and a SMALL summit
+                # breadcrumb (R_summit=120) pays the climb itself so it is worth starting before the
+                # return is learned -- kept below the flat-completion floor (200) so 'climb and stop'
+                # still never out-pays closing the loop.
                 return RewardParams(
                     R_struct_max=250.0,
                     struct_chain_target=1,
@@ -144,20 +148,27 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                     struct_w_drop=0.0,
                     completion_hill_floor=0.2,
                     R_roundtrip=300.0,
-                    R_summit=0.0,
+                    roundtrip_gain=1.0,
+                    R_summit=120.0,
                     w_h=6.0,
                     w_return=6.0,
                     w_close=8.0,
                 )
-            if phase2_stage == 2:  # 2.2 one-chain completion: completion-gated, relax w_h
+            if phase2_stage == 2:  # 2.2 one-chain completion: integrate the chain INTO a closed
+                # loop. Keep the climb cheap (roundtrip_gain=1.0, not 2.0) so the 2.1 climb habit
+                # and its breadcrumbs survive the jump, and lower the flat floor (0.25 -> 0.15) so
+                # flat completion can't out-pay chain completion -- at 0.25 the agent collapsed onto
+                # flat closure here. (The early-Phase-2 entropy floor 0.018 is carried through 2.2
+                # in train.py.)
                 return RewardParams(
                     R_struct_max=250.0,
                     struct_chain_target=1,
                     struct_w_chain=1.0,
                     struct_w_drop=0.0,
-                    completion_hill_floor=0.25,
+                    completion_hill_floor=0.15,
                     R_roundtrip=300.0,
-                    R_summit=0.0,
+                    roundtrip_gain=1.0,
+                    R_summit=60.0,
                     w_h=4.0,
                     w_return=4.0,
                     w_close=8.0,
@@ -169,6 +180,7 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                 struct_w_drop=0.0,
                 completion_hill_floor=0.10,
                 R_roundtrip=200.0,
+                roundtrip_gain=4.0,
                 w_h=3.0,
                 w_return=3.0,
                 w_close=8.0,
@@ -558,6 +570,11 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
             if phase2_signals is not None:
                 info['phase2_stage'] = self.phase2_stage
                 info['phase2_threshold'] = self._phase2_threshold()
+                # Surface the live annealed schedule so the discoverability bootstrap is visible
+                # in TB next to summit/roundtrip rates (diagnostic-per-term).
+                stage_params = self._phase_reward_params(2, self.phase2_stage)
+                info['phase2_roundtrip_gain'] = stage_params.roundtrip_gain
+                info['phase2_summit_reward'] = stage_params.R_summit
                 info.update(phase2_signals)
                 info['phase2_summit_rate'] = (
                     sum(self.phase2_summit_results) / len(self.phase2_summit_results)

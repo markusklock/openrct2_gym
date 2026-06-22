@@ -172,6 +172,25 @@ def test_phi_increases_as_heading_aligns_with_close_dir():
     assert reversed_ < perp < aligned
 
 
+def test_heading_term_is_coupled_to_the_dock():
+    """Tier-2.1: the closing-heading reward is gated by near_xy, so it only matters AS the head
+    docks (within close_range), leaving the agent free to turn while routing the loop. AT the dock
+    aligned vs opposed differ by the full w_dir; FAR from it heading is irrelevant (a curved
+    closing approach arrives a few tiles out heading some non-entry direction -- it must not be
+    penalised there). Isolated to the heading term so the gating is unambiguous."""
+    geo = replace(RewardParams(), w_xy=0.0, w_z=0.0, w_e=0.0, w_h=0.0, w_close=0.0,
+                  w_return=0.0, w_dir=6.0, close_range=3.0)
+    at_aligned = _phi_env((0, 0, 14), direction=1, close_dir=1)._potential(geo)   # at dock, aligned
+    at_opposed = _phi_env((0, 0, 14), direction=3, close_dir=1)._potential(geo)   # at dock, opposed
+    far_aligned = _phi_env((10, 0, 14), direction=1, close_dir=1)._potential(geo) # 10 tiles out
+    far_opposed = _phi_env((10, 0, 14), direction=3, close_dir=1)._potential(geo)
+    assert at_aligned == pytest.approx(6.0)     # near_xy=1, aligned -> full w_dir
+    assert at_opposed == pytest.approx(0.0)     # near_xy=1, opposed -> 0
+    assert at_aligned > at_opposed              # heading matters AT the dock
+    assert far_aligned == pytest.approx(0.0) and far_opposed == pytest.approx(0.0)
+    assert far_aligned == far_opposed           # heading is free while routing (gated off)
+
+
 def test_phi_maximal_at_anchor():
     geo = RewardParams(w_e=0.0, w_h=0.0)   # isolate geometry (no energy/discovery contribution)
     at_anchor = _phi_env((0, 0, 14), direction=1)._potential(geo)
@@ -573,6 +592,17 @@ def test_completion_no_quality_when_disabled(monkeypatch):
     assert reward == pytest.approx(p.R_complete - phi_prev_before)   # no quality term
 
 
+def test_goal_position_is_the_station_dock(monkeypatch):
+    """Tier-1: goal_position is the station's dock endpoint (== station_start), not one tile east.
+    verify_goal_position.py confirmed the API closes the circuit AT station_start, so the old
+    +1-east staging tile mis-aimed the guide by a tile (and disagreed with the calibrated
+    close_pos)."""
+    monkeypatch.setattr(oe_mod, "APIController", CompletingAPI)
+    env = OpenRCT2Env(verbose=0)
+    env.reset()
+    assert list(env.goal_position) == list(env.station_start_position) == [61, 66, 14]
+
+
 # ----------------------------------------------- curriculum unification (tests 12,13,15)
 
 from openrct2_gym.envs.improved_phased_curriculum_wrapper import ImprovedPhasedCurriculumWrapper
@@ -615,7 +645,7 @@ def test_phase_reward_params_structural_per_phase():
     # phase 3/4 remove that floor once the bridge is done so structure is required.
     assert p1.completion_hill_floor == 1.0 and p5.completion_hill_floor == 1.0
     assert p2a.completion_hill_floor == pytest.approx(0.2)   # 2.1 restores the closure floor
-    assert p2b.completion_hill_floor == 0.25                 # 2.2 keeps a slightly higher floor
+    assert p2b.completion_hill_floor == 0.15                 # 2.2 lowered to widen the chain-vs-flat gap
     assert p2c.completion_hill_floor == 0.10
     assert p3.completion_hill_floor == 0.0 and p4.completion_hill_floor == 0.0
     # descent/return shaping (w_return): ON in the hill phases 2-4 to make the RETURN learnable,
@@ -762,23 +792,31 @@ def test_episode_metrics_expose_struct_and_height_diagnostics(monkeypatch):
 
 # ---- completion gating (force hills: a flat loop is worth little in phases 2-4)
 
-def _complete_payoff(params, chains=0, drops=0):
-    """Total reward for a completing step under `params`, with _phi_prev=0 so the PBRS
-    term is 0 and only the completion payoff (gated R_complete + struct bonus) remains."""
+def _complete_payoff(params, chains=0, drops=0, isolate=False):
+    """Total reward for a completing step under `params`, with _phi_prev=0 so the PBRS term is 0
+    and only the completion payoff (gated R_complete + struct bonus) remains. With isolate=True
+    the once-per-episode summit/roundtrip latches are pre-burned so the milestones don't add on
+    top (a fresh chain completion at a low roundtrip_gain banks them too) -- use it to assert the
+    isolated gated-completion magnitude."""
     env = _struct_env(chains=chains, drops=drops)
     env.reward_params = params
     env._phi_prev = 0.0
     env.loop_completed = True
+    if isolate:
+        env._summit_awarded = True
+        env._roundtrip_awarded = True
     return env._calculate_reward(True, 0)
 
 
-def test_completion_gate_keeps_small_flat_floor_in_phase2_stage2():
-    # Stage 2.1 restores the closure floor (0.2, see test_phase2_stage1_restores_closure_floor);
-    # stage 2.2 keeps a slightly higher floor (0.25) once the gate is completion-based again.
+def test_completion_gate_lowers_flat_floor_in_phase2_stage2():
+    # Stage 2.2 LOWERS the flat-completion floor to 0.15 (was 0.25) to widen the chain-vs-flat gap
+    # after the agent collapsed onto flat completion here. Completion is isolated from the
+    # summit/roundtrip milestones (which a fresh 1-chain completion also banks now that gain=1) to
+    # check the gated completion magnitude itself.
     P = ImprovedPhasedCurriculumWrapper._phase_reward_params(2, phase2_stage=2)
-    flat = _complete_payoff(P, chains=0)
-    full = _complete_payoff(P, chains=1)
-    assert flat == pytest.approx(250.0)        # floor=.25: keeps the learned closing skill alive
+    flat = _complete_payoff(P, chains=0, isolate=True)
+    full = _complete_payoff(P, chains=1, isolate=True)
+    assert flat == pytest.approx(150.0)        # floor=.15: a hill-less close pays less now
     assert full == pytest.approx(1250.0)       # R_complete * 1.0 + struct 250
     assert flat < full
 
@@ -810,24 +848,37 @@ def test_phase2_stage1_restores_closure_floor():
     flat-close paid 50 < the ~100 a climb-and-stop banked, so the agent abandoned closure.)"""
     W = ImprovedPhasedCurriculumWrapper
     assert W._phase_reward_params(2, phase2_stage=1).completion_hill_floor == pytest.approx(0.2)
-    assert W._phase_reward_params(2, phase2_stage=2).completion_hill_floor == 0.25  # unchanged
+    assert W._phase_reward_params(2, phase2_stage=2).completion_hill_floor == 0.15  # lowered: widen chain gap
     assert W._phase_reward_params(2, phase2_stage=3).completion_hill_floor == 0.10  # unchanged
     flat = _complete_payoff(W._phase_reward_params(2, phase2_stage=1), chains=0)
     assert flat == pytest.approx(200.0)       # closing a flat loop is worth something again
 
 
-def test_phase2_summit_payout_disabled_in_bridge_stages():
-    """Closure-first: the one-shot R_summit payout is REMOVED (0) so 'climb and stop' is no
-    longer a satisfying terminal that out-pays closing. The dense w_h discovery term still
-    makes the first climb learnable, and R_roundtrip rewards the climb-and-descend. (The
-    phase2_summit_rate diagnostic is unaffected -- it is computed from chain gain, not this
-    payout; see test_phase2_summit_signal_tracks_chain_climb.)"""
+def test_phase2_summit_breadcrumb_schedule():
+    """Discoverability bootstrap: R_summit pays the chain CLIMB itself as a small breadcrumb,
+    tapering 120 -> 60 -> 0 across the bridge stages (the climb is learned by 2.3). It stays
+    strictly below R_roundtrip so the RETURN is still worth more than stopping at the summit
+    (and below the flat-completion floor so 'climb and stop' never out-pays closing the loop)."""
     W = ImprovedPhasedCurriculumWrapper
-    assert W._phase_reward_params(2, phase2_stage=1).R_summit == 0.0
-    assert W._phase_reward_params(2, phase2_stage=2).R_summit == 0.0
-    assert W._phase_reward_params(2, phase2_stage=3).R_summit == 0.0
+    summit = [W._phase_reward_params(2, phase2_stage=s).R_summit for s in (1, 2, 3)]
+    assert summit == [120.0, 60.0, 0.0]
+    assert summit == sorted(summit, reverse=True)              # tapering
+    for s in (1, 2, 3):
+        P = W._phase_reward_params(2, phase2_stage=s)
+        assert P.R_summit < P.R_roundtrip                      # return stays worth learning
     assert W._phase_reward_params(1).R_summit == 0.0
     assert W._phase_reward_params(5).R_summit == 0.0
+
+
+def test_phase2_roundtrip_gain_anneals_monotonically():
+    """Make the existing climb-and-return milestone DISCOVERABLE: the required chain-climb stays
+    a single piece's worth (1 z) through stages 2.1 AND 2.2 -- so the climb habit and its
+    breadcrumbs survive the integration step -- and only 2.3 demands the full 4-z hill."""
+    W = ImprovedPhasedCurriculumWrapper
+    gains = [W._phase_reward_params(2, phase2_stage=s).roundtrip_gain for s in (1, 2, 3)]
+    assert gains == [1.0, 1.0, 4.0]
+    assert gains == sorted(gains)                              # monotone non-decreasing
+    assert gains[-1] == RewardParams().roundtrip_gain          # stage 2.3 == default 4-z hill
 
 
 def test_completion_not_gated_in_phase1():
@@ -905,6 +956,72 @@ def test_roundtrip_requires_chain_lift_not_plain_climb():
     r = env._calculate_reward(True, 0)
     assert r == pytest.approx(p.gamma * env._potential(p))   # no milestone
     assert env._roundtrip_awarded is False                   # flag not burned
+
+
+def test_phase2_roundtrip_fires_at_each_stages_annealed_gain():
+    """The annealed gain is what makes the round-trip reachable: a 1-z chain climb-and-return
+    qualifies the milestone in stages 2.1 AND 2.2 (gain 1), but not 2.3 (gain 4); a full 4-z
+    hill qualifies in every stage."""
+    W = ImprovedPhasedCurriculumWrapper
+    for stage, should_fire in [(1, True), (2, True), (3, False)]:
+        P = W._phase_reward_params(2, phase2_stage=stage)
+        env = _roundtrip_env(peak_z=15, head_z=14, p=P)       # one chain piece (+1 z), returned
+        env._summit_awarded = False
+        env._calculate_reward(True, 0)
+        assert env._roundtrip_awarded is should_fire
+    for stage in (1, 2, 3):                                    # a 4-z hill qualifies everywhere
+        P = W._phase_reward_params(2, phase2_stage=stage)
+        env = _roundtrip_env(peak_z=18, head_z=14, p=P)
+        env._summit_awarded = False
+        env._calculate_reward(True, 0)
+        assert env._roundtrip_awarded is True
+
+
+def test_phase2_1_summit_breadcrumb_fires_once():
+    """Stage 2.1 pays R_summit the first time the chain climb reaches the (annealed) gain,
+    exactly once per episode -- the breadcrumb that makes the climb worth starting before the
+    return is learned. Isolated here with the head still elevated, so only summit (not the
+    round-trip) fires."""
+    P = ImprovedPhasedCurriculumWrapper._phase_reward_params(2, phase2_stage=1)  # R_summit 120
+    env = _roundtrip_env(peak_z=20, head_z=20, p=P)           # climbed, NOT returned -> summit only
+    env._summit_awarded = False
+    r1 = env._calculate_reward(True, 0)
+    assert env._summit_awarded is True
+    assert env._roundtrip_awarded is False                    # head still elevated
+    assert r1 == pytest.approx(P.gamma * env._potential(P) + 120.0)
+    env._phi_prev = 0.0
+    r2 = env._calculate_reward(True, 0)                        # once-per-episode: no re-award
+    assert r2 == pytest.approx(P.gamma * env._potential(P))
+
+
+def test_flat_completion_below_hill_completion_all_stages():
+    """Closure stays dominant: in every bridge stage a hill completion out-pays a flat one, so
+    the agent keeps closing the loop -- only now the biggest reward requires the hill too.
+    (Magnitudes include the freshly-latched summit/roundtrip milestones, hence an inequality.)"""
+    W = ImprovedPhasedCurriculumWrapper
+    for stage in (1, 2, 3):
+        P = W._phase_reward_params(2, phase2_stage=stage)
+        assert _complete_payoff(P, chains=0) < _complete_payoff(P, chains=3)
+
+
+def test_phase2_info_exposes_schedule_diagnostics(monkeypatch):
+    """Diagnostic-per-term: the live annealed schedule (roundtrip_gain, R_summit) is surfaced on
+    the Phase-2 terminal info so the bootstrap is visible in TensorBoard next to the summit/
+    roundtrip rates."""
+    monkeypatch.setattr(oe_mod, "APIController", CompletingAPI)
+    base = OpenRCT2Env(verbose=0)
+    wrapper = ImprovedPhasedCurriculumWrapper(base, verbose=0)
+    wrapper.current_phase = 2
+    wrapper.phase2_stage = 1
+    wrapper._update_phase_settings()
+    wrapper.reset()
+    info = {}
+    for _ in range(12):
+        _, _, terminated, truncated, info = wrapper.step(9)   # chain lifts -> completes
+        if terminated or truncated:
+            break
+    assert info.get('phase2_roundtrip_gain') == 1.0
+    assert info.get('phase2_summit_reward') == 120.0
 
 
 def test_roundtrip_disabled_and_below_completion_per_phase():
@@ -1528,6 +1645,8 @@ def _make_guard_cb(ent_coef=0.015, target_kl=0.04):
     cb._opt_guarded = True            # phase >= 2: base restores to the guarded floor
     cb._ent_boosted = False
     cb._ent_boost_calls = 0
+    cb._phase = 1                     # __init__ defaults (skipped by __new__); non-2.1 -> guarded base
+    cb._phase2_stage = None
     cb.model = SimpleNamespace(ent_coef=ent_coef, target_kl=target_kl)
     return cb
 

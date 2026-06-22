@@ -290,6 +290,69 @@ def test_entropy_collapse_guard_restore_tracks_phase2_base():
     assert cb._ent_boosted is False
 
 
+def test_phase_base_ent_coef_is_early_phase2_aware():
+    """The entropy FLOOR the collapse-guard restores to is raised through the early Phase-2
+    discovery+integration stages (2.1 AND 2.2, where the agent must keep building chains) and
+    drops back to the guarded base at stage 2.3 / later phases."""
+    from types import SimpleNamespace
+    cb = T.ParallelCurriculumMaskableCallback(n_envs=2)
+    cb.model = SimpleNamespace(target_kl=None, ent_coef=0.01)
+    assert cb._phase_base_ent_coef() == T.OPT_PHASE1['ent_coef']     # not guarded -> bootstrap floor
+    cb._opt_guarded = True
+    cb._phase, cb._phase2_stage = 2, 1
+    assert cb._phase_base_ent_coef() == T.PHASE2_EARLY_ENT_COEF      # raised floor in stage 2.1
+    cb._phase2_stage = 2
+    assert cb._phase_base_ent_coef() == T.PHASE2_EARLY_ENT_COEF      # ...and stage 2.2 (integration)
+    cb._phase2_stage = 3
+    assert cb._phase_base_ent_coef() == T.OPT_GUARDED['ent_coef']    # stage 2.3: back to guarded base
+    cb._phase, cb._phase2_stage = 3, None
+    assert cb._phase_base_ent_coef() == T.OPT_GUARDED['ent_coef']    # later phases: guarded base
+
+
+def test_arming_kl_guard_lands_on_early_phase2_floor():
+    """Arming at the phase-1->2 transition must set ent_coef via the phase-aware base, so a
+    stage-2.1 (or 2.2) arm lands on the raised early-Phase-2 floor (0.018), not the bare guarded
+    base. (The _phase_base_ent_coef change alone is not enough -- arming sets model.ent_coef.)"""
+    from types import SimpleNamespace
+    for stage in (1, 2):
+        cb = T.ParallelCurriculumMaskableCallback(n_envs=2)
+        cb.model = SimpleNamespace(target_kl=None, ent_coef=0.01)
+        cb._phase, cb._phase2_stage = 2, stage   # captured before arming, as _on_step does
+        cb._maybe_arm_kl_guard({'learning_phase': 2})
+        assert cb.model.target_kl == T.OPT_GUARDED['target_kl']
+        assert cb.model.ent_coef == T.PHASE2_EARLY_ENT_COEF
+
+    cb3 = T.ParallelCurriculumMaskableCallback(n_envs=2)
+    cb3.model = SimpleNamespace(target_kl=None, ent_coef=0.01)
+    cb3._phase, cb3._phase2_stage = 2, 3
+    cb3._maybe_arm_kl_guard({'learning_phase': 2})
+    assert cb3.model.ent_coef == T.OPT_GUARDED['ent_coef']    # stage 2.3 arms at the guarded base
+
+
+def test_rebaseline_ent_coef_drops_floor_after_stage_advance():
+    """The raised early-Phase-2 floor (0.018) is held through stages 2.1 AND 2.2, then drops to
+    0.015 when stage 2.3 begins -- the re-baseline applies it on the next rollout (the collapse
+    guard only restores on recovery). A live entropy BOOST is never clobbered."""
+    from types import SimpleNamespace
+    cb = T.ParallelCurriculumMaskableCallback(n_envs=2)
+    cb.model = SimpleNamespace(target_kl=0.04, ent_coef=0.01)
+    cb._opt_guarded = True
+    cb._phase, cb._phase2_stage = 2, 1
+    cb._rebaseline_ent_coef()
+    assert cb.model.ent_coef == T.PHASE2_EARLY_ENT_COEF
+    cb._phase2_stage = 2                          # still the raised floor through 2.2
+    cb._rebaseline_ent_coef()
+    assert cb.model.ent_coef == T.PHASE2_EARLY_ENT_COEF
+    cb._phase2_stage = 3                          # drops to the guarded base at 2.3
+    cb._rebaseline_ent_coef()
+    assert cb.model.ent_coef == T.OPT_GUARDED['ent_coef']
+    cb._phase2_stage = 1                          # a live boost must survive the re-baseline
+    cb._ent_boosted = True
+    cb.model.ent_coef = T.ENT_COLLAPSE_BOOST
+    cb._rebaseline_ent_coef()
+    assert cb.model.ent_coef == T.ENT_COLLAPSE_BOOST
+
+
 def test_entropy_collapse_guard_ignores_missing_entropy():
     """Before the first train() the logged entropy is absent; the guard must no-op."""
     from types import SimpleNamespace

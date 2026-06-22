@@ -109,7 +109,7 @@ reward = F + sparse terms,    where   F = γ·Φ(s′) − Φ(s)
 
 ### Closing target: deterministic heading + calibrated refinement
 
-`goal_position` is only a guide tile; the game itself decides completion via its `isCircuitComplete` flag. The **closing heading is deterministic from the station build** — the station is created with `startDir=0`, so every circuit re-enters BeginStation heading North — and Φ is handed this heading (`_STATION_ENTRY_DIR`) from step 1. This is what lets the agent learn the final connection during the **Phase-1 cold start**: previously the heading term stayed disabled until the *first* completion calibrated it, a chicken-and-egg (no heading → no completion → no heading) that stalled bootstrapping. The full closing geometry (the exact pre-close head position/direction) is still refined from real completions and cached to `logs/close_geometry.json`, but the anchor is **locked only after ≥3 completions agree** (median position, modal direction) so a single fluky closure can't poison Φ for the rest of the run.
+`goal_position` is the station's **dock endpoint** (verified by `verify_goal_position.py`: the API closes the circuit at `station_start`, so the guide points exactly at the closable tile — it was previously a tile off); the game itself decides completion via its `isCircuitComplete` flag. The **closing heading is deterministic from the station build** — the station is created with `startDir=0`, so every circuit re-enters BeginStation heading North — and Φ is handed this heading (`_STATION_ENTRY_DIR`) from step 1, the heading reward **coupled to the dock** (gated by the near-closure factor) so the agent routes freely and only aligns as it docks. This is what lets the agent learn the final connection during the **Phase-1 cold start**: previously the heading term stayed disabled until the *first* completion calibrated it, a chicken-and-egg (no heading → no completion → no heading) that stalled bootstrapping. The full closing geometry (the exact pre-close head position/direction) is still refined from real completions and cached to `logs/close_geometry.json`, but the anchor is **locked only after ≥3 completions agree** (median position, modal direction) so a single fluky closure can't poison Φ for the rest of the run.
 
 ### Energy model (feeds Φ's viability term)
 
@@ -126,7 +126,7 @@ All five phases share the **same reward and the same Φ**; they differ only in t
 
 | Phase | Name | Max Pieces | What it adds | Advancement |
 |-------|------|------------|--------------|-------------|
-| 1 | Return Practice | 25 | completion only | 50% completion |
+| 1 | Return Practice | 40 | completion only | 50% completion |
 | 2 | Lift Hill Building | 40 | staged chain-lift bridge | 2.1 one-chain roundtrip, 2.2 one-chain completion, 2.3 three-chain completion |
 | 3 | Drop & Turn | 60 | completion with lift/drop structure | 35% with chain lifts and a drop |
 | 4 | Circuit Mastery | 80 | completion only | 30% completion |
