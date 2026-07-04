@@ -9,3 +9,7 @@ venv/
 # Training artifacts
 logs_parallel_curriculum_masked_*/
 *_tensorboard/
+
+# Runtime state (loop library, calibration, probe logs)
+logs/
+training_run.log

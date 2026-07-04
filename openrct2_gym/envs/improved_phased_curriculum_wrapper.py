@@ -8,7 +8,8 @@ from collections import deque
 from contextlib import contextmanager
 from typing import Dict, Any, Tuple
 
-from openrct2_gym.envs.openrct2_env import RewardParams
+from openrct2_gym.envs.openrct2_env import OpenRCT2Env, RewardParams
+from openrct2_gym.envs.warm_start import LoopLibrary, WarmStartAnnealer, WarmStartPlan
 
 
 class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
@@ -42,7 +43,14 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                  verbose=1,
                  # Phase 2 sub-stage thresholds (kept at the end for positional compatibility)
                  phase2_roundtrip_threshold=0.30,  # 30% one-chain climb-and-return
-                 phase2_chain1_success_threshold=0.30):  # 30% completion with >=1 chain
+                 phase2_chain1_success_threshold=0.30,  # 30% completion with >=1 chain
+                 # Warm-start reverse curriculum (see warm_start.py). None for the library
+                 # path defers to OpenRCT2Env._LOOP_LIBRARY_PATH at construction, so test
+                 # fixtures that isolate the env's harvest file isolate the wrapper too.
+                 warm_start_enabled=True,
+                 loop_library_path=None,
+                 p_cold=0.25,
+                 warm_k_init=3):
         """
         Args:
             env: Base OpenRCT2 environment
@@ -76,8 +84,19 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
         self.phase5_current_length = phase5_initial_length
         self.phase5_increase_step = phase5_increase_step
 
-        # Performance tracking
+        # Warm-start reverse curriculum: the wrapper owns the per-worker annealer and a
+        # read-view of the shared loop library (the env writes harvests to the same file).
+        # Gate windows below are COLD-ONLY; scaffolded outcomes feed the annealer instead.
+        self.warm_start_enabled = warm_start_enabled
+        self._loop_library = LoopLibrary(loop_library_path or OpenRCT2Env._LOOP_LIBRARY_PATH)
+        self._annealer = WarmStartAnnealer(k_init=warm_k_init, p_cold=p_cold)
+        self._current_plan = WarmStartPlan(prefix=[], k=0, loop_len=0, cold=True)
+
+        # Performance tracking. episode_results (and the qualified/phase-2 windows below)
+        # see only COLD episodes -- a scaffolded win must never advance a phase gate.
         self.episode_results = deque(maxlen=window_size)
+        self.scaffold_results = deque(maxlen=window_size)
+        self._cold_flags = deque(maxlen=window_size)
         self.episode_qualified_results = deque(maxlen=window_size)
         self.phase2_summit_results = deque(maxlen=window_size)
         self.phase2_roundtrip_results = deque(maxlen=window_size)
@@ -115,7 +134,37 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
         return env
 
     @staticmethod
+    def _validate_completion_first(params, label):
+        """Completion-first invariant: the once-per-episode climb milestones (R_roundtrip + R_summit)
+        are earnable WITHOUT closing the loop, so they must never out-pay completing it -- otherwise
+        the agent farms the milestone and abandons closure. (Observed at 1.1M steps: Phase-2.3
+        completion collapsed 0.44 -> 0.08 while struct_bonus stayed 0, because R_roundtrip=200 beat
+        the 0.10*1000=100 a flat close paid.) Two checks:
+          * ALWAYS: milestones < R_complete -- a perfect (full-hill) completion must beat farming.
+          * when completion_hill_floor > 0: milestones < floor*R_complete -- even a FLAT close must
+            beat farming. (floor==0 phases pay nothing for a flat close by design and rely on the
+            agent already producing hill-ful completions; only the first check applies there.)"""
+        milestones = params.R_roundtrip + params.R_summit
+        assert milestones < params.R_complete, (
+            f"{label}: climb milestones {milestones} >= R_complete {params.R_complete} "
+            f"-- not closing the loop can out-pay even a perfect completion")
+        if params.completion_hill_floor > 0.0:
+            flat = params.completion_hill_floor * params.R_complete
+            assert milestones < flat, (
+                f"{label}: climb milestones {milestones} >= flat-completion floor {flat} "
+                f"({params.completion_hill_floor}*{params.R_complete}) -- not closing out-pays a flat close")
+
+    @staticmethod
     def _phase_reward_params(phase, phase2_stage=1):
+        """Per-phase RewardParams, validated for the completion-first invariant (see
+        _validate_completion_first). The raw per-phase config lives in _phase_reward_params_raw."""
+        params = ImprovedPhasedCurriculumWrapper._phase_reward_params_raw(phase, phase2_stage)
+        ImprovedPhasedCurriculumWrapper._validate_completion_first(
+            params, f"phase {phase}" + (f".{phase2_stage}" if phase == 2 else ""))
+        return params
+
+    @staticmethod
+    def _phase_reward_params_raw(phase, phase2_stage=1):
         """Per-phase RewardParams. The PBRS geometry weights (w_xy/w_z/w_dir/w_e) are fixed,
         but the elevation-discovery term (w_h) is ON only in the hill-building phases 2-4 and
         OFF in phase 1 (pure completion) and phase 5 (quality): an always-on climb pull traps
@@ -138,52 +187,61 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                 # station height. The annealed roundtrip_gain (1 z here and through 2.2; only 2.3
                 # demands the full 4-z hill) makes that round-trip reachable from a flat-loop policy,
                 # and a SMALL summit
-                # breadcrumb (R_summit=120) pays the climb itself so it is worth starting before the
-                # return is learned -- kept below the flat-completion floor (200) so 'climb and stop'
-                # still never out-pays closing the loop.
+                # breadcrumb (R_summit) pays the climb itself so it is worth starting before the
+                # return is learned. CRITICAL: R_roundtrip + R_summit (80+40=120) is kept BELOW the
+                # flat-completion floor (0.2*1000=200) so 'climb and stop' never out-pays closing the
+                # loop (_validate_completion_first enforces this). The dense PBRS shaping (w_h=6,
+                # w_return=6), not the sparse milestone, is what teaches the climb.
                 return RewardParams(
                     R_struct_max=250.0,
                     struct_chain_target=1,
                     struct_w_chain=1.0,
                     struct_w_drop=0.0,
                     completion_hill_floor=0.2,
-                    R_roundtrip=300.0,
+                    R_roundtrip=80.0,
                     roundtrip_gain=1.0,
-                    R_summit=120.0,
+                    R_summit=40.0,
                     w_h=6.0,
                     w_return=6.0,
                     w_close=8.0,
+                    w_route=3.0,
                 )
             if phase2_stage == 2:  # 2.2 one-chain completion: integrate the chain INTO a closed
                 # loop. Keep the climb cheap (roundtrip_gain=1.0, not 2.0) so the 2.1 climb habit
                 # and its breadcrumbs survive the jump, and lower the flat floor (0.25 -> 0.15) so
                 # flat completion can't out-pay chain completion -- at 0.25 the agent collapsed onto
-                # flat closure here. (The early-Phase-2 entropy floor 0.018 is carried through 2.2
-                # in train.py.)
+                # flat closure here. Milestones (60+30=90) stay below the flat floor (0.15*1000=150)
+                # so closing always wins. (The early-Phase-2 entropy floor 0.018 is carried through
+                # 2.2 in train.py.)
                 return RewardParams(
                     R_struct_max=250.0,
                     struct_chain_target=1,
                     struct_w_chain=1.0,
                     struct_w_drop=0.0,
                     completion_hill_floor=0.15,
-                    R_roundtrip=300.0,
+                    R_roundtrip=60.0,
                     roundtrip_gain=1.0,
-                    R_summit=60.0,
+                    R_summit=30.0,
                     w_h=4.0,
                     w_return=4.0,
                     w_close=8.0,
+                    w_route=3.0,
                 )
-            return RewardParams(  # 2.3 tighten to >=3 chains; discovery back to the modest default
+            # 2.3 tighten to >=3 chains; discovery back to the modest default. R_roundtrip (60) stays
+            # below the flat floor (0.10*1000=100) -- this is the stage that broke: at R_roundtrip=200
+            # > 100 the agent farmed the climb-and-return milestone and stopped closing the loop.
+            return RewardParams(
                 R_struct_max=250.0,
                 struct_chain_target=3,
                 struct_w_chain=1.0,
                 struct_w_drop=0.0,
                 completion_hill_floor=0.10,
-                R_roundtrip=200.0,
-                roundtrip_gain=4.0,
+                R_roundtrip=60.0,
+                roundtrip_gain=3.0,   # == chain gain of the canonical hill (crest isn't chained)
                 w_h=3.0,
                 w_return=3.0,
                 w_close=8.0,
+                w_route=3.0,
             )
         if phase == 3:  # gate: >=2 chains AND drop
             return RewardParams(
@@ -195,6 +253,7 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                 R_roundtrip=100.0,
                 w_return=3.0,
                 w_close=8.0,
+                w_route=3.0,
             )
         if phase == 4:  # integration: hill + drop
             return RewardParams(
@@ -206,8 +265,10 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                 R_roundtrip=100.0,
                 w_return=3.0,
                 w_close=8.0,
+                w_route=3.0,
             )
-        return RewardParams(w_h=0.0, w_close=8.0)  # phase 1: struct+discovery off; closure densified
+        # phase 1: struct+discovery off; closure densified; route term guides the detour
+        return RewardParams(w_h=0.0, w_close=8.0, w_route=3.0)
 
     @staticmethod
     def _history_chain_count(base_env):
@@ -255,9 +316,16 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
         summit_awarded = bool(getattr(base_env, '_summit_awarded', False)) or (
             chain_gain >= params.roundtrip_gain
         )
+        # Mirror of the env's award: near station height AND strictly below the climb bar
+        # (at gain=1 the +1 tolerance otherwise contains the summit -- no return required).
+        station_z = getattr(base_env, 'STATION_HEIGHT', 14)
+        position = getattr(base_env, 'current_position', None)
+        below_bar = (position is not None and len(position) >= 3
+                     and position[2] < station_z + params.roundtrip_gain)
         roundtrip_awarded = bool(getattr(base_env, '_roundtrip_awarded', False)) or (
             chain_gain >= params.roundtrip_gain
             and self._returned_near_station_height(base_env)
+            and below_bar
         )
 
         return {
@@ -422,6 +490,8 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
 
     def _clear_phase_windows(self):
         self.episode_results.clear()
+        self.scaffold_results.clear()
+        self._cold_flags.clear()
         self.episode_qualified_results.clear()
         self.phase2_summit_results.clear()
         self.phase2_roundtrip_results.clear()
@@ -447,6 +517,8 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
         self.phase2_stage = new_stage
         self.phase_episode_count = 0
         self._clear_phase_windows()
+        # A sub-stage is a new gate: re-anneal the scaffold for it.
+        self._annealer.on_phase_change(self.current_phase)
         self._update_phase_settings()
 
         if self.verbose >= 1:
@@ -474,6 +546,8 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
             self.phase2_stage = 1
         self.phase_episode_count = 0
         self._clear_phase_windows()
+        # New phase == new target skill (P2 flips the pool to hill loops): restart the anneal.
+        self._annealer.on_phase_change(new_phase)
 
         self._update_phase_settings()
 
@@ -492,9 +566,32 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
             print(f"   Previous phase success rate: {success_rate:.1%}")
             print(f"{'='*70}\n")
 
+    def _sample_warm_start(self):
+        """This episode's warm-start plan. Cold when disabled, during evaluation (eval must
+        measure the true task), or outside the scaffolded phases 1-2. Stage 2.3 prefers
+        loops that can actually satisfy its 3-chain gate."""
+        if (not self.warm_start_enabled or not self._track_stats
+                or self.current_phase not in (1, 2)):
+            return WarmStartPlan(prefix=[], k=0, loop_len=0, cold=True)
+        self._loop_library.maybe_refresh()   # pick up other workers' harvested loops
+        base_env = self._get_base_env()
+        min_chains = 3 if (self.current_phase == 2 and self.phase2_stage >= 3) else 1
+        return self._annealer.sample_plan(
+            self._loop_library, self.current_phase,
+            getattr(base_env, 'max_track_length', 40),
+            min_chains=min_chains)
+
     def reset(self, **kwargs):
         """Reset environment and check for phase advancement"""
         self._check_phase_advancement()
+
+        # Stage this episode's warm-start prefix on the base env AFTER the advancement
+        # check (so phase/max_length are current); the env replays it one-shot inside
+        # reset(), before Phi seeding. The suffix k sizes the tight scaffolded budget.
+        self._current_plan = self._sample_warm_start()
+        base_env = self._get_base_env()
+        base_env.warm_start_actions = list(self._current_plan.prefix) or None
+        base_env.warm_start_suffix_k = self._current_plan.k or None
 
         obs, info = self.env.reset(**kwargs)
 
@@ -535,26 +632,39 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
 
             base_env = self._get_base_env()
             success = getattr(base_env, 'loop_completed', False)
-            self.episode_results.append(success)
+            cold = bool(info.get('cold_start', getattr(base_env, '_warm_cold', True)))
+            self._cold_flags.append(cold)
+            # Cold-only gating: every phase-gate window (success, qualified, phase-2 chain
+            # diagnostics) sees only true-task episodes -- a scaffolded win must never
+            # advance a gate. Scaffolded outcomes drive the annealer's frontier instead.
+            if cold:
+                self.episode_results.append(success)
+            else:
+                self.scaffold_results.append(success)
+            # Aborted prefixes are infrastructure events, not agent outcomes: they must
+            # not feed the frontier (a burst of aborts would demote k_max on noise).
+            if not info.get('warm_aborted', False):
+                self._annealer.record_outcome(self._current_plan, success)
             chain_count = self._history_chain_count(base_env)
             phase2_signals = None
             if self.current_phase == 2:
                 phase2_signals = self._phase2_signals(base_env, success)
-                self.phase2_summit_results.append(phase2_signals['phase2_summit'])
-                self.phase2_roundtrip_results.append(phase2_signals['phase2_roundtrip'])
-                self.phase2_chain1_completion_results.append(
-                    phase2_signals['phase2_complete_chain1']
-                )
-                self.phase2_chain2_completion_results.append(
-                    phase2_signals['phase2_complete_chain2']
-                )
-                self.phase2_chain3_completion_results.append(
-                    phase2_signals['phase2_complete_chain3']
-                )
+                if cold:
+                    self.phase2_summit_results.append(phase2_signals['phase2_summit'])
+                    self.phase2_roundtrip_results.append(phase2_signals['phase2_roundtrip'])
+                    self.phase2_chain1_completion_results.append(
+                        phase2_signals['phase2_complete_chain1']
+                    )
+                    self.phase2_chain2_completion_results.append(
+                        phase2_signals['phase2_complete_chain2']
+                    )
+                    self.phase2_chain3_completion_results.append(
+                        phase2_signals['phase2_complete_chain3']
+                    )
 
             # Phase-specific qualified success, sourced from the removal-safe track history.
             qualified = self._is_qualified(base_env, success)
-            if qualified is not None:
+            if qualified is not None and cold:
                 self.episode_qualified_results.append(qualified)
 
             if success:
@@ -567,6 +677,9 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
             info['learning_phase'] = self.current_phase
             info['curriculum_phase'] = self.current_phase
             info['chain_count'] = chain_count
+            # On the done-info too (reset-infos never reach the callback under SubprocVecEnv,
+            # so curriculum/max_length was silently never logged).
+            info['max_track_length'] = getattr(base_env, 'max_track_length', 0)
             if phase2_signals is not None:
                 info['phase2_stage'] = self.phase2_stage
                 info['phase2_threshold'] = self._phase2_threshold()
@@ -606,10 +719,28 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                     if self.episode_qualified_results else 0.0
                 )
             info['phase_success'] = success
-            info['phase_success_rate'] = (
+            # phase_success_rate is now the COLD-episode rate (the gate-driving number);
+            # cold_success_rate is the explicit alias, scaffold_success_rate its counterpart.
+            cold_rate = (
                 sum(self.episode_results) / len(self.episode_results)
                 if self.episode_results else 0
             )
+            info['phase_success_rate'] = cold_rate
+            info['cold_success_rate'] = cold_rate
+            info['scaffold_success_rate'] = (
+                sum(self.scaffold_results) / len(self.scaffold_results)
+                if self.scaffold_results else 0.0
+            )
+            info['cold_fraction'] = (
+                sum(self._cold_flags) / len(self._cold_flags)
+                if self._cold_flags else 1.0
+            )
+            info['warm_k'] = self._current_plan.k
+            info['warm_k_max'] = self._annealer.k_max
+            info['loop_library_size'] = len(self._loop_library)
+            frontier_rate = self._annealer.frontier_rate
+            if frontier_rate is not None:
+                info['warm_frontier_rate'] = frontier_rate
 
             # Periodic logging
             if self.phase_episode_count % 10 == 0 and self.verbose >= 1:
@@ -662,6 +793,7 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
             'phase5_stage': self.phase5_stage if self.current_phase == 5 else None,
             'total_episodes': self.episode_count,
             'phase_episodes': self.phase_episode_count,
+            # cold-episode rate: episode_results is cold-only under warm starts
             'success_rate': (
                 sum(self.episode_results) / len(self.episode_results)
                 if self.episode_results
@@ -669,5 +801,7 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
             ),
             'total_loops_completed': self.total_loops_completed,
             'phases_completed': self.phases_completed,
-            'current_max_length': max_lengths.get(self.current_phase, self.phase5_current_length)
+            'current_max_length': max_lengths.get(self.current_phase, self.phase5_current_length),
+            'warm_k_max': self._annealer.k_max,
+            'loop_library_size': len(self._loop_library),
         }

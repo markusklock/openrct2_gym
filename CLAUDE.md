@@ -88,6 +88,10 @@ This is a Gymnasium environment for training RL agents to build roller coasters 
   the unified potential-based reward and MaskablePPO action masking.
   - `--ports` (comma-separated): one OpenRCT2 instance per port; `SubprocVecEnv` for 2+ ports, else `DummyVecEnv`
   - other flags: `--timesteps`, `--disable-eval`, `--model-path` (resume), `--target-rollout`, `--checkpoint-freq`, `--eval-freq`
+  - warm-start flags: `--no-warm-start` (disable the reverse curriculum), `--loop-library PATH`
+    (default `logs/loop_library.jsonl`), `--p-cold F` (base cold-episode fraction, default 0.25)
+- **build_loop_library.py**: seeds the warm-start loop library with live-verified closable loops
+  (run once per map: `python build_loop_library.py --port 8080` and `--hill` for the Phase-2 pool).
 - **run_model.py**: Run a trained model.
 
 ### Key Design Decisions
@@ -101,19 +105,28 @@ This is a Gymnasium environment for training RL agents to build roller coasters 
    - Energy estimation: chain lifts add energy, drops convert to speed
    - Pattern detection: rewards for lift hills, drops, turnarounds
    - Soft approach guidance: bonuses for correct height/direction near station
-   - **Goal = the station dock; deterministic, dock-coupled closing heading**: `goal_position` is the
-     station's dock endpoint itself (verified by `verify_goal_position.py` — the API closes the circuit
-     AT `station_start`, not one tile east as the old guide assumed). The station is built with
-     `startDir=0`, so every circuit re-enters BeginStation heading North; Φ is handed this closing
+   - **Goal = the STAGING tile [62,66,14] (one tile east of the dock); deterministic, dock-coupled
+     closing heading**: the head can never sit ON the dock tile (occupied by BeginStation), so
+     `goal_position` is the staging tile the closing piece is placed FROM (openrct2_env.py reset();
+     probe_corridor.py confirmed 7+ pieces dock from there; a goal-=-dock experiment collapsed
+     completion to 0% and was reverted). The station is built with `startDir=0` (dir 0 = West,
+     vector (-1,0)), so every circuit re-enters BeginStation heading dir 0; Φ is handed this closing
      heading (`_STATION_ENTRY_DIR`) from step 1, and the heading reward is **coupled to the dock**
      (gated by the near-closure factor) so the agent is free to turn while routing and only must align
-     as it docks. Deterministic heading is critical for Phase-1 bootstrap — otherwise the heading term
-     stays off until a completion calibrates it (a chicken-and-egg that stalled the cold start). The
-     full closing geometry is still refined from real completions (anchor locked only after ≥3 agree).
+     as it docks. The full closing geometry is still refined from real completions (anchor locked
+     only after ≥3 agree).
+   - **Route potential (`w_route`, on in phases 1-4)**: the directional approach cone is deliberately
+     zero on the whole start/west side, which left the detour around the station unshaped (the Jun-24
+     run parked ~5 tiles out forever). `_route_progress()` pays bounded angular progress of the head's
+     bearing around the station center — monotone along BOTH detours, PBRS-clean, diagnosed via
+     `rewards/route_potential`.
    - **Phase-2 hill-discovery bootstrap**: the climb-and-return milestone is made *discoverable* by
-     annealing `roundtrip_gain` (1→1→4 z across sub-stages 2.1/2.2/2.3) plus a small one-time summit
-     breadcrumb (`R_summit` 120→60→0), with a raised early-Phase-2 entropy floor
+     annealing `roundtrip_gain` (1→1→3 z across sub-stages 2.1/2.2/2.3; the bar is CHAIN-banked gain —
+     the canonical hill [10,9,13] banks 3, its crest piece isn't chained) plus a small one-time summit
+     breadcrumb (`R_summit` 40→30→0), with a raised early-Phase-2 entropy floor
      (`PHASE2_EARLY_ENT_COEF=0.018` in `train.py`) so exploration survives long enough to find the climb.
+     The completion hill gate scales chain credit by chain-banked ELEVATION against that bar, so
+     chain-stub decoration on a flat loop cannot pay as a full hill.
    - Ride quality optimization in Phase 5 (Excitement 7-9, Intensity 4.5-6.5, Nausea <4.5)
 
 3. **5-Phase Curriculum Learning**:
@@ -121,8 +134,23 @@ This is a Gymnasium environment for training RL agents to build roller coasters 
    - Trusts API's `isCircuitComplete` flag (no artificial restrictions)
    - Progressive track length limits (40 → 40 → 60 → 80 → 120; Phase 1 raised 25→40 to give the agent
      room to route a loop back to the station before truncation)
+   - **Warm-start reverse curriculum (phases 1-2)**: completion is a discovery problem (a minimal
+     loop is 12 exact pieces; the Jun-24 run saw 7 completions in 31k episodes and entropy-collapsed).
+     At reset the env replays a prefix of a verified loop from `logs/loop_library.jsonl`
+     (`openrct2_gym/envs/warm_start.py`: `LoopLibrary` + per-worker `WarmStartAnnealer`); the agent
+     builds the last k pieces, k anneals up on frontier success, and every completion is harvested
+     back into the library. **Phase gates count cold (unscaffolded) episodes only** — read
+     `success/cold_completion_rate` and `curriculum/warm_k_max` in TB, not the scaffold-mixed
+     `overall_loop_completion_rate`. A progress-conditional entropy floor (`optim/ent_floor_mode`)
+     holds ent_coef at 0.025 with a raised collapse band until cold completions flow (≥2%), then
+     restores the proven 0.01 config.
 
 4. **Action Space**: 32 discrete actions (30 track pieces + remove + flat), with action masking to prevent invalid placements
+   - **Descending pieces are placed at BASE z** (`api_track_builder.py descent_entry_z_offset`,
+     live-probed): the plugin validates a piece's train ENTRY against the previous end but takes the
+     base z, which for descents sits below the entry by the piece's drop (25°=2, 60°=8, flat↔25=1,
+     25↔60=4). Before this offset every descent placement failed silently — drops were effectively
+     removed from the action space in all earlier runs.
 
 ## Important Notes
 

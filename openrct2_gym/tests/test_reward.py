@@ -19,22 +19,27 @@ from openrct2_gym.envs.openrct2_env import OpenRCT2Env, RewardParams
 from openrct2_gym.envs.obs_config import make_observation_space, SCALE, H_SCALE
 from openrct2_gym.tests.test_env_smoke import FakeAPI
 
-DIRS = [(0, 1), (1, 0), (0, -1), (-1, 0)]  # N, E, S, W
+DIRS = [(-1, 0), (0, 1), (1, 0), (0, -1)]  # API encoding: 0=W, 1=N, 2=E, 3=S (matches env.direction_vectors)
 
 
 @pytest.fixture(autouse=True)
 def _isolate_close_cache(tmp_path):
-    """Isolate the process-wide calibration cache + record buffer + its file per test."""
+    """Isolate the process-wide calibration cache + record buffer + its file per test,
+    and the warm-start loop-library file (completions harvest into it; the curriculum
+    wrapper's default library path follows the same class attr)."""
     orig_cache = OpenRCT2Env._close_cache
     orig_path = OpenRCT2Env._CLOSE_CACHE_PATH
     orig_records = OpenRCT2Env._close_records
+    orig_library = OpenRCT2Env._LOOP_LIBRARY_PATH
     OpenRCT2Env._close_cache = None
     OpenRCT2Env._close_records = []
     OpenRCT2Env._CLOSE_CACHE_PATH = str(tmp_path / "close_geometry.json")
+    OpenRCT2Env._LOOP_LIBRARY_PATH = str(tmp_path / "loop_library.jsonl")
     yield
     OpenRCT2Env._close_cache = orig_cache
     OpenRCT2Env._close_records = orig_records
     OpenRCT2Env._CLOSE_CACHE_PATH = orig_path
+    OpenRCT2Env._LOOP_LIBRARY_PATH = orig_library
 
 
 def _bare_env(current_position=(61, 70, 14), current_direction=1,
@@ -151,10 +156,48 @@ def _phi_env(pos, direction=1, close_pos=(0, 0, 14), close_dir=1):
 
 
 def test_phi_increases_as_head_approaches_target_xy():
+    # Approach ALONG the entry corridor (close_dir=1 -> entry +Y, so the approach side is -Y).
+    # The horizontal w_xy pull is now directional, so it rewards closing in along this axis.
     geo = RewardParams(w_e=0.0)  # isolate geometry
-    phis = [_phi_env((d, 0, 14))._potential(geo) for d in (30, 20, 10, 0)]
+    phis = [_phi_env((0, -d, 14))._potential(geo) for d in (30, 20, 10, 0)]
     assert phis == sorted(phis)              # monotonically increasing
     assert phis[-1] > phis[0]
+
+
+def test_approach_is_directional_no_wrong_side_pull():
+    """The horizontal w_xy pull is directional: at equal distance, approaching ALONG the entry
+    corridor from the -entry side earns the pull, while the wrong side (behind the dock) and the
+    far off-axis earn ZERO -- so the head can't minimise distance by parking behind/beside the
+    station. (close_dir=1 -> entry +Y; approach side -Y; off-axis is X.)"""
+    geo = RewardParams(w_xy=10.0, w_z=0.0, w_dir=0.0, w_e=0.0, w_h=0.0, w_close=0.0)
+    on_corridor = _phi_env((0, -2, 14))._potential(geo)   # along=2 on-axis  -> strong pull
+    wrong_side  = _phi_env((0,  2, 14))._potential(geo)    # along=-2 behind dock -> no pull
+    far_off     = _phi_env((10, 0, 14))._potential(geo)    # along=0, perp=10 (cone tol=2) -> no pull
+    assert on_corridor > 0.0
+    assert wrong_side == pytest.approx(0.0)
+    assert far_off == pytest.approx(0.0)
+    assert on_corridor > wrong_side
+
+
+def test_approach_cone_widens_away_from_dock():
+    """The approach corridor is a cone: an off-axis tile far from the dock is inside it (caught as
+    the head rounds back), while the same perp offset close to the dock is outside it."""
+    geo = RewardParams(w_xy=10.0, w_z=0.0, w_dir=0.0, w_e=0.0, w_h=0.0, w_close=0.0)
+    far_offaxis  = _phi_env((3, -8, 14))._potential(geo)   # along=8, perp=3 < tol(2+8=10) -> inside
+    near_offaxis = _phi_env((3, -1, 14))._potential(geo)   # along=1, perp=3 > tol(2+1=3)? equal->0
+    assert far_offaxis > 0.0
+    assert near_offaxis == pytest.approx(0.0)
+
+
+def test_approach_directional_disabled_restores_isotropic():
+    """approach_perp_range=0 restores the legacy isotropic radial w_xy pull (wrong side no longer
+    zeroed -- equal distance gives equal pull regardless of side)."""
+    geo = replace(RewardParams(w_z=0.0, w_dir=0.0, w_e=0.0, w_h=0.0, w_close=0.0),
+                  approach_perp_range=0.0)
+    approach_side = _phi_env((0, -2, 14))._potential(geo)
+    wrong_side    = _phi_env((0,  2, 14))._potential(geo)
+    assert approach_side == pytest.approx(wrong_side)
+    assert wrong_side > 0.0
 
 
 def test_phi_increases_as_head_approaches_station_height():
@@ -220,11 +263,12 @@ def test_phi_drops_heading_term_before_calibration():
 # --------------------------------------------- dense constructive-move gate (test 14)
 
 def test_constructive_xy_move_yields_net_positive_shaping():
-    """A one-tile XY move toward the (aligned) anchor must give F = gamma*Phi' - Phi > 0
-    at the default D_xy, even at high Phi where discount leakage (1-gamma)*Phi bites."""
+    """A one-tile XY move toward the (aligned) anchor ALONG the entry corridor must give
+    F = gamma*Phi' - Phi > 0 at the default D_xy, even at high Phi where discount leakage
+    (1-gamma)*Phi bites. (close_dir=1 -> entry +Y, so the approach axis is -Y.)"""
     p = RewardParams()
-    far = _phi_env((11, 0, 14), direction=1)._potential(p)
-    near = _phi_env((10, 0, 14), direction=1)._potential(p)
+    far = _phi_env((0, -11, 14), direction=1)._potential(p)
+    near = _phi_env((0, -10, 14), direction=1)._potential(p)
     f = p.gamma * near - far
     assert f > 0
 
@@ -429,9 +473,9 @@ def test_init_closing_target_provisional_uses_station_entry_axis():
 
 def test_pbrs_constructive_move_reward_is_positive():
     p = RewardParams()
-    env = _phi_env((11, 0, 14), direction=1)
+    env = _phi_env((0, -11, 14), direction=1)   # on the -Y entry corridor (close_dir=1)
     env._phi_prev = env._potential(p)
-    env.current_position = [10, 0, 14]          # one tile closer to the anchor
+    env.current_position = [0, -10, 14]         # one tile closer to the anchor along the corridor
     env.loop_completed = False
     assert env._calculate_reward(True, 0) > 0
 
@@ -592,15 +636,19 @@ def test_completion_no_quality_when_disabled(monkeypatch):
     assert reward == pytest.approx(p.R_complete - phi_prev_before)   # no quality term
 
 
-def test_goal_position_is_the_station_dock(monkeypatch):
-    """Tier-1: goal_position is the station's dock endpoint (== station_start), not one tile east.
-    verify_goal_position.py confirmed the API closes the circuit AT station_start, so the old
-    +1-east staging tile mis-aimed the guide by a tile (and disagreed with the calibrated
-    close_pos)."""
+def test_goal_position_is_the_dock_staging_tile(monkeypatch):
+    """Goal = the STAGING tile one step on the approach side of the dock (dock - entry-direction
+    vector), NOT the dock tile itself. probe_corridor.py: the head cannot sit on the occupied
+    station tile; it docks FROM (62,66,14) heading the entry direction. (Reverts the goal-=-dock
+    change that collapsed completion to 0%.)"""
     monkeypatch.setattr(oe_mod, "APIController", CompletingAPI)
     env = OpenRCT2Env(verbose=0)
     env.reset()
-    assert list(env.goal_position) == list(env.station_start_position) == [61, 66, 14]
+    ex, ey = env.direction_vectors[env._STATION_ENTRY_DIR]
+    expected = [env.station_start_position[0] - ex,
+                env.station_start_position[1] - ey,
+                env.station_start_position[2]]
+    assert list(env.goal_position) == expected == [62, 66, 14]
 
 
 # ----------------------------------------------- curriculum unification (tests 12,13,15)
@@ -673,7 +721,10 @@ def test_discovery_potential_off_in_phase1_and_5_on_in_phase2():
     phi_p2 = env._potential(W._phase_reward_params(2))   # discovery ON
     phi_p5 = env._potential(W._phase_reward_params(5))   # discovery OFF
     assert phi_p2 > phi_p1 + 1.0                         # P2 gains the banked-elevation term
-    assert phi_p5 == pytest.approx(phi_p1)               # P5 has no discovery pull either
+    # P5 has no discovery pull either; it differs from P1 only by the route term (on in the
+    # completion phases 1-4, off in phase 5).
+    route = W._phase_reward_params(1).w_route * env._route_progress()
+    assert phi_p5 == pytest.approx(phi_p1 - route)
 
 
 # ---- structural bonus
@@ -697,9 +748,12 @@ def test_structural_bonus_disabled_returns_zero():
 
 
 def test_structural_bonus_p2_scales_with_chain_count():
+    """Chain COUNT times chain ELEVATION (vs the roundtrip_gain bar): pieces alone are
+    farmable -- three scattered 1-z stubs must not equal a lift hill. _struct_env climbs
+    +1 z per chain, so count == gain here."""
     p = RewardParams(R_struct_max=250.0, struct_chain_target=3, struct_w_chain=1.0, struct_w_drop=0.0)
-    assert _struct_env(chains=1)._structural_bonus(p) == pytest.approx(250.0 / 3)
-    assert _struct_env(chains=2)._structural_bonus(p) == pytest.approx(250.0 * 2 / 3)
+    assert _struct_env(chains=1)._structural_bonus(p) == pytest.approx(250.0 / 9)        # 1/3 x 1/3
+    assert _struct_env(chains=2)._structural_bonus(p) == pytest.approx(250.0 * 4 / 9)    # 2/3 x 2/3
     assert _struct_env(chains=3)._structural_bonus(p) == pytest.approx(250.0)
     assert _struct_env(chains=4)._structural_bonus(p) == pytest.approx(250.0)   # clipped at target
     assert _struct_env(chains=0)._structural_bonus(p) == 0.0
@@ -707,10 +761,13 @@ def test_structural_bonus_p2_scales_with_chain_count():
 
 def test_structural_bonus_p3_requires_chains_and_drop():
     p = RewardParams(R_struct_max=250.0, struct_chain_target=2, struct_w_chain=0.5, struct_w_drop=0.5)
-    assert _struct_env(chains=2, drops=1)._structural_bonus(p) == pytest.approx(250.0)   # both -> full
-    assert _struct_env(chains=2, drops=0)._structural_bonus(p) == pytest.approx(125.0)   # chains only
+    # chains=2 climbs +2 z against the default gain bar (3): chain credit scales by 2/3
+    assert _struct_env(chains=2, drops=1)._structural_bonus(p) == pytest.approx(125.0 * 2 / 3 + 125.0)
+    assert _struct_env(chains=2, drops=0)._structural_bonus(p) == pytest.approx(125.0 * 2 / 3)
     assert _struct_env(chains=0, drops=1)._structural_bonus(p) == pytest.approx(125.0)   # drop only
     assert _struct_env(chains=0, drops=0)._structural_bonus(p) == 0.0
+    # a full-height hill restores the full chain credit
+    assert _struct_env(chains=3, drops=1)._structural_bonus(p) == pytest.approx(250.0)
 
 
 def test_structural_bonus_p4_integration():
@@ -777,8 +834,11 @@ def test_episode_metrics_expose_struct_and_height_diagnostics(monkeypatch):
     monkeypatch.setattr(oe_mod, "APIController", CompletingAPI)
     env = OpenRCT2Env(verbose=0)
     env.skip_ride_testing = True
+    # roundtrip_gain=0 opts out of the elevation scaling: the FakeAPI geometry never gains
+    # z, and this test is about the metrics contract, not the hill economy.
     env.reward_params = RewardParams(R_struct_max=250.0, struct_chain_target=1,
-                                     struct_w_chain=1.0, struct_w_drop=0.0)
+                                     struct_w_chain=1.0, struct_w_drop=0.0,
+                                     roundtrip_gain=0.0)
     env.reset()
     info = {}
     for _ in range(6):
@@ -822,10 +882,12 @@ def test_completion_gate_lowers_flat_floor_in_phase2_stage2():
 
 
 def test_phase2_final_stage_tightens_to_three_chains():
+    # isolate=True: a full 3-chain hill at gain bar 3 now ALSO banks the roundtrip milestone
+    # on the completing step; burn the latches to assert the gated-completion magnitude itself.
     P = ImprovedPhasedCurriculumWrapper._phase_reward_params(2, phase2_stage=3)
-    flat = _complete_payoff(P, chains=0)
-    one_chain = _complete_payoff(P, chains=1)
-    full = _complete_payoff(P, chains=3)
+    flat = _complete_payoff(P, chains=0, isolate=True)
+    one_chain = _complete_payoff(P, chains=1, isolate=True)
+    full = _complete_payoff(P, chains=3, isolate=True)
     assert flat == pytest.approx(100.0)        # mostly devalued, but not zeroed out
     assert flat < one_chain < full
     assert full == pytest.approx(1250.0)
@@ -861,11 +923,13 @@ def test_phase2_summit_breadcrumb_schedule():
     (and below the flat-completion floor so 'climb and stop' never out-pays closing the loop)."""
     W = ImprovedPhasedCurriculumWrapper
     summit = [W._phase_reward_params(2, phase2_stage=s).R_summit for s in (1, 2, 3)]
-    assert summit == [120.0, 60.0, 0.0]
+    assert summit == [40.0, 30.0, 0.0]
     assert summit == sorted(summit, reverse=True)              # tapering
     for s in (1, 2, 3):
         P = W._phase_reward_params(2, phase2_stage=s)
         assert P.R_summit < P.R_roundtrip                      # return stays worth learning
+        # the SUM must stay below the flat-completion floor, else 'climb and stop' out-pays closing
+        assert P.R_summit + P.R_roundtrip < P.completion_hill_floor * P.R_complete
     assert W._phase_reward_params(1).R_summit == 0.0
     assert W._phase_reward_params(5).R_summit == 0.0
 
@@ -873,12 +937,14 @@ def test_phase2_summit_breadcrumb_schedule():
 def test_phase2_roundtrip_gain_anneals_monotonically():
     """Make the existing climb-and-return milestone DISCOVERABLE: the required chain-climb stays
     a single piece's worth (1 z) through stages 2.1 AND 2.2 -- so the climb habit and its
-    breadcrumbs survive the integration step -- and only 2.3 demands the full 4-z hill."""
+    breadcrumbs survive the integration step -- and only 2.3 demands the full hill. The bar is
+    chain gain 3, not 4: the canonical hill [10,9,13] banks 3 via CHAIN pieces (the crest piece
+    isn't chained), so a 4.0 bar made the milestone + w_return silently inert for that hill."""
     W = ImprovedPhasedCurriculumWrapper
     gains = [W._phase_reward_params(2, phase2_stage=s).roundtrip_gain for s in (1, 2, 3)]
-    assert gains == [1.0, 1.0, 4.0]
+    assert gains == [1.0, 1.0, 3.0]
     assert gains == sorted(gains)                              # monotone non-decreasing
-    assert gains[-1] == RewardParams().roundtrip_gain          # stage 2.3 == default 4-z hill
+    assert gains[-1] == RewardParams().roundtrip_gain          # stage 2.3 == default full hill
 
 
 def test_completion_not_gated_in_phase1():
@@ -982,13 +1048,13 @@ def test_phase2_1_summit_breadcrumb_fires_once():
     exactly once per episode -- the breadcrumb that makes the climb worth starting before the
     return is learned. Isolated here with the head still elevated, so only summit (not the
     round-trip) fires."""
-    P = ImprovedPhasedCurriculumWrapper._phase_reward_params(2, phase2_stage=1)  # R_summit 120
+    P = ImprovedPhasedCurriculumWrapper._phase_reward_params(2, phase2_stage=1)  # R_summit 40
     env = _roundtrip_env(peak_z=20, head_z=20, p=P)           # climbed, NOT returned -> summit only
     env._summit_awarded = False
     r1 = env._calculate_reward(True, 0)
     assert env._summit_awarded is True
     assert env._roundtrip_awarded is False                    # head still elevated
-    assert r1 == pytest.approx(P.gamma * env._potential(P) + 120.0)
+    assert r1 == pytest.approx(P.gamma * env._potential(P) + 40.0)
     env._phi_prev = 0.0
     r2 = env._calculate_reward(True, 0)                        # once-per-episode: no re-award
     assert r2 == pytest.approx(P.gamma * env._potential(P))
@@ -1021,7 +1087,7 @@ def test_phase2_info_exposes_schedule_diagnostics(monkeypatch):
         if terminated or truncated:
             break
     assert info.get('phase2_roundtrip_gain') == 1.0
-    assert info.get('phase2_summit_reward') == 120.0
+    assert info.get('phase2_summit_reward') == 40.0
 
 
 def test_roundtrip_disabled_and_below_completion_per_phase():
@@ -1029,9 +1095,9 @@ def test_roundtrip_disabled_and_below_completion_per_phase():
     W = ImprovedPhasedCurriculumWrapper
     assert W._phase_reward_params(1).R_roundtrip == 0.0     # off in phase 1
     assert W._phase_reward_params(5).R_roundtrip == 0.0     # off in phase 5
-    assert W._phase_reward_params(2, phase2_stage=1).R_roundtrip == 300.0
-    assert W._phase_reward_params(2, phase2_stage=2).R_roundtrip == 300.0
-    assert W._phase_reward_params(2, phase2_stage=3).R_roundtrip == 200.0
+    assert W._phase_reward_params(2, phase2_stage=1).R_roundtrip == 80.0
+    assert W._phase_reward_params(2, phase2_stage=2).R_roundtrip == 60.0
+    assert W._phase_reward_params(2, phase2_stage=3).R_roundtrip == 60.0
     for P in (
         W._phase_reward_params(2, phase2_stage=1),
         W._phase_reward_params(2, phase2_stage=2),
@@ -1042,6 +1108,28 @@ def test_roundtrip_disabled_and_below_completion_per_phase():
         # must stay below a real hill completion (R_complete) so climb-and-return is a stepping
         # stone, never a substitute for closing the hill loop.
         assert P.R_roundtrip < P.R_complete
+
+
+def test_completion_first_invariant_holds_for_every_phase():
+    """Regression guard for the Phase-2.3 milestone-farming collapse: the once-per-episode climb
+    milestones (R_roundtrip + R_summit, earnable WITHOUT closing) must never out-pay completion.
+    _phase_reward_params is now validated, so a violating config would raise on construction."""
+    W = ImprovedPhasedCurriculumWrapper
+    for phase, stage in [(1, 1), (2, 1), (2, 2), (2, 3), (3, 1), (4, 1), (5, 1)]:
+        P = W._phase_reward_params(phase, phase2_stage=stage)   # raises if the invariant is violated
+        milestones = P.R_roundtrip + P.R_summit
+        assert milestones < P.R_complete                        # a perfect completion always wins
+        if P.completion_hill_floor > 0.0:                       # ...and so does a flat completion
+            assert milestones < P.completion_hill_floor * P.R_complete
+
+
+def test_validate_completion_first_rejects_milestone_farming():
+    """The guard fails fast on the exact pre-fix Phase-2.3 config (R_roundtrip 200 > 0.10*1000)."""
+    W = ImprovedPhasedCurriculumWrapper
+    W._validate_completion_first(RewardParams(completion_hill_floor=0.10, R_roundtrip=60.0), "ok")
+    bad = RewardParams(completion_hill_floor=0.10, R_roundtrip=200.0)   # the bug that collapsed P2.3
+    with pytest.raises(AssertionError):
+        W._validate_completion_first(bad, "bad")
 
 
 # ---- summit milestone (reachable first half of the round-trip bridge)
@@ -1395,17 +1483,19 @@ def _ladder_rung(P, *, chains, head_z, completed):
 
 
 def test_phase2_stage1_reward_ladder_is_monotone():
-    """The core fix: stage-2.1 sparse rewards form a monotone, reachable ladder
-    climb-only < flat-close < climb-and-descend < hill-close. So the gradient always points
-    PAST flat looping toward the hill round-trip (closure-first AND anti-flat-only), while a
-    closed loop always out-pays an unclosed climb. On the pre-fix params (floor 0.05,
-    R_summit 100) a climb-and-stop out-pays a flat close, so this fails."""
+    """Closure-first ladder: stage-2.1 sparse rewards form a monotone, reachable ladder
+    climb-only < climb-and-descend < flat-close < hill-close. CLOSING THE LOOP ALWAYS OUT-PAYS
+    NOT CLOSING IT (flat_close > climb_descend) -- the milestones are a stepping stone, never a
+    substitute -- and the big hill bonus (hill_close >> flat_close), not an inflated round-trip,
+    is what pulls past flat looping toward the hill. (The pre-fix params made climb_descend
+    out-pay flat_close, which let the agent farm the round-trip and abandon closure: at 1.1M
+    steps Phase-2.3 completion collapsed 0.44 -> 0.08 with zero hill completions.)"""
     P = ImprovedPhasedCurriculumWrapper._phase_reward_params(2, phase2_stage=1)
     climb_only = _ladder_rung(P, chains=1, head_z=20, completed=False)     # elevated, no close
-    flat_close = _ladder_rung(P, chains=0, head_z=14, completed=True)      # flat loop closed
     climb_descend = _ladder_rung(P, chains=1, head_z=14, completed=False)  # returned, not closed
+    flat_close = _ladder_rung(P, chains=0, head_z=14, completed=True)      # flat loop closed
     hill_close = _ladder_rung(P, chains=1, head_z=14, completed=True)      # hill loop closed
-    assert climb_only < flat_close < climb_descend < hill_close
+    assert climb_only < climb_descend < flat_close < hill_close
 
 
 def test_episode_metrics_expose_return_potential(monkeypatch):
@@ -1449,13 +1539,51 @@ def test_close_bonus_zero_beyond_range():
 
 
 def test_close_bonus_ramps_steeply_to_target():
-    """Within range it ramps monotonically (and steeply) to w_close at the exact closing tile."""
+    """Along the entry-axis approach corridor it ramps monotonically (and steeply) to w_close at the
+    staging tile. (_phi_env uses close_dir=1, so the entry axis is +Y and the approach comes from
+    the south; moving along it -- not perpendicular -- is what the funnel rewards.)"""
     p = _close_only(w_close=8.0, close_range=3.0)
-    phis = [_phi_env((d, 0, 14))._potential(p) for d in (3, 2, 1, 0)]
+    phis = [_phi_env((0, -d, 14))._potential(p) for d in (3, 2, 1, 0)]   # approach along the corridor
     assert phis[0] == pytest.approx(0.0)             # at the range edge
     assert phis[0] < phis[1] < phis[2] < phis[3]     # steep monotonic climb in the final tiles
-    assert phis[3] == pytest.approx(8.0)             # full bonus at the closing tile
+    assert phis[3] == pytest.approx(8.0)             # full bonus at the staging tile
     assert (phis[3] - phis[2]) > 1.0                 # steeper than the 0.25/tile w_xy approach
+
+
+def test_close_bonus_is_a_directional_corridor():
+    """The near-closure funnel is DIRECTIONAL: full only when the head approaches the staging tile
+    along the entry axis from the correct (-entry) side. Off-axis or past the tile gives less/nothing,
+    so the agent can't farm it by parking beside the station from the wrong direction. (_phi_env:
+    close_dir=1 -> entry dir +Y; approach side is -Y (south); off-axis is the X direction.)"""
+    p = _close_only(w_close=8.0, close_range=3.0)
+    on_axis    = _phi_env((0, -1, 14))._potential(p)   # 1 tile south, on the corridor
+    off_axis   = _phi_env((1,  0, 14))._potential(p)   # 1 tile to the side (perpendicular)
+    wrong_side = _phi_env((0,  1, 14))._potential(p)   # 1 tile PAST the staging tile (along < 0)
+    assert on_axis > 0.0
+    assert off_axis < on_axis                          # off-axis funnels down
+    assert wrong_side == pytest.approx(0.0)            # past the staging tile -> no funnel
+
+
+def test_close_funnel_pinches_to_centerline_at_throat():
+    """The funnel pinches to a POINT at the throat: the off-axis tiles immediately beside the
+    staging tile (along=0) are excluded, but off-axis tiles one tile back (along>=1) are retained.
+    (_phi_env: close_dir=1 -> entry +Y, throat staging (0,0); off-axis is the X direction.)"""
+    p = _close_only(w_close=8.0, close_range=3.0)
+    throat_off = _phi_env((1,  0, 14))._potential(p)   # off-axis AT the throat -> excluded
+    throat_off2 = _phi_env((-1, 0, 14))._potential(p)  # other side, AT the throat -> excluded
+    back_off   = _phi_env((1, -1, 14))._potential(p)   # off-axis ONE tile back -> retained
+    on_throat  = _phi_env((0,  0, 14))._potential(p)   # centerline throat -> full bonus
+    assert throat_off == pytest.approx(0.0)
+    assert throat_off2 == pytest.approx(0.0)
+    assert back_off > 0.0
+    assert on_throat == pytest.approx(8.0)
+
+
+def test_close_funnel_pinch_disabled_restores_rectangular_corridor():
+    """close_throat_pinch=0 falls back to the legacy un-pinched corridor (throat off-axis tiles
+    still earn the perpendicular falloff)."""
+    p = replace(_close_only(w_close=8.0, close_range=3.0), close_throat_pinch=0.0)
+    assert _phi_env((1, 0, 14))._potential(p) > 0.0     # throat off-axis no longer excluded
 
 
 def test_close_bonus_enabled_in_completion_phases_off_in_phase5():
@@ -1555,6 +1683,11 @@ def test_phase2_substage_advancement_sequence():
     w.phase2_chain1_completion_results = deque(maxlen=50)
     w.phase2_chain2_completion_results = deque(maxlen=50)
     w.phase2_chain3_completion_results = deque(maxlen=50)
+    # warm-start state touched by _clear_phase_windows / _advance_* hooks
+    w.scaffold_results = deque(maxlen=50)
+    w._cold_flags = deque(maxlen=50)
+    from openrct2_gym.envs.warm_start import WarmStartAnnealer
+    w._annealer = WarmStartAnnealer()
     updates = []
     w._update_phase_settings = lambda: updates.append(w.phase2_stage)
 
@@ -1813,3 +1946,194 @@ def test_phase5_episode_metrics_include_quality_bonus(monkeypatch):
     assert terminated
     assert env.episode_rewards[-1] == pytest.approx(reward)                    # not under-reported
     assert sum(env.phase_rewards.values()) == pytest.approx(sum(env.episode_rewards))
+
+
+# --------------------------------------------- route potential (west-side detour shaping)
+# The approach cone gives ZERO horizontal pull for along<0 (the whole start side), so the
+# detour AROUND the station was unshaped: the 1.3M-step Jun-24 run parked at ~5 tiles and
+# never completed. Phi gains a bounded angular-progress term (w_route * bearing progress
+# around the station center, 0 on the start/west bearing -> 1 on the approach/east bearing)
+# that is monotone along BOTH detours. Pure function of current_position -> PBRS-clean.
+
+def _route_env(pos, direction=0):
+    """Bare env at the REAL station geometry ([61,66,14], length 6) with the calibrated
+    closing target at the staging tile, matching a live phase-1 episode."""
+    env = _bare_env(current_position=pos, current_direction=direction,
+                    goal_position=(62, 66, 14), history=[])
+    env.close_pos = [62, 66, 14]
+    env.close_dir = 0
+    return env
+
+
+def test_route_progress_zero_on_start_side_full_on_approach_side():
+    assert _route_env((55, 66, 14))._route_progress() == pytest.approx(0.0)   # post-station head
+    assert _route_env((62, 66, 14))._route_progress() == pytest.approx(1.0)   # staging tile
+    assert _route_env((70, 66, 14))._route_progress() == pytest.approx(1.0)   # radius-independent
+
+
+def test_route_progress_monotone_on_both_detours():
+    """Strictly increasing along a real racetrack path (live-verified waypoints) around the
+    NORTH side, and its mirror around the SOUTH side -- both detours get a gradient."""
+    north = [(55, 66, 14), (54, 68, 14), (56, 69, 14), (59, 69, 14),
+             (63, 69, 14), (64, 67, 14), (62, 66, 14)]
+    south = [(x, 66 - (y - 66), z) for (x, y, z) in north]
+    for path in (north, south):
+        vals = [_route_env(p)._route_progress() for p in path]
+        assert all(b > a for a, b in zip(vals, vals[1:]))
+        assert vals[0] == pytest.approx(0.0) and vals[-1] == pytest.approx(1.0)
+
+
+def test_route_potential_off_by_default_and_bounded():
+    assert RewardParams().w_route == 0.0          # kill-switch default: all frozen-Phi tests hold
+    iso = RewardParams(w_xy=0.0, w_z=0.0, w_dir=0.0, w_e=0.0, w_h=0.0,
+                       w_close=0.0, w_route=3.0)  # isolate the route term
+    for pos in ((55, 66, 14), (56, 69, 14), (62, 66, 14), (80, 90, 14)):
+        phi = _route_env(pos)._potential(iso)
+        assert 0.0 <= phi <= 3.0 + 1e-9           # bounded by w_route
+    assert _route_env((62, 66, 14))._potential(iso) == pytest.approx(3.0)
+    assert _route_env((55, 66, 14))._potential(iso) == pytest.approx(0.0)
+
+
+def test_route_potential_telescopes_on_place_remove(monkeypatch):
+    """Route term is part of the single Phi -> place+remove telescopes to (gamma-1)*(Phi+Phi') < 0
+    (not farmable), exactly like the rest of the potential."""
+    monkeypatch.setattr(oe_mod, "APIController", FakeAPI)
+    env = OpenRCT2Env(verbose=0)
+    env.skip_ride_testing = True
+    env.reward_params = RewardParams(w_xy=0.0, w_z=0.0, w_dir=0.0, w_e=0.0, w_h=0.0,
+                                     w_close=0.0, w_route=3.0)
+    env.reset()
+    _, r_place, *_ = env.step(0)
+    _, r_remove, *_ = env.step(31)
+    assert r_place + r_remove < 0
+
+
+def test_route_potential_no_new_parking_optimum():
+    """Under full phase-1 params the route term must not create a resting place: Phi at the
+    docked (staging, aligned) state strictly dominates every detour waypoint."""
+    p1 = ImprovedPhasedCurriculumWrapper._phase_reward_params(1)
+    assert p1.w_route > 0.0
+    docked = _route_env((62, 66, 14), direction=0)._potential(p1)
+    for probe in ((55, 66, 14), (54, 68, 14), (56, 69, 14), (59, 69, 14),
+                  (63, 69, 14), (56, 63, 14), (59, 63, 14), (70, 66, 14)):
+        assert _route_env(probe)._potential(p1) < docked
+
+
+def test_phase_params_enable_route_in_completion_phases():
+    """w_route follows the w_close pattern: ON in the completion-learning phases 1-4, OFF in
+    phase 5 (completion mastered; quality phase keeps Phi lean)."""
+    W = ImprovedPhasedCurriculumWrapper
+    assert W._phase_reward_params(1).w_route == 3.0
+    for s in (1, 2, 3):
+        assert W._phase_reward_params(2, phase2_stage=s).w_route == 3.0
+    assert W._phase_reward_params(3).w_route == 3.0
+    assert W._phase_reward_params(4).w_route == 3.0
+    assert W._phase_reward_params(5).w_route == 0.0
+
+
+def test_episode_metrics_expose_route_potential(monkeypatch):
+    """Diagnostic-per-term: the route term's episode-end value is surfaced in episode_metrics
+    so the training callback can log rewards/route_potential."""
+    monkeypatch.setattr(oe_mod, "APIController", CompletingAPI)
+    env = OpenRCT2Env(verbose=0)
+    env.skip_ride_testing = True
+    env.reward_params = ImprovedPhasedCurriculumWrapper._phase_reward_params(1)
+    env.reset()
+    _, _, terminated, truncated, info = _drive_to_terminal(env)
+    assert terminated or truncated
+    m = info['episode_metrics']
+    assert 'route_potential' in m
+    assert 0.0 <= m['route_potential'] <= env.reward_params.w_route + 1e-9
+
+
+# --------------------------------------------- roundtrip degeneracy + hill elevation
+
+def test_roundtrip_gain1_requires_actual_descent():
+    """At roundtrip_gain=1 the +1 return tolerance CONTAINED the 1-z summit: a single
+    action-10 stub fired summit AND roundtrip (and the 2.1 gate) with no return ever.
+    The return must now be strictly below the required-climb threshold."""
+    p = RewardParams(R_roundtrip=100.0, roundtrip_gain=1.0)
+    at_summit = _roundtrip_env(peak_z=15, head_z=15, p=p)     # placed one stub, still on it
+    at_summit._calculate_reward(True, 0)
+    assert at_summit._roundtrip_awarded is False              # no descent -> no round-trip
+    returned = _roundtrip_env(peak_z=15, head_z=14, p=p)      # actually came back down
+    returned._calculate_reward(True, 0)
+    assert returned._roundtrip_awarded is True
+
+
+def test_roundtrip_not_awarded_on_dive_below_station():
+    """The env paid a chain-climb-then-dive (z<=station+1 had no lower bound) while the
+    wrapper's mirror (abs<=1) did not count it -- silent gate/reward disagreement."""
+    p = RewardParams(R_roundtrip=100.0, roundtrip_gain=4.0)
+    dived = _roundtrip_env(peak_z=20, head_z=11, p=p)         # 3 below station
+    dived._calculate_reward(True, 0)
+    assert dived._roundtrip_awarded is False
+
+
+def test_hill_quality_scales_with_chain_elevation():
+    """Chain PIECES alone are farmable: three scattered 1-z stubs must not equal a full
+    lift hill for the completion gate / structural bonus. Quality is elevation-scaled
+    against the stage's climb bar (roundtrip_gain)."""
+    p = RewardParams(R_struct_max=250.0, struct_chain_target=3, struct_w_chain=1.0,
+                     struct_w_drop=0.0, roundtrip_gain=3.0)
+    stubs = _bare_env(history=[
+        {"action": 9, "position": [i, 0, 14], "next_position": [i, 0, 15]} for i in range(3)
+    ])                                                        # 3 chain pieces, peak +1
+    full = _struct_env(chains=3)                              # 3 chain pieces climbing to +3
+    assert full._structural_bonus(p) == pytest.approx(250.0)
+    assert stubs._structural_bonus(p) == pytest.approx(250.0 / 3)   # count 1.0 x gain 1/3
+    assert stubs._hill_quality(p) < full._hill_quality(p)
+
+
+def test_stage23_climb_bar_matches_canonical_hill():
+    """The canonical hill [10,9,13] banks chain-gain 3 (the crest piece isn't chained);
+    a 4.0 bar made the 2.3/P3/P4 roundtrip milestone and w_return descent shaping
+    silently inert for the exact hill the curriculum teaches."""
+    W = ImprovedPhasedCurriculumWrapper
+    assert RewardParams().roundtrip_gain == 3.0
+    assert W._phase_reward_params(2, phase2_stage=3).roundtrip_gain == 3.0
+    for phase in (3, 4):
+        assert W._phase_reward_params(phase).roundtrip_gain == 3.0
+
+
+def test_autobacktrack_still_pays_the_failure_penalty(monkeypatch):
+    """The forced remove used to REPLACE the fail penalty with the remove's PBRS delta --
+    the agent's chosen (failed) action escaped its penalty whenever auto-backtrack fired."""
+    monkeypatch.setattr(oe_mod, "APIController", FlakyAPI)
+    env = OpenRCT2Env(verbose=0)
+    env.skip_ride_testing = True
+    env.reset()
+    env.step(0)                                # one real piece so the remove has a target
+    env.api_controller.fail_places = True
+    rewards = []
+    for _ in range(3):                         # 3rd failure triggers the forced remove
+        _, r, _, _, info = env.step(0)
+        rewards.append(r)
+    assert info['auto_backtracked'] is True
+    p = env.reward_params
+    phi_term = rewards[-1] - p.fail_penalty    # forced-remove step = PBRS delta + fail penalty
+    assert rewards[-1] < phi_term              # the penalty is actually included
+
+
+def test_failed_remove_does_not_reset_failure_counter(monkeypatch):
+    monkeypatch.setattr(oe_mod, "APIController", FakeAPI)
+    env = OpenRCT2Env(verbose=0)
+    env.skip_ride_testing = True
+    env.reset()
+    env.consecutive_failures = 2
+    env.step(31)                               # empty history -> remove fails
+    assert env.consecutive_failures == 2       # a failed remove is not a recovery
+
+
+def test_probe_log_stops_after_anchor_locks():
+    """closing_probe.jsonl exists to confirm the closing geometry empirically; once the
+    anchor is locked its purpose is fulfilled -- unbounded per-completion appends over a
+    multi-million-step run are pure disk growth."""
+    import os
+    OpenRCT2Env._close_cache = {"pos": [62, 66, 14], "dir": 0, "action": 0, "track_type": 0}
+    env = _bare_env()
+    env.loop_completed = True
+    env.track_builder = SimpleNamespace(history=_completing_history())
+    env._maybe_capture_closing_geometry()
+    path = os.path.join(os.path.dirname(OpenRCT2Env._CLOSE_CACHE_PATH), "closing_probe.jsonl")
+    assert not os.path.exists(path)            # locked anchor -> no more probe lines

@@ -198,18 +198,21 @@ def test_clear_calibration_cache_removes_stale_file(tmp_path, monkeypatch):
 
 def test_callback_arms_kl_guard_when_phase2_begins():
     """The phase-2 transition is where the KL=2.49 catastrophe happened, so the guard
-    (target_kl + raised ent_coef) must arm exactly when the curriculum reaches phase 2 --
+    (target_kl + raised ent_coef) must arm when the FLEET majority reaches phase 2 --
     and stay armed (one-way switch, phases never go backward)."""
     from types import SimpleNamespace
     cb = T.ParallelCurriculumMaskableCallback(n_envs=2)
     cb.model = SimpleNamespace(target_kl=None, ent_coef=0.01)
 
     cb._maybe_arm_kl_guard({})                          # no phase info -> no-op
-    cb._maybe_arm_kl_guard({'learning_phase': 1})       # phase 1 -> stays in bootstrap config
+    cb._note_env_phase(0, {'learning_phase': 1})        # phase 1 -> stays in bootstrap config
+    cb._maybe_arm_kl_guard({'learning_phase': 1})
     assert cb.model.target_kl is None
     assert cb.model.ent_coef == 0.01
 
-    cb._maybe_arm_kl_guard({'learning_phase': 2})       # phase 2 -> guard arms
+    cb._note_env_phase(0, {'learning_phase': 2, 'phase2_stage': 3})
+    cb._note_env_phase(1, {'learning_phase': 2, 'phase2_stage': 3})
+    cb._maybe_arm_kl_guard({'learning_phase': 2})       # fleet at phase 2 -> guard arms
     assert cb.model.target_kl == 0.04
     assert cb.model.ent_coef == 0.015                   # modest entropy floor (between 0.01/0.02)
 
@@ -228,6 +231,7 @@ def test_entropy_collapse_guard_boosts_when_entropy_low():
     from types import SimpleNamespace
     cb = T.ParallelCurriculumMaskableCallback(n_envs=2)
     cb.model = SimpleNamespace(target_kl=None, ent_coef=0.01)
+    cb._ent_mode = "normal"                             # legacy band (bootstrap band tested below)
     cb._maybe_guard_entropy_collapse(0.02)              # well under the floor -> boost
     assert cb.model.ent_coef == T.ENT_COLLAPSE_BOOST
     assert cb._ent_boosted is True
@@ -240,6 +244,7 @@ def test_entropy_collapse_guard_dormant_in_healthy_band():
     from types import SimpleNamespace
     cb = T.ParallelCurriculumMaskableCallback(n_envs=2)
     cb.model = SimpleNamespace(target_kl=None, ent_coef=0.01)
+    cb._ent_mode = "normal"
     cb._maybe_guard_entropy_collapse(0.20)
     assert cb.model.ent_coef == 0.01
     assert cb._ent_boosted is False
@@ -252,6 +257,7 @@ def test_entropy_collapse_guard_restores_phase_base_after_recovery():
     from types import SimpleNamespace
     cb = T.ParallelCurriculumMaskableCallback(n_envs=2)
     cb.model = SimpleNamespace(target_kl=None, ent_coef=T.ENT_COLLAPSE_BOOST)
+    cb._ent_mode = "normal"
     cb._ent_boosted = True
     cb._ent_boost_calls = 0
     for _ in range(T.ENT_BOOST_MIN_HOLD):              # recovered; ride out the min-hold -> restore
@@ -266,6 +272,7 @@ def test_entropy_collapse_guard_hysteresis_holds_boost_in_band():
     from types import SimpleNamespace
     cb = T.ParallelCurriculumMaskableCallback(n_envs=2)
     cb.model = SimpleNamespace(target_kl=None, ent_coef=T.ENT_COLLAPSE_BOOST)
+    cb._ent_mode = "normal"
     cb._ent_boosted = True
     cb._maybe_guard_entropy_collapse(0.20)              # in the band -> hold the boost
     assert cb.model.ent_coef == T.ENT_COLLAPSE_BOOST
@@ -279,8 +286,10 @@ def test_entropy_collapse_guard_restore_tracks_phase2_base():
     from types import SimpleNamespace
     cb = T.ParallelCurriculumMaskableCallback(n_envs=2)
     cb.model = SimpleNamespace(target_kl=None, ent_coef=0.01)
+    cb._ent_mode = "normal"
     cb._maybe_guard_entropy_collapse(0.02)              # boost in phase 1
     assert cb.model.ent_coef == T.ENT_COLLAPSE_BOOST
+    cb._phase = 2                                       # _on_step captures this before arming
     cb._maybe_arm_kl_guard({'learning_phase': 2})       # arm while boosted
     assert cb.model.target_kl == 0.04
     assert cb.model.ent_coef == T.ENT_COLLAPSE_BOOST    # boost preserved, NOT clobbered to 0.015
@@ -297,7 +306,9 @@ def test_phase_base_ent_coef_is_early_phase2_aware():
     from types import SimpleNamespace
     cb = T.ParallelCurriculumMaskableCallback(n_envs=2)
     cb.model = SimpleNamespace(target_kl=None, ent_coef=0.01)
-    assert cb._phase_base_ent_coef() == T.OPT_PHASE1['ent_coef']     # not guarded -> bootstrap floor
+    assert cb._phase_base_ent_coef() == T.PHASE1_BOOTSTRAP_ENT_COEF  # fresh run: bootstrap floor
+    cb._ent_mode = "normal"
+    assert cb._phase_base_ent_coef() == T.OPT_PHASE1['ent_coef']     # cold completions flowing
     cb._opt_guarded = True
     cb._phase, cb._phase2_stage = 2, 1
     assert cb._phase_base_ent_coef() == T.PHASE2_EARLY_ENT_COEF      # raised floor in stage 2.1
@@ -367,6 +378,147 @@ def test_entropy_collapse_constants_form_a_valid_hysteresis_band():
     assert 0.0 < T.ENT_COLLAPSE_LO < T.ENT_COLLAPSE_HI
     assert T.ENT_COLLAPSE_BOOST > T.OPT_PHASE1['ent_coef']     # boost is an increase ...
     assert T.ENT_COLLAPSE_BOOST > T.OPT_GUARDED['ent_coef']    # ... above either phase base
+
+
+# --------------------------- progress-conditional Phase-1 entropy floor (bootstrap mode)
+# The Jun-24 run collapsed to ~0.2 nats by 130k steps and never sampled a docking sequence
+# again: the 0.12/0.30 band is tuned for EXPLOITING completions, not discovering them. The
+# callback now starts in "bootstrap" mode (higher floor 0.025 + raised band) and hands back
+# to the proven config only once COLD-episode completions actually flow.
+
+def _fresh_cb(phase=1):
+    from types import SimpleNamespace
+    cb = T.ParallelCurriculumMaskableCallback(n_envs=2)
+    cb.model = SimpleNamespace(target_kl=None, ent_coef=0.01)
+    cb._phase = phase
+    return cb
+
+
+def test_bootstrap_mode_is_initial_floor_and_band():
+    cb = _fresh_cb()
+    assert cb._ent_mode == "bootstrap"                  # rate is 0 by definition at start
+    assert cb._phase_base_ent_coef() == T.PHASE1_BOOTSTRAP_ENT_COEF
+    assert cb._ent_band() == (T.BOOT_ENT_LO, T.BOOT_ENT_HI, T.BOOT_ENT_BOOST)
+    cb._rebaseline_ent_coef()                           # applied at the first rollout end
+    assert cb.model.ent_coef == T.PHASE1_BOOTSTRAP_ENT_COEF
+
+
+def test_bootstrap_band_boosts_at_dormant_zone_entropy():
+    """0.20 nats is 'healthy' for exploiting completions but is exactly the dormant-zone
+    freeze the Jun-24 run died in -- in bootstrap mode the guard must fire there."""
+    cb = _fresh_cb()
+    cb._maybe_guard_entropy_collapse(0.20)
+    assert cb._ent_boosted is True
+    assert cb.model.ent_coef == T.BOOT_ENT_BOOST
+
+
+def test_bootstrap_exits_on_any_completions_after_min_hold():
+    """The floor is anti-collapse insurance, keyed on ANY-episode completions (scaffolded
+    included): with warm starts active, scaffolded +1000s flow by construction, and holding
+    0.025 entropy then CAPS the sharpening the scaffold exists to teach (smoke run 2
+    plateaued at ~15% = the random baseline). Cold rate remains the PHASE-GATE metric only."""
+    cb = _fresh_cb()
+    for _ in range(T.COMPLETION_RATE_MIN_SAMPLES):
+        cb._completion_window.append(True)              # scaffolded completions flowing
+    for _ in range(T.ENT_MODE_MIN_HOLD - 1):
+        cb._maybe_update_ent_mode()
+    assert cb._ent_mode == "bootstrap"                  # min-hold not yet elapsed
+    cb._maybe_update_ent_mode()
+    assert cb._ent_mode == "normal"
+    assert cb._phase_base_ent_coef() == T.OPT_PHASE1['ent_coef']   # proven config restored
+    assert cb._ent_band() == (T.ENT_COLLAPSE_LO, T.ENT_COLLAPSE_HI, T.ENT_COLLAPSE_BOOST)
+
+
+def test_bootstrap_holds_without_enough_completion_samples():
+    cb = _fresh_cb()
+    for _ in range(T.COMPLETION_RATE_MIN_SAMPLES - 1):  # not yet statistically meaningful
+        cb._completion_window.append(True)
+    for _ in range(3 * T.ENT_MODE_MIN_HOLD):
+        cb._maybe_update_ent_mode()
+    assert cb._ent_mode == "bootstrap"
+
+
+def test_bootstrap_reenters_when_all_completions_die():
+    cb = _fresh_cb()
+    for _ in range(T.COMPLETION_RATE_MIN_SAMPLES):
+        cb._completion_window.append(True)
+    for _ in range(T.ENT_MODE_MIN_HOLD):
+        cb._maybe_update_ent_mode()
+    assert cb._ent_mode == "normal"
+    cb._completion_window.clear()
+    for _ in range(T.COMPLETION_RATE_MIN_SAMPLES):
+        cb._completion_window.append(False)             # completions died entirely (rate 0)
+    for _ in range(T.ENT_MODE_MIN_HOLD - 1):
+        cb._maybe_update_ent_mode()
+    assert cb._ent_mode == "normal"                     # min-hold since last flip
+    cb._maybe_update_ent_mode()
+    assert cb._ent_mode == "bootstrap"
+
+
+def test_bootstrap_exits_when_phase_advances():
+    cb = _fresh_cb(phase=2)                             # bootstrap is a phase-1 concern
+    for _ in range(T.ENT_MODE_MIN_HOLD):
+        cb._maybe_update_ent_mode()
+    assert cb._ent_mode == "normal"
+
+
+def test_callback_pools_cold_flags_from_infos_without_ipc():
+    """The mode machine reads (cold_start, loop_completed) straight from episode-end infos --
+    no get_attr/env_method collectives (the no-IPC invariant the metric logging already pins)."""
+    from types import SimpleNamespace
+
+    cb = T.ParallelCurriculumMaskableCallback(n_envs=2)
+
+    class _SpyEnv:
+        def __init__(self):
+            self.get_attr_calls = []
+            self.env_method_calls = []
+
+        def get_attr(self, name, *a, **k):
+            self.get_attr_calls.append(name)
+            return [0, 0]
+
+        def env_method(self, name, *a, **k):
+            self.env_method_calls.append(name)
+            return [(0.0,), (0.0,)]
+
+    spy = _SpyEnv()
+    logger = SimpleNamespace(record=lambda key, val, *a, **k: None)
+    cb.model = SimpleNamespace(get_env=lambda: spy, logger=logger, ent_coef=0.01, target_kl=None)
+    cb.locals = {
+        'dones': [True, True],
+        'infos': [
+            {'loop_completed': True, 'cold_start': True,
+             'track_length': 12, 'current_distance': 0.0, 'collision_count': 0},
+            {'loop_completed': True, 'cold_start': False,   # scaffolded: must NOT pollute
+             'track_length': 3, 'current_distance': 0.0, 'collision_count': 0},
+        ],
+    }
+    assert cb._on_step() is True
+    assert list(cb._completion_window) == [True, True]  # every episode feeds the floor's window
+    assert list(cb._cold_window) == [True]              # only the cold episode feeds the gate tag
+    assert spy.get_attr_calls == [] and spy.env_method_calls == []
+
+
+def test_rollout_end_logs_ent_floor_mode_and_cold_rate():
+    from types import SimpleNamespace
+    cb = _fresh_cb()
+    recorded = {}
+    cb.model.logger = SimpleNamespace(
+        name_to_value={},
+        record=lambda key, val, *a, **k: recorded.__setitem__(key, val))
+    for _ in range(T.COMPLETION_RATE_MIN_SAMPLES):
+        cb._cold_window.append(False)
+    cb._on_rollout_end()
+    assert recorded['optim/ent_floor_mode'] == 1.0      # bootstrap
+    assert recorded['success/cold_completion_rate'] == 0.0
+
+
+def test_bootstrap_constants_are_sane():
+    assert T.OPT_PHASE1['ent_coef'] < T.PHASE1_BOOTSTRAP_ENT_COEF < T.BOOT_ENT_BOOST
+    assert 0.0 < T.BOOT_ENT_LO < T.BOOT_ENT_HI
+    assert T.ENT_COLLAPSE_HI <= T.BOOT_ENT_LO or T.BOOT_ENT_LO > T.ENT_COLLAPSE_LO  # raised band
+    assert 0.0 < T.COMPLETION_RATE_ENTER < T.COMPLETION_RATE_EXIT < 1.0
 
 
 def test_entropy_guard_reads_live_entropy_at_rollout_end(monkeypatch):
@@ -512,3 +664,212 @@ def test_save_vecnormalize_callback_writes_per_checkpoint_stats(monkeypatch, tmp
     model.learn(total_timesteps=16, callback=cb)
     assert list(tmp_path.glob("ckpt_*_steps_vecnormalize.pkl")), "callback wrote no stats"
     env.close()
+
+
+def test_fresh_run_resets_tb_run_dir_resume_does_not(monkeypatch, tmp_path):
+    """A fresh run must pass reset_num_timesteps=True on its FIRST learn chunk: SB3 only
+    starts a new TB run dir then, so passing False unconditionally appended every fresh
+    run's events into the previous run's PPO_0 (overlaid, unrelated curves). Later chunks
+    and resumes keep False (continue the same run / step counter)."""
+    from types import SimpleNamespace
+    from openrct2_gym.envs.openrct2_env import OpenRCT2Env
+    monkeypatch.setattr(oe_mod, "APIController", FakeAPI)
+    monkeypatch.setattr(OpenRCT2Env, "_CLOSE_CACHE_PATH", str(tmp_path / "close.json"))
+    monkeypatch.setattr(OpenRCT2Env, "_LOOP_LIBRARY_PATH", str(tmp_path / "lib.jsonl"))
+    monkeypatch.setattr(T, "evaluate_policy", lambda *a, **k: (0.0, 0.0))
+
+    calls = []
+
+    class StubPPO:
+        def __init__(self, *a, **k):
+            self.gamma = T.GAMMA
+
+        @classmethod
+        def load(cls, path, env=None):
+            return cls()
+
+        def learn(self, total_timesteps, callback=None, reset_num_timesteps=None):
+            calls.append(reset_num_timesteps)
+
+        def save(self, path):
+            pass
+
+        def get_vec_normalize_env(self):
+            return None
+
+        def get_env(self):
+            return None
+
+    monkeypatch.setattr(T, "MaskablePPO", StubPPO)
+
+    # Fresh run, two chunks (eval_freq 8 over 16 steps): first True, then False.
+    T.train([8080], total_timesteps=16, checkpoint_freq=1000, eval_freq=8,
+            verbose=0, eval_episodes=1, disable_eval=False)
+    assert calls == [True, False]
+
+    # Resume (model file exists): never reset -- continue the checkpoint's run.
+    calls.clear()
+    ckpt = tmp_path / "model.zip"
+    ckpt.write_bytes(b"stub")
+    T.train([8080], total_timesteps=16, checkpoint_freq=1000, eval_freq=8,
+            model_path=str(ckpt), verbose=0, eval_episodes=1, disable_eval=False)
+    assert calls == [False, False]
+
+
+def test_resolve_model_path_variants(tmp_path):
+    """--model-path with a typo (or the extension-less form SB3 tolerates on load) must
+    NOT silently fall through to training-from-scratch: that wipes the calibration, loads
+    the OLD VecNormalize stats onto a fresh policy, and wastes the whole run."""
+    exact = tmp_path / "model.zip"
+    exact.write_bytes(b"x")
+    assert T._resolve_model_path(None) is None
+    assert T._resolve_model_path(str(exact)) == str(exact)
+    assert T._resolve_model_path(str(tmp_path / "model")) == str(exact)   # .zip appended
+    with pytest.raises(SystemExit):
+        T._resolve_model_path(str(tmp_path / "nope"))
+
+
+def test_final_model_saved_even_when_env_close_raises(monkeypatch, tmp_path):
+    """A dead SubprocVecEnv worker makes env.close() raise inside finally -- the final
+    model save must happen BEFORE close and survive it."""
+    from types import SimpleNamespace
+    from openrct2_gym.envs.openrct2_env import OpenRCT2Env
+    monkeypatch.setattr(oe_mod, "APIController", FakeAPI)
+    monkeypatch.setattr(OpenRCT2Env, "_CLOSE_CACHE_PATH", str(tmp_path / "close.json"))
+    monkeypatch.setattr(OpenRCT2Env, "_LOOP_LIBRARY_PATH", str(tmp_path / "lib.jsonl"))
+    monkeypatch.setattr(DummyVecEnv, "close", lambda self: (_ for _ in ()).throw(EOFError("dead worker")))
+
+    saved = []
+
+    class StubPPO:
+        def __init__(self, *a, **k):
+            self.gamma = T.GAMMA
+            self._last_obs = object()
+
+        @classmethod
+        def load(cls, path, env=None):
+            return cls()
+
+        def learn(self, total_timesteps, callback=None, reset_num_timesteps=None):
+            pass
+
+        def save(self, path):
+            saved.append(path)
+
+        def get_vec_normalize_env(self):
+            return None
+
+        def get_env(self):
+            return None
+
+    monkeypatch.setattr(T, "MaskablePPO", StubPPO)
+    T.train([8080], total_timesteps=8, checkpoint_freq=1000, eval_freq=0,
+            verbose=0, disable_eval=True)                 # must not raise
+    assert saved and saved[-1].endswith("final_model")
+
+
+def test_eval_auto_disabled_for_multi_env(monkeypatch, tmp_path):
+    """SubprocVecEnv eval cannot reach the wrappers (no stat suppression, scaffolded
+    episodes measured, model._last_obs desync): eval must hard-disable at n_envs>1."""
+    from openrct2_gym.envs.openrct2_env import OpenRCT2Env
+    monkeypatch.setattr(oe_mod, "APIController", FakeAPI)
+    monkeypatch.setattr(OpenRCT2Env, "_CLOSE_CACHE_PATH", str(tmp_path / "close.json"))
+    monkeypatch.setattr(OpenRCT2Env, "_LOOP_LIBRARY_PATH", str(tmp_path / "lib.jsonl"))
+    monkeypatch.setattr(T, "SubprocVecEnv", DummyVecEnv)  # run "2 workers" in-process
+    evals = []
+    monkeypatch.setattr(T, "evaluate_policy", lambda *a, **k: evals.append(1) or (0.0, 0.0))
+
+    class StubPPO:
+        def __init__(self, *a, **k):
+            self.gamma = T.GAMMA
+            self._last_obs = object()
+
+        @classmethod
+        def load(cls, path, env=None):
+            return cls()
+
+        def learn(self, total_timesteps, callback=None, reset_num_timesteps=None):
+            pass
+
+        def save(self, path):
+            pass
+
+        def get_vec_normalize_env(self):
+            return None
+
+        def get_env(self):
+            return None
+
+    monkeypatch.setattr(T, "MaskablePPO", StubPPO)
+    T.train([8080, 8081], total_timesteps=16, checkpoint_freq=1000, eval_freq=8,
+            verbose=0, eval_episodes=1, disable_eval=False)
+    assert evals == []                                    # eval never ran
+
+
+def test_single_env_eval_resets_last_obs(monkeypatch, tmp_path):
+    """evaluate_policy steps the TRAINING env, leaving model._last_obs stale against the
+    real env state; the next collect would pair pre-eval obs with post-eval env. Clearing
+    _last_obs forces a clean reset at the next learn chunk."""
+    from openrct2_gym.envs.openrct2_env import OpenRCT2Env
+    monkeypatch.setattr(oe_mod, "APIController", FakeAPI)
+    monkeypatch.setattr(OpenRCT2Env, "_CLOSE_CACHE_PATH", str(tmp_path / "close.json"))
+    monkeypatch.setattr(OpenRCT2Env, "_LOOP_LIBRARY_PATH", str(tmp_path / "lib.jsonl"))
+    monkeypatch.setattr(T, "evaluate_policy", lambda *a, **k: (0.0, 0.0))
+    observed = []
+
+    class StubPPO:
+        def __init__(self, *a, **k):
+            self.gamma = T.GAMMA
+            self._last_obs = object()
+
+        @classmethod
+        def load(cls, path, env=None):
+            return cls()
+
+        def learn(self, total_timesteps, callback=None, reset_num_timesteps=None):
+            observed.append(self._last_obs)               # what the next chunk would start from
+            self._last_obs = object()
+
+        def save(self, path):
+            pass
+
+        def get_vec_normalize_env(self):
+            return None
+
+        def get_env(self):
+            return None
+
+    monkeypatch.setattr(T, "MaskablePPO", StubPPO)
+    T.train([8080], total_timesteps=16, checkpoint_freq=1000, eval_freq=8,
+            verbose=0, eval_episodes=1, disable_eval=False)
+    assert len(observed) == 2
+    assert observed[1] is None                            # post-eval chunk starts clean
+
+
+def test_kl_guard_arms_on_fleet_majority_not_first_worker():
+    """Per-worker curricula desync: arming target_kl the moment ONE worker touches phase 2
+    throttles the +1000-spike exploitation every other worker's phase-1 bootstrap depends
+    on. The guard arms only when the majority of workers are past phase 1."""
+    from types import SimpleNamespace
+    cb = T.ParallelCurriculumMaskableCallback(n_envs=3)
+    cb.model = SimpleNamespace(target_kl=None, ent_coef=0.01)
+    cb._note_env_phase(0, {'learning_phase': 2, 'phase2_stage': 1})
+    cb._maybe_arm_kl_guard({'learning_phase': 2})
+    assert cb.model.target_kl is None                     # 1 of 3: no arm
+    cb._note_env_phase(1, {'learning_phase': 2, 'phase2_stage': 1})
+    cb._maybe_arm_kl_guard({'learning_phase': 2})
+    assert cb.model.target_kl == T.OPT_GUARDED['target_kl']   # 2 of 3: majority -> arm
+    assert cb._phase == 2                                 # fleet phase follows the majority
+
+
+def test_resumed_model_with_armed_guard_is_recognized():
+    """Resume rebuilds the callback fresh (bootstrap floor 0.025) while the LOADED model
+    still carries target_kl=0.04 -- the destructive high-entropy+tight-KL combination.
+    The callback must recognize an already-armed guard at the first rollout end."""
+    from types import SimpleNamespace
+    cb = _fresh_cb()
+    cb.model.target_kl = 0.04                             # loaded from checkpoint
+    cb.model.logger = SimpleNamespace(name_to_value={}, record=lambda *a, **k: None)
+    cb._on_rollout_end()
+    assert cb._opt_guarded is True
+    assert cb.model.ent_coef == T.OPT_GUARDED['ent_coef'] # guarded floor, not bootstrap 0.025

@@ -1,6 +1,7 @@
 class APITrackBuilder:
-    def __init__(self, api_controller):
+    def __init__(self, api_controller, verbose=0):
         self.api = api_controller
+        self.verbose = verbose  # gates the hot-path prints (20 workers x 50% completions = spam)
         self.direction_vectors = [
             (0, 1),   # North (0)
             (1, 0),   # East (1)
@@ -74,6 +75,23 @@ class APITrackBuilder:
         
         # Actions that should add chain lift
         self.chain_lift_actions = {9, 10}  # Up 25° with chain, Flat to Up 25° with chain
+
+        # Entry-z offsets for DESCENDING track types (live-probed against the plugin,
+        # Jul 2026). placeTrackPiece takes a piece's BASE z, but its validation requires
+        # the piece's TRAIN ENTRY -- which for descents sits ABOVE the base by the piece's
+        # z-span -- to continue from the previous piece's end. Passing the head z
+        # unadjusted made EVERY descending placement fail ("train entry would be ...,
+        # previous piece ends at ..."), silently removing drops from the action space.
+        # Spans match the ascent counterparts: 25deg = 2 z/tile, 60deg = 8 z/tile,
+        # flat<->25 transitions = 1, 25<->60 transitions = 4.
+        self.descent_entry_z_offset = {
+            10: 2,   # Down25
+            11: 8,   # Down60
+            12: 1,   # FlatToDown25
+            13: 4,   # Down25ToDown60
+            14: 4,   # Down60ToDown25
+            15: 1,   # Down25ToFlat
+        }
         
     def _cache_valid_from_payload(self, payload):
         """Cache valid next track types from a placement/deletion payload.
@@ -122,26 +140,30 @@ class APITrackBuilder:
                         new_direction = last_entry["next_direction"]
                 
                 pieces_remaining = payload.get("piecesRemaining", 0)
-                if pieces_remaining == 0:
+                if pieces_remaining == 0 and self.verbose >= 2:
                     print("All track pieces removed, only station remains")
             else:
                 success = False
-                error_msg = resp.get("error", "Unknown error")
-                print(f"Failed to delete track piece: {error_msg}")
+                if self.verbose >= 1:
+                    print(f"Failed to delete track piece: {resp.get('error', 'Unknown error')}")
                 
             return success, new_position, new_direction
         
         # Get track type for this action
         track_type = self.action_to_track_type.get(action, 0)
-        
+
         # Check if we should add chain lift (only for specific actions)
         has_chain = action in self.chain_lift_actions
-        
+
+        # Descending pieces are placed at their BASE z (entry minus the piece's drop);
+        # see descent_entry_z_offset above.
+        place_z = current_position[2] - self.descent_entry_z_offset.get(track_type, 0)
+
         # Try to place the track piece
         resp = self.api.place_track_piece(
             current_position[0],
             current_position[1],
-            current_position[2],
+            place_z,
             current_direction,
             track_type,
             has_chain
@@ -170,7 +192,7 @@ class APITrackBuilder:
             # Cache valid next pieces returned with the placement (saves a round-trip).
             self._cache_valid_from_payload(resp["payload"])
 
-            if is_complete:
+            if is_complete and self.verbose >= 1:
                 print(f"[API] Circuit complete detected! Track returned to station after {len(self.history)} pieces.")
                 print(f"[API] Final position: {new_position}, Direction: {new_direction}")
         

@@ -29,7 +29,9 @@ def main():
     args = parser.parse_args()
 
     env = DummyVecEnv([
-        lambda: create_curriculum_masked_env(args.port, verbose=1)
+        # Inference must show the TRUE task: no warm-start scaffolding (the env would
+        # otherwise pre-build most of the loop before the model acts).
+        lambda: create_curriculum_masked_env(args.port, verbose=1, warm_start_enabled=False)
     ])
 
     stats_path = args.vecnormalize or _vecnormalize_path(args.model)

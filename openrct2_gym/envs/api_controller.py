@@ -4,6 +4,11 @@ import random
 import time
 
 class APIController:
+    # Consecutive fully-timed-out requests before raising: a HUNG game instance otherwise
+    # drags the whole synchronized SubprocVecEnv fleet to ~1 step / 7s forever with no error
+    # surfaced. Raising kills this worker loudly; the run ends with checkpoints intact.
+    MAX_CONSECUTIVE_TIMEOUTS = 10
+
     def __init__(self, host="localhost", port=8080, verbose=1):
         self.host = host
         self.port = port
@@ -11,6 +16,11 @@ class APIController:
         self.sock = None
         self.ride_id = None
         self.station_length = 6
+        # Protocol-hygiene state: a request that timed out may have been APPLIED server-side
+        # (placements are not idempotent), so callers must be able to see it and sacrifice
+        # the episode rather than continue from a possibly-desynced head.
+        self.last_request_timed_out = False
+        self.consecutive_timeouts = 0
         
     def connect(self):
         try:
@@ -38,19 +48,23 @@ class APIController:
         time.sleep(0.1)  # Brief delay before reconnect
         return self.connect()
 
-    def send_request(self, request, max_retries=3, base_timeout=0.5):
+    def send_request(self, request, max_retries=3, base_timeout=1.0):
         """
         Send request with retry logic and proper resource cleanup.
 
         Args:
             request: The request dictionary to send
             max_retries: Maximum number of retry attempts (default: 3)
-            base_timeout: Base timeout in seconds, doubles each retry (default: 0.5)
+            base_timeout: Base timeout in seconds, doubles each retry (default: 1.0). Raised
+                from 0.5 so a transient slow response under heavy (~20x) parallelism doesn't
+                trip a spurious timeout -> reconnect, which would re-establish the socket
+                mid-episode and turn that worker into a straggler under the synchronized barrier.
 
         Returns:
             Response dictionary with 'success' key
         """
         endpoint = request.get('endpoint', 'unknown')
+        self.last_request_timed_out = False
 
         for attempt in range(max_retries):
             # Ensure we have a connection
@@ -62,7 +76,7 @@ class APIController:
                     return {"success": False, "error": "Not connected to API server"}
 
             try:
-                # Set timeout with exponential backoff: 0.5s, 1s, 2s
+                # Set timeout with exponential backoff (default base 1.0s): 1s, 2s, 4s
                 timeout = base_timeout * (2 ** attempt)
                 self.sock.settimeout(timeout)
 
@@ -76,7 +90,9 @@ class APIController:
                     line = file_obj.readline()
                     if not line:
                         raise socket.timeout("Empty response from server")
-                    return json.loads(line)
+                    resp = json.loads(line)
+                    self.consecutive_timeouts = 0
+                    return resp
                 finally:
                     file_obj.close()  # Fix: Always close the file object
 
@@ -86,6 +102,17 @@ class APIController:
                 if attempt < max_retries - 1:
                     self._reconnect()
                     continue
+                # Final attempt: the socket has an ABANDONED in-flight request -- keeping it
+                # would make every later response off-by-one (the next endpoint would read
+                # THIS request's late reply). Drop it; the next request reconnects clean.
+                self.disconnect()
+                self.last_request_timed_out = True
+                self.consecutive_timeouts += 1
+                if self.consecutive_timeouts >= self.MAX_CONSECUTIVE_TIMEOUTS:
+                    raise RuntimeError(
+                        f"OpenRCT2 instance on port {self.port} unresponsive: "
+                        f"{self.consecutive_timeouts} consecutive request timeouts "
+                        f"(endpoint {endpoint})")
                 return {"success": False, "error": f"Request timeout after {max_retries} attempts"}
 
             except (ConnectionError, BrokenPipeError, ConnectionResetError) as e:
@@ -94,9 +121,13 @@ class APIController:
                 if attempt < max_retries - 1:
                     self._reconnect()
                     continue
+                self.disconnect()   # stream state unknown -- never reuse
                 return {"success": False, "error": f"Connection error: {e}"}
 
             except json.JSONDecodeError as e:
+                # Non-JSON line: the stream framing is unknown (torn/foreign reply); the
+                # socket cannot be trusted for even one more request.
+                self.disconnect()
                 return {"success": False, "error": f"Invalid JSON response: {e}"}
 
             except Exception as e:
@@ -105,6 +136,7 @@ class APIController:
                 if attempt < max_retries - 1:
                     self._reconnect()
                     continue
+                self.disconnect()
                 return {"success": False, "error": f"Request failed: {e}"}
 
         return {"success": False, "error": "Max retries exceeded"}
@@ -129,7 +161,44 @@ class APIController:
         else:
             print(f"createRide failed: {resp}")
             return None
-    
+
+    def reset_episode(self, station_length=6, start=(61, 66, 14), start_direction=0, ride_type=52):
+        """One-round-trip episode reset: server-side demolish-all + create-ride + build-station.
+
+        Replaces the legacy delete_all_rides() + create_ride() + N*place_track_piece() sequence
+        (8 round-trips) with a single request. Under heavy parallelism every synchronized
+        vector-step waits on the slowest worker's reset, so collapsing it is a large win.
+
+        Returns the payload dict {rideId, finalEndpoint, validNextPieces} on success (and sets
+        self.ride_id), or None on failure / when the plugin lacks the endpoint, so the caller
+        can fall back to the multi-call path.
+        """
+        req = {
+            "endpoint": "resetEpisode",
+            "params": {
+                "stationLength": station_length,
+                "startX": start[0],
+                "startY": start[1],
+                "startZ": start[2],
+                "startDir": start_direction,
+                "rideType": ride_type,
+            },
+        }
+        # resetEpisode runs ~8 game actions server-side (demolish + create + N station
+        # placements), so it gets a more generous base timeout than a per-step request. A
+        # timeout/retry is safe: the handler demolishes all rides first, so a re-run just
+        # rebuilds from a clean slate.
+        resp = self.send_request(req, base_timeout=2.0)
+        if resp.get("success"):
+            payload = resp.get("payload", {})
+            ride_id = payload.get("rideId")
+            if ride_id is not None:
+                self.ride_id = ride_id
+                return payload
+        if self.verbose >= 1:
+            print(f"resetEpisode failed or unsupported: {resp.get('error', resp)}")
+        return None
+
     def place_track_piece(self, tile_x, tile_y, tile_z, direction, track_type, has_chain_lift=False):
         if self.ride_id is None:
             return {"success": False, "error": "No ride created"}
@@ -283,18 +352,6 @@ class APIController:
 
         req = {
             "endpoint": "getRideStats",
-            "params": {
-                "rideId": self.ride_id
-            }
-        }
-        return self.send_request(req)
-    
-    def place_entrance_exit(self):
-        if self.ride_id is None:
-            return {"success": False, "error": "No ride created"}
-            
-        req = {
-            "endpoint": "placeEntranceExit",
             "params": {
                 "rideId": self.ride_id
             }

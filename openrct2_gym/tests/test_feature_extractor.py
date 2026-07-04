@@ -15,6 +15,7 @@ from openrct2_gym.envs.obs_config import (
     MAP_SHAPE,
     HIST_FEAT_DIM,
     NUM_ACTIONS,
+    SCALARS_DIM,
 )
 from openrct2_gym.envs.feature_extractor import BuildHistoryExtractor
 
@@ -45,7 +46,7 @@ def _make_batch(batch=2, lengths=(5, 5), corrupt_pad=False):
         "build_history_mask": th.as_tensor(mask),
         "goal_disp": th.as_tensor(rng.uniform(-1, 1, size=(batch, 3)), dtype=th.float32),
         "goal_direction3": th.as_tensor(rng.uniform(-1, 1, size=(batch, 3)), dtype=th.float32),
-        "scalars": th.as_tensor(rng.uniform(-1, 1, size=(batch, 8)), dtype=th.float32),
+        "scalars": th.as_tensor(rng.uniform(-1, 1, size=(batch, SCALARS_DIM)), dtype=th.float32),
         # Discrete keys arrive one-hot (float) after SB3 preprocessing
         "current_direction": th.as_tensor(np.eye(4, dtype=np.float32)[rng.integers(0, 4, batch)]),
         "last_piece_type": th.as_tensor(np.eye(33, dtype=np.float32)[rng.integers(0, 33, batch)]),
@@ -72,7 +73,7 @@ def test_make_observation_space_shapes():
     assert space["build_history_mask"].shape == (SEQ_LEN,)
     assert space["goal_disp"].shape == (3,)
     assert space["goal_direction3"].shape == (3,)
-    assert space["scalars"].shape == (8,)
+    assert space["scalars"].shape == (SCALARS_DIM,)   # 8 legacy + 4 corridor/route features
     assert isinstance(space["current_direction"], gym.spaces.Discrete)
     assert space["current_direction"].n == 4
     assert isinstance(space["last_piece_type"], gym.spaces.Discrete)

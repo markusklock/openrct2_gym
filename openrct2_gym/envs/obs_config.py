@@ -19,8 +19,14 @@ MAP_SIZE = 24            # H == W of the egocentric, forward-aligned crop
 MAP_SHAPE = (MAP_CHANNELS, MAP_SIZE, MAP_SIZE)
 
 # --- normalization scales (tunable) ----------------------------------------------
-SCALE = 100.0            # horizontal/relative displacement normalizer (tiles)
+SCALE = 32.0             # horizontal/relative displacement normalizer (tiles). 32, not 100:
+                         # phase-1 loop distances are <=~30 tiles, so goal_disp/history feats
+                         # actually use the [-1, 1] range instead of idling in [-0.25, 0.25].
 H_SCALE = 30.0           # vertical relief normalizer (tiles), signed in [-1, 1]
+
+# --- continuous scalars vector ----------------------------------------------------
+SCALARS_DIM = 12         # 8 legacy + [along/16, perp/8, heading_cos, route_progress] --
+                         # the corridor coordinates Phi pays on, exposed to the policy
 
 # --- categorical sizes ------------------------------------------------------------
 DIRECTION_N = 4          # current_direction (cardinal)
@@ -41,7 +47,7 @@ def make_observation_space() -> gym.spaces.Dict:
         "build_history_mask": gym.spaces.Box(low=0.0, high=1.0, shape=(SEQ_LEN,), dtype=np.float32),
         "goal_disp": gym.spaces.Box(low=-1.0, high=1.0, shape=(3,), dtype=np.float32),
         "goal_direction3": gym.spaces.Box(low=-1.0, high=1.0, shape=(3,), dtype=np.float32),
-        "scalars": gym.spaces.Box(low=-10.0, high=10.0, shape=(8,), dtype=np.float32),
+        "scalars": gym.spaces.Box(low=-10.0, high=10.0, shape=(SCALARS_DIM,), dtype=np.float32),
         "current_direction": gym.spaces.Discrete(DIRECTION_N),
         "last_piece_type": gym.spaces.Discrete(LAST_PIECE_N),
     })

@@ -30,8 +30,11 @@ import torch
 import argparse
 import time
 import math
+from collections import deque
 from typing import Callable, List, Optional
 from contextlib import ExitStack
+
+from openrct2_gym.envs.warm_start import LoopLibrary
 
 # Single source of truth for the discount factor. PBRS policy-invariance requires the
 # shaping potential to discount with the SAME gamma as PPO, so the reward's
@@ -77,6 +80,28 @@ ENT_COLLAPSE_BOOST = 0.03   # temporary ent_coef while boosted. 0.03 not 0.05: 0
 # Stabilizers on top of the LO/HI hysteresis band, to stop the boost<->relax thrash:
 ENT_BOOST_MIN_HOLD = 3      # min updates to HOLD the boost before any relax (rides out the overshoot)
 
+# Progress-conditional Phase-1 entropy floor ("bootstrap" mode). The Jun-24 run proved the
+# 0.01 floor + 0.12/0.30 band is a DISCOVERY killer: entropy sat at ~0.2 nats from 130k steps
+# and the ~12-piece docking sequence was never sampled again (7 completions in 31k episodes,
+# all before the collapse). That config is right for EXPLOITING completions once they flow --
+# so it is conditional: while phase 1 has ~zero completions, hold a higher floor and a raised
+# collapse band; hand back to the proven OPT_PHASE1 once completions flow. Keyed on the
+# ANY-episode completion rate (scaffolded included): the floor is anti-collapse INSURANCE,
+# and with warm starts active scaffolded +1000s flow by construction -- holding 0.025 then
+# CAPS the sharpening the scaffold exists to teach (smoke run 2 plateaued at ~15%, the
+# random-choice baseline, under the cold-keyed floor). Cold rate remains the PHASE-GATE
+# metric; if completions of every kind die, the floor re-arms.
+PHASE1_BOOTSTRAP_ENT_COEF = 0.025   # resting floor while bootstrapping (vs 0.01 proven-exploit)
+COMPLETION_RATE_EXIT = 0.02         # any-episode completion rate that ends bootstrap mode
+COMPLETION_RATE_ENTER = 0.005       # relapse threshold that re-enters it
+COMPLETION_RATE_WINDOW = 400        # episodes kept (pooled across all envs)
+COMPLETION_RATE_MIN_SAMPLES = 50    # min episodes before the rate is trusted
+COLD_RATE_WINDOW = 400              # cold episodes kept for the success/cold_completion_rate tag
+BOOT_ENT_LO = 0.30                  # bootstrap collapse band: the Jun-24 "dormant zone" (~0.2)
+BOOT_ENT_HI = 0.55                  # is itself a freeze while discovering -> band sits above it
+BOOT_ENT_BOOST = 0.04               # must exceed the 0.025 floor to be a boost at all
+ENT_MODE_MIN_HOLD = 10              # min updates between mode flips (anti-thrash)
+
 # Fixed PPO hyperparameters, module-level so tests can pin them (n_steps/batch_size are
 # computed per run). Starts in the phase-1 config; the callback arms OPT_GUARDED later.
 PPO_HYPERPARAMS = dict(
@@ -108,6 +133,22 @@ def _vecnormalize_path(model_path: str) -> str:
     if model_path.endswith(".zip"):
         model_path = model_path[:-4]
     return model_path + "_vecnormalize.pkl"
+
+
+def _resolve_model_path(model_path: Optional[str]) -> Optional[str]:
+    """Validate --model-path BEFORE anything destructive. A typo'd path must not silently
+    fall through to training-from-scratch: that wipes the closing calibration and pairs the
+    OLD run's VecNormalize stats with a brand-new policy -- a whole-run waste with a single
+    'Creating new model' line as the only symptom. Accepts the extension-less form SB3's
+    load tolerates, by resolving to the sibling .zip."""
+    if not model_path:
+        return None
+    if os.path.exists(model_path):
+        return model_path
+    if os.path.exists(model_path + ".zip"):
+        return model_path + ".zip"
+    raise SystemExit(f"❌ --model-path {model_path} not found (nor {model_path}.zip); "
+                     f"refusing to silently train from scratch on a resume request")
 
 
 def _unwrap_to_vecenv_with_envs(env):
@@ -172,17 +213,48 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
         self._opt_guarded = False  # becomes True once OPT_GUARDED is armed (phase >= 2)
         self._ent_boosted = False  # True while the entropy-collapse guard holds ent_coef boosted
         self._ent_boost_calls = 0  # updates elapsed since the current boost armed (min-hold counter)
-        self._phase = 1            # latest curriculum phase seen on a step info (drives the ent floor)
-        self._phase2_stage = None  # latest Phase-2 sub-stage seen (raises the floor only in stage 2.1)
+        # Per-worker curricula advance INDEPENDENTLY (each wrapper has its own gates), so the
+        # fleet straddles phase boundaries. _phase/_phase2_stage are the FLEET view derived in
+        # _note_env_phase (lower-median phase; min stage among phase-2 workers) -- last-writer-
+        # wins made the KL guard and entropy floor functions of episode-finish ordering, and
+        # armed target_kl on the FIRST worker to touch phase 2 while the rest still needed the
+        # unguarded phase-1 bootstrap.
+        self._env_phase = {i: 1 for i in range(n_envs)}   # every worker starts in phase 1
+        self._env_stage = {}
+        self._phase = 1            # fleet (lower-median) curriculum phase
+        self._phase2_stage = None  # min phase-2 sub-stage among workers currently in phase 2
+        # Progress-conditional Phase-1 entropy floor: starts in bootstrap mode (completion
+        # rate is 0 by definition at the start of a run); exits once completions flow
+        # (scaffolded count -- the floor is anti-collapse insurance, not a gate).
+        self._ent_mode = "bootstrap"
+        self._completion_window = deque(maxlen=COMPLETION_RATE_WINDOW)  # all episodes, all envs
+        self._cold_window = deque(maxlen=COLD_RATE_WINDOW)  # cold episodes (TB tag + gates readout)
+        self._ent_mode_calls = 0       # _maybe_update_ent_mode invocations (one per rollout end)
+        self._ent_mode_last_flip = 0   # call index of the last mode flip (min-hold anchor)
+
+    def _note_env_phase(self, env_idx, info):
+        """Record one worker's curriculum phase/stage and refresh the fleet view."""
+        phase = info.get('learning_phase')
+        if phase is not None:
+            self._env_phase[env_idx] = phase
+        stage = info.get('phase2_stage')
+        if stage is not None:
+            self._env_stage[env_idx] = stage
+        phases = sorted(self._env_phase.values())
+        self._phase = phases[(len(phases) - 1) // 2]   # lower median: majority-conservative
+        stages = [s for i, s in self._env_stage.items() if self._env_phase.get(i) == 2]
+        if stages:
+            self._phase2_stage = min(stages)           # earliest stage keeps the raised floor
 
     def _maybe_arm_kl_guard(self, info):
-        """Arm the guarded optimizer config (target_kl + raised ent_coef) the first time
-        the curriculum reaches phase 2. One-way: phase 1 needs the unguarded bootstrap
-        config to amplify rare completion spikes; the guard exists to survive the
-        phase-transition reward shift, which only matters from phase 2 onward."""
+        """Arm the guarded optimizer config (target_kl + raised ent_coef) once the FLEET
+        majority reaches phase 2. One-way: phase 1 needs the unguarded bootstrap config to
+        amplify rare completion spikes -- arming on the FIRST worker to touch phase 2 would
+        throttle every other worker's bootstrap (the guard exists to survive the
+        phase-transition reward shift, which only matters from phase 2 onward)."""
         if self._opt_guarded:
             return
-        if info.get('learning_phase', 1) < 2:
+        if self._phase < 2:
             return
         self.model.target_kl = OPT_GUARDED['target_kl']
         self._opt_guarded = True   # _phase_base_ent_coef() now returns the guarded floor
@@ -193,14 +265,61 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
         print(f"🛡️ Phase 2 reached: armed guard {OPT_GUARDED}")
 
     def _phase_base_ent_coef(self):
-        """The ent_coef the entropy guard restores to: the phase-1 bootstrap value until the guard
-        arms, then the guarded floor -- raised to PHASE2_EARLY_ENT_COEF through the early Phase-2
-        chain stages (sub-stages 2.1 discovery and 2.2 integration), dropping back at 2.3."""
+        """The ent_coef the entropy guard restores to: the raised bootstrap floor while phase 1
+        still has ~zero cold completions, the proven phase-1 value once they flow, then the
+        guarded floor after the KL guard arms -- raised to PHASE2_EARLY_ENT_COEF through the
+        early Phase-2 chain stages (sub-stages 2.1 discovery and 2.2 integration)."""
         if not self._opt_guarded:
+            if self._phase == 1 and self._ent_mode == "bootstrap":
+                return PHASE1_BOOTSTRAP_ENT_COEF
             return OPT_PHASE1['ent_coef']
         if self._phase == 2 and self._phase2_stage in (1, 2):
             return PHASE2_EARLY_ENT_COEF
         return OPT_GUARDED['ent_coef']
+
+    def _ent_band(self):
+        """(lo, hi, boost) for the collapse guard: the raised bootstrap band while discovering
+        (the legacy 'dormant zone' ~0.2 nats is itself a freeze there), the proven band after.
+        Never the bootstrap band once the KL guard armed -- past phase 1, exploitation rules."""
+        if (not self._opt_guarded) and self._phase == 1 and self._ent_mode == "bootstrap":
+            return BOOT_ENT_LO, BOOT_ENT_HI, BOOT_ENT_BOOST
+        return ENT_COLLAPSE_LO, ENT_COLLAPSE_HI, ENT_COLLAPSE_BOOST
+
+    def _cold_completion_rate(self):
+        """Completion rate over pooled COLD episodes (the phase-gate readout), or None."""
+        if len(self._cold_window) < COMPLETION_RATE_MIN_SAMPLES:
+            return None
+        return sum(self._cold_window) / len(self._cold_window)
+
+    def _completion_rate(self):
+        """Completion rate over ALL pooled episodes (scaffolded included) -- what the
+        entropy floor keys on -- or None until enough samples exist."""
+        if len(self._completion_window) < COMPLETION_RATE_MIN_SAMPLES:
+            return None
+        return sum(self._completion_window) / len(self._completion_window)
+
+    def _maybe_update_ent_mode(self):
+        """bootstrap <-> normal mode machine, one call per rollout end. Exit bootstrap when
+        the phase advances or completions flow at all (rate >= COMPLETION_RATE_EXIT,
+        scaffolded included); re-enter on a phase-1 relapse (rate < COMPLETION_RATE_ENTER).
+        Flips respect ENT_MODE_MIN_HOLD. Pure decision logic (no logger access) so it is
+        server-free testable."""
+        self._ent_mode_calls += 1
+        if self._ent_mode_calls - self._ent_mode_last_flip < ENT_MODE_MIN_HOLD:
+            return
+        rate = self._completion_rate()
+        if self._ent_mode == "bootstrap":
+            if self._phase > 1 or (rate is not None and rate >= COMPLETION_RATE_EXIT):
+                self._ent_mode = "normal"
+                self._ent_mode_last_flip = self._ent_mode_calls
+                print(f"🧊 Phase-1 bootstrap floor released (completion rate "
+                      f"{-1.0 if rate is None else rate:.3f}); restoring proven entropy config")
+        else:
+            if self._phase == 1 and rate is not None and rate < COMPLETION_RATE_ENTER:
+                self._ent_mode = "bootstrap"
+                self._ent_mode_last_flip = self._ent_mode_calls
+                print(f"🧊 Completions relapsed to {rate:.3f}: re-arming the "
+                      f"Phase-1 bootstrap entropy floor")
 
     def _rebaseline_ent_coef(self):
         """Snap the resting ent_coef to the current phase base when NOT actively boosted, so a stage
@@ -223,25 +342,26 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
         is server-free testable."""
         if entropy is None:
             return
+        lo, hi, boost = self._ent_band()   # mode-aware: raised band while bootstrapping phase 1
         if not self._ent_boosted:
-            if entropy < ENT_COLLAPSE_LO:
-                self.model.ent_coef = ENT_COLLAPSE_BOOST
+            if entropy < lo:
+                self.model.ent_coef = boost
                 self._ent_boosted = True
                 self._ent_boost_calls = 0
-                print(f"🌀 Entropy collapse guard: entropy={entropy:.3f} < {ENT_COLLAPSE_LO} "
-                      f"-> ent_coef boosted to {ENT_COLLAPSE_BOOST}")
+                print(f"🌀 Entropy collapse guard: entropy={entropy:.3f} < {lo} "
+                      f"-> ent_coef boosted to {boost}")
             return
         # Currently boosted: count this update toward the min-hold, then test all relax conditions.
         self._ent_boost_calls += 1
         target_kl = getattr(self.model, "target_kl", None)
         kl_ok = kl is None or target_kl is None or kl < target_kl
-        if (entropy > ENT_COLLAPSE_HI
+        if (entropy > hi
                 and self._ent_boost_calls >= ENT_BOOST_MIN_HOLD
                 and kl_ok):
             base = self._phase_base_ent_coef()
             self.model.ent_coef = base
             self._ent_boosted = False
-            print(f"🌀 Entropy recovered: entropy={entropy:.3f} > {ENT_COLLAPSE_HI} "
+            print(f"🌀 Entropy recovered: entropy={entropy:.3f} > {hi} "
                   f"(held {self._ent_boost_calls} updates) -> ent_coef restored to {base}")
 
     def _on_rollout_end(self) -> None:
@@ -251,16 +371,28 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
         still holds the previous update's value (the logger dump that clears it runs after this
         hook), so the read is reliable from the second update on (None before the first train()).
         Also surface the live ent_coef so the guard's action is visible in TensorBoard."""
+        # A RESUMED model carries its previous run's armed KL guard (target_kl is saved with
+        # the model) while the callback restarts fresh -- recognizing it here prevents the
+        # destructive bootstrap-floor(0.025)+tight-KL combination on resume.
+        if not self._opt_guarded and getattr(self.model, "target_kl", None) is not None:
+            self._opt_guarded = True
+
         name_to_value = getattr(self.model.logger, 'name_to_value', {})
         ent_loss = name_to_value.get('train/entropy_loss')
         approx_kl = name_to_value.get('train/approx_kl')
+        self._maybe_update_ent_mode()   # mode first: the guard reads the mode-aware band below
         self._maybe_guard_entropy_collapse(
             None if ent_loss is None else -float(ent_loss),
             kl=None if approx_kl is None else float(approx_kl),
         )
         self._rebaseline_ent_coef()   # drop the resting floor when the stage advances (2.1 -> 2.2)
         self.logger.record('optim/ent_coef', float(self.model.ent_coef))
-        self.logger.record('optim/phase2_stage', float(self._phase2_stage or 0))
+        self.logger.record('optim/phase2_stage',
+                           float(self._phase2_stage or 0) if self._phase == 2 else 0.0)
+        self.logger.record('optim/ent_floor_mode', 1.0 if self._ent_mode == "bootstrap" else 0.0)
+        cold_rate = self._cold_completion_rate()
+        if cold_rate is not None:
+            self.logger.record('success/cold_completion_rate', cold_rate)
 
     def _on_step(self) -> bool:
         # Track total steps for throughput calculation
@@ -302,6 +434,13 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
                     self.logger.record(f'success/env_{env_idx}_loop_completed', 1.0)
                 else:
                     self.logger.record(f'success/env_{env_idx}_loop_completed', 0.0)
+
+                # Pool episode outcomes (no get_attr/env_method IPC): every episode feeds
+                # the entropy floor's any-completion window; cold episodes additionally
+                # feed the phase-gate readout tag.
+                self._completion_window.append(bool(loop_completed))
+                if self.locals['infos'][env_idx].get('cold_start', False):
+                    self._cold_window.append(bool(loop_completed))
                 
                 # Print episode details in verbose mode
                 if self.training_verbose >= 1:
@@ -340,11 +479,10 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
                 # progress past each lift-hill gate is visible in TensorBoard.
                 _info = self.locals['infos'][env_idx]
                 # Capture phase/stage BEFORE arming: _maybe_arm_kl_guard sets ent_coef via
-                # _phase_base_ent_coef (which keys on these), and it early-returns once armed -- so
-                # this independent capture is also what keeps _phase2_stage current for the
+                # _phase_base_ent_coef (which keys on the fleet view), and it early-returns
+                # once armed -- this capture also keeps _phase2_stage current for the
                 # rollout-end re-baseline after the guard is armed.
-                self._phase = _info.get('learning_phase', self._phase)
-                self._phase2_stage = _info.get('phase2_stage', self._phase2_stage)
+                self._note_env_phase(env_idx, _info)
                 self._maybe_arm_kl_guard(_info)
                 if 'curriculum_phase' in _info:
                     self.logger.record('curriculum/phase', _info['curriculum_phase'])
@@ -365,6 +503,16 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
                     'phase2_chain2_completion_rate',
                     'phase2_chain3_completion_rate',
                     'completed_chain_count',
+                    # warm-start reverse curriculum diagnostics (cold_* are the numbers that
+                    # matter -- success/overall_* and ep_rew/ep_len are scaffold-mixed now)
+                    'cold_success_rate',
+                    'scaffold_success_rate',
+                    'cold_fraction',
+                    'warm_k',
+                    'warm_k_max',
+                    'warm_frontier_rate',
+                    'warm_prefix_len',
+                    'loop_library_size',
                 ):
                     if key in _info:
                         self.logger.record(f'curriculum/{key}', _info[key])
@@ -394,6 +542,8 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
                             self.logger.record('height/summit', info_metrics['summit'])
                         if 'return_potential' in info_metrics:
                             self.logger.record('rewards/return_potential', info_metrics['return_potential'])
+                        if 'route_potential' in info_metrics:
+                            self.logger.record('rewards/route_potential', info_metrics['route_potential'])
                         if 'remove_count' in info_metrics:
                             self.logger.record('behavior/remove_count', info_metrics['remove_count'])
 
@@ -521,8 +671,17 @@ def mask_fn(env: gym.Env) -> np.ndarray:
     return np.ones(env.action_space.n, dtype=bool)
 
 
-def create_curriculum_masked_env(port: int, verbose: int = 0) -> gym.Env:
+def create_curriculum_masked_env(port: int, verbose: int = 0,
+                                 warm_start_enabled: bool = True,
+                                 loop_library_path: Optional[str] = None,
+                                 p_cold: float = 0.25) -> gym.Env:
     """Create an improved-curriculum environment with action masking for a port."""
+    # A custom library path must redirect BOTH sides: the wrapper's read pool AND the
+    # env's harvest destination (class attr; this runs inside each SubprocVecEnv worker).
+    # Redirecting only the read side silently leaks every harvest into the default file.
+    if loop_library_path:
+        OpenRCT2Env._LOOP_LIBRARY_PATH = loop_library_path
+
     # Base environment with specific port and verbosity
     base_env = gym.make('OpenRCT2-v0', host='localhost', port=port, verbose=verbose)
 
@@ -548,6 +707,9 @@ def create_curriculum_masked_env(port: int, verbose: int = 0) -> gym.Env:
         phase5_target_length=120,
         phase5_increase_step=10,
         verbose=verbose,
+        warm_start_enabled=warm_start_enabled,
+        loop_library_path=loop_library_path,
+        p_cold=p_cold,
     )
 
     # Add Monitor for logging
@@ -559,11 +721,15 @@ def create_curriculum_masked_env(port: int, verbose: int = 0) -> gym.Env:
     return env
 
 
-def make_env_factory(port: int, verbose: int = 0) -> Callable[[], gym.Env]:
+def make_env_factory(port: int, verbose: int = 0,
+                     warm_start_enabled: bool = True,
+                     loop_library_path: Optional[str] = None,
+                     p_cold: float = 0.25) -> Callable[[], gym.Env]:
     """Create a factory function for an environment on a specific port"""
     def _init() -> gym.Env:
         try:
-            env = create_curriculum_masked_env(port, verbose)
+            env = create_curriculum_masked_env(port, verbose, warm_start_enabled,
+                                               loop_library_path, p_cold)
             print(f"✅ Successfully connected to OpenRCT2 on port {port}")
             return env
         except Exception as e:
@@ -595,6 +761,9 @@ def train(
     eval_episodes: int = 10,
     disable_eval: bool = False,
     target_rollout: int = 2048,
+    warm_start_enabled: bool = True,
+    loop_library_path: Optional[str] = None,
+    p_cold: float = 0.25,
 ):
     """Train agent with curriculum learning AND action masking on multiple parallel environments"""
 
@@ -603,10 +772,23 @@ def train(
     # A fresh run must NOT inherit a stale closing-geometry calibration from a previous run
     # (it would anchor Phi at an old/atypical closing state). Clear it unless we're resuming
     # an existing model, in which case the calibration should stay consistent with it.
-    resuming = bool(model_path and os.path.exists(model_path))
+    # NOTE: the warm-start loop library is deliberately NOT cleared -- verified loop geometry
+    # is regime-independent, unlike the Phi anchor.
+    model_path = _resolve_model_path(model_path)   # hard error on a typo'd resume path
+    resuming = model_path is not None
     if not resuming and _clear_calibration_cache():
         print("🧭 Fresh run: cleared stale closing-geometry calibration (will recalibrate "
               "from this run's first completion)")
+
+    from openrct2_gym.envs.openrct2_env import OpenRCT2Env as _Env
+    _lib_path = loop_library_path or _Env._LOOP_LIBRARY_PATH
+    _lib_size = len(LoopLibrary(_lib_path))
+    if warm_start_enabled:
+        print(f"📚 Warm-start loop library: {_lib_size} verified loops at {_lib_path}"
+              + ("" if _lib_size else " (empty: run build_loop_library.py to seed, or the"
+                 " run bootstraps cold until the first harvested completion)"))
+    else:
+        print("📚 Warm-start reverse curriculum DISABLED (--no-warm-start)")
 
     print("="*60)
     print("🎓 PARALLEL CURRICULUM LEARNING + ACTION MASKING")
@@ -614,7 +796,7 @@ def train(
     print(f"Training on {n_envs} parallel OpenRCT2 instances")
     print(f"Ports: {', '.join(map(str, ports))}")
     print("Using improved 5-phase curriculum with physics-aware rewards:")
-    print("  Phase 1: Return Practice (25 pieces) - Learn navigation")
+    print("  Phase 1: Return Practice (40 pieces) - Learn navigation")
     print("  Phase 2: Lift Hill Building (40 pieces) - staged chain roundtrip/completion gates")
     print("  Phase 3: Drop & Turn (60 pieces) - Learn drops & turnarounds")
     print("  Phase 4: Circuit Mastery (80 pieces) - Full integration")
@@ -623,19 +805,20 @@ def train(
     print("Using MaskablePPO to prevent invalid actions")
     print("="*60 + "\n")
 
-    # Intermediate evaluation reaches into the env wrappers to suppress curriculum-stat updates
-    # during eval episodes, via _unwrap_to_vecenv_with_envs(). That returns None under
-    # SubprocVecEnv (n_envs > 1, no .envs), so the suppression silently no-ops and eval episodes
-    # pollute curriculum advancement -- besides adding long synchronized rollouts. Recommend
-    # --disable-eval for any multi-env run, and especially at ~20 instances.
+    # Intermediate evaluation reaches into the env wrappers to suppress curriculum-stat
+    # updates and force cold (unscaffolded) episodes, via _unwrap_to_vecenv_with_envs().
+    # That returns None under SubprocVecEnv (n_envs > 1, no .envs), so eval episodes would
+    # be SCAFFOLDED (measuring the loop library, not the policy), pollute curriculum gates
+    # and the annealer, and desync the rollout collector. Not a warning -- hard-disable.
     if not disable_eval and n_envs > 1:
-        print(f"⚠️  Intermediate eval is ON with {n_envs} parallel envs (SubprocVecEnv): eval-mode "
-              "curriculum-stat suppression cannot reach the wrappers and will be skipped, so eval "
-              "episodes will pollute curriculum stats. Re-run with --disable-eval for clean, "
-              "faster training at scale.\n")
+        print(f"⚠️  Intermediate eval DISABLED automatically for {n_envs} parallel envs "
+              "(SubprocVecEnv): eval cannot reach the wrappers to suppress curriculum stats "
+              "or force cold episodes. Evaluate checkpoints separately with run_model.py.\n")
+        disable_eval = True
 
     # Create environment factories for each port
-    env_factories = [make_env_factory(port, verbose) for port in ports]
+    env_factories = [make_env_factory(port, verbose, warm_start_enabled,
+                                      loop_library_path, p_cold) for port in ports]
 
     # Create vectorized environments
     print(f"\n🔌 Connecting to {n_envs} OpenRCT2 instances...")
@@ -751,13 +934,18 @@ def train(
         remaining = total_timesteps
         chunk = max(1, eval_freq) if not disable_eval else remaining
         learned = 0
+        first_chunk = True
         while remaining > 0:
             this_chunk = remaining if disable_eval else min(chunk, remaining)
+            # reset_num_timesteps=True on a fresh run's FIRST chunk only: that is when SB3
+            # starts a new TB run dir (False appended every fresh run into the previous
+            # run's PPO_0). Resumes and later chunks continue the same run/counter.
             model.learn(
                 total_timesteps=this_chunk,
                 callback=[checkpoint_callback, vecnormalize_callback, tensorboard_callback],
-                reset_num_timesteps=False,
+                reset_num_timesteps=first_chunk and not resuming,
             )
+            first_chunk = False
             learned += this_chunk
             remaining -= this_chunk
             
@@ -794,6 +982,11 @@ def train(
                 finally:
                     if vecn is not None:
                         vecn.training = prev_training
+                    # evaluate_policy stepped the TRAINING env: model._last_obs is now stale
+                    # against the real env state, and the next collect would pair pre-eval
+                    # observations with post-eval transitions. Clearing it forces a clean
+                    # env reset at the start of the next learn chunk.
+                    model._last_obs = None
                 print(f"  Mean reward: {mean_reward:.2f} ± {std_reward:.2f}")
         
     except KeyboardInterrupt:
@@ -832,14 +1025,23 @@ def train(
         except Exception as e:
             print(f"⚠️ Could not save VecNormalize stats: {e}")
 
-        # Clean up environments after collecting stats
-        env.close()
+        # Save the final model BEFORE closing the env: a dead SubprocVecEnv worker makes
+        # close() raise (EOFError from the worker pipe), which previously skipped the save
+        # entirely and ended a multi-hour run without its final model.
+        final_model_path = os.path.join(log_dir, "final_model")
+        try:
+            model.save(final_model_path)
+            print(f"\n💾 Final model saved to {final_model_path}")
+            print(f"💾 VecNormalize stats: {_vecnormalize_path(final_model_path)}")
+        except Exception as e:
+            print(f"⚠️ Could not save final model: {e}")
 
-    # Save final model
-    final_model_path = os.path.join(log_dir, "final_model")
-    model.save(final_model_path)
-    print(f"\n💾 Final model saved to {final_model_path}")
-    print(f"💾 VecNormalize stats: {_vecnormalize_path(final_model_path)}")
+        # Clean up environments after collecting stats; never let a dead worker's pipe
+        # error mask the outcome above.
+        try:
+            env.close()
+        except Exception as e:
+            print(f"⚠️ env.close() failed (dead worker?): {e}")
 
     # Log final curriculum stats if available
     if stats:
@@ -885,6 +1087,14 @@ def main():
     parser.add_argument("--target-rollout", type=int, default=2048,
                        help="Target transitions per PPO update; n_steps ~= target_rollout/n_envs "
                             "(min 128). Raise (e.g. 5120) to keep n_steps>=256 at many envs.")
+    parser.add_argument("--no-warm-start", action="store_true",
+                       help="Disable the warm-start reverse curriculum (cold starts only)")
+    parser.add_argument("--loop-library", type=str, default=None,
+                       help="Path to the warm-start loop library JSONL "
+                            "(default: logs/loop_library.jsonl)")
+    parser.add_argument("--p-cold", type=float, default=0.25,
+                       help="Base probability of a cold (unscaffolded) episode while warm starts "
+                            "are active; rises automatically as the anneal progresses (default 0.25)")
     args = parser.parse_args()
     
     # Parse ports
@@ -966,6 +1176,9 @@ def main():
         args.eval_episodes,
         args.disable_eval or args.eval_freq <= 0,
         args.target_rollout,
+        warm_start_enabled=not args.no_warm_start,
+        loop_library_path=args.loop_library,
+        p_cold=args.p_cold,
     )
     # Training function already evaluates between chunks and closes env.
     # No additional evaluation here to avoid interfering with API ports.

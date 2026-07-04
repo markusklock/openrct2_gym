@@ -10,16 +10,18 @@ from .api_controller import APIController
 from .obs_config import (
     make_observation_space, SEQ_LEN, HIST_FEAT_DIM, MAP_SHAPE, SCALE, H_SCALE,
 )
+from .warm_start import LoopLibrary
 
 
 @dataclass(frozen=True)
 class RewardParams:
     """All tunables for the unified, potential-based reward.
 
-    The Phi-weights and normalizers are FROZEN across all curriculum phases so the
-    single potential is globally policy-invariant (Ng/Harada/Russell 1999); only the
-    sparse-objective fields (R_quality_max, step_cost) and the env's max_track_length /
-    skip_ride_testing vary per phase.
+    The CORE Phi geometry weights (w_xy/w_z/w_dir/w_e) and normalizers are frozen across
+    all curriculum phases; the auxiliary Phi terms (w_h, w_return, w_close, w_route) are
+    deliberately phase-gated (PBRS invariance holds within a phase; phase changes shift
+    the potential once, at a reset). Sparse-objective fields (R_complete gating, struct,
+    milestones, R_quality_max, step_cost) vary per phase.
     """
     gamma: float = 0.99            # MUST equal the PPO discount for PBRS invariance
     # --- Phi potential weights (fixed across phases) ---
@@ -29,6 +31,14 @@ class RewardParams:
     w_e: float = 2.0               # energy viability bonus
     # --- Phi normalizers (decoupled from obs SCALE/H_SCALE; see plan #6) ---
     d_xy: float = 40.0
+    # Directional approach corridor: when >0 (and the entry axis is calibrated) the horizontal w_xy
+    # pull is DIRECTIONAL -- it rewards closing in ALONG the entry axis from the -entry (approach)
+    # side within a cone of this half-width (the cone widens 1 tile per tile away from the dock so
+    # the head is caught as it rounds back onto the corridor) and gives ZERO pull from the wrong
+    # side. This removes the isotropic w_xy attractor that let the head minimise distance by parking
+    # behind/beside the station (approaching the dock from the wrong direction). 0 restores the
+    # legacy isotropic radial w_xy term. Pure state function -> PBRS-clean.
+    approach_perp_range: float = 2.0
     d_z: float = 20.0              # m_z slope = w_z/d_z = 0.3/z. Must stay steep enough that
                                    # the energy term's chain-lift bump (~+0.47) cannot make
                                    # climbing profitable where it shouldn't be (at d_z=60 the
@@ -43,6 +53,15 @@ class RewardParams:
                                    # m_z cost) but halves the attractor a wrecked policy can
                                    # settle into instead of completing
     h_scale: float = 6.0           # elevation normalizer (z-units); saturate at ~a 3-chain hill
+    # --- Route potential (fills the west-side shaping hole; ON in completion phases 1-4) ---
+    # The directional approach cone deliberately gives ZERO horizontal pull for along<0, so the
+    # detour AROUND the station (the first half of every loop) had no gradient -- the Jun-24 run
+    # parked ~5 tiles out and never completed. w_route pays angular progress of the head's bearing
+    # around the station center: 0 on the start/west bearing rising monotonically to w_route on the
+    # approach/east bearing, along BOTH the north and south detours. Bounded, radius-independent,
+    # pure function of position -> PBRS-clean; its maximum sits where the w_xy cone + w_close
+    # funnel already dominate, so it cannot create a new parking optimum. 0 disables (P5 default).
+    w_route: float = 0.0
     # --- Sparse real objectives ---
     R_complete: float = 1000.0     # fixed completion bonus across all phases
     R_quality_max: float = 0.0     # 0 disables quality (phases 1-4); 500 in phase 5
@@ -62,7 +81,11 @@ class RewardParams:
     # add-on to the agent's closure skill). Kept below the gated completion reward so it never
     # lures the agent away from completing. 0 disables it (P1/P5).
     R_roundtrip: float = 0.0
-    roundtrip_gain: float = 4.0    # min elevation (z above station) that counts as "climbed"
+    roundtrip_gain: float = 3.0    # min CHAIN-banked elevation (z above station) that counts as
+                                   # "climbed". 3, not 4: the canonical hill [10,9,13] banks chain
+                                   # gain 3 (the crest piece isn't chained) -- a 4.0 bar made the
+                                   # milestone + w_return descent shaping silently inert for the
+                                   # exact hill the curriculum teaches.
     # Summit milestone: the reachable FIRST HALF of the round-trip — a one-time-per-episode
     # bonus for chain-climbing >= roundtrip_gain above the station, INDEPENDENT of returning or
     # completing. Pays the climb before the return so the climb-and-return conjunction becomes a
@@ -82,7 +105,13 @@ class RewardParams:
     # the last-piece closure in a cold start. Pure state function -> PBRS-clean. 0 disables it; the
     # curriculum turns it on in the completion phases 1-4 (off in phase 5, completion already mastered).
     w_close: float = 0.0
-    close_range: float = 3.0       # XY tiles within which the bonus ramps (steeply) to w_close
+    close_range: float = 3.0       # tiles ALONG the entry axis within which the funnel ramps to w_close
+    close_perp_range: float = 2.0  # corridor half-width PERPENDICULAR to the entry axis (off-axis falloff)
+    # Funnel taper: the perpendicular corridor opens from a POINT at the throat (along=0) to the
+    # full close_perp_range over this many tiles of along-distance, so the off-axis tiles right
+    # beside the dock (the throat row) are EXCLUDED -- the head must be ON the entry axis to dock.
+    # 0 = no pinch (legacy rectangular corridor).
+    close_throat_pinch: float = 1.0
     close_z_range: float = 2.0     # height tolerance (z) for the bonus
     exc_target: float = 8.0
     exc_sigma: float = 1.0
@@ -108,17 +137,32 @@ class OpenRCT2Env(gym.Env):
     # the first completion, which poisoned Phi for whole runs when that closure was atypical.
     _close_records = []
     _CLOSE_MIN_CONSISTENT = 3
+    # Warm-start loop library (reverse curriculum): every completion's action sequence is
+    # harvested here; the curriculum wrapper replays prefixes from it at reset. Shared
+    # across workers via atomic JSONL appends (see warm_start.LoopLibrary).
+    _LOOP_LIBRARY_PATH = "logs/loop_library.jsonl"
     def __init__(self, render_mode=None, host="localhost", port=8080, verbose=1):
         super(OpenRCT2Env, self).__init__()
         self.render_mode = render_mode
         self.verbose = verbose  # 0=silent, 1=important only, 2=detailed
         self.api_controller = APIController(host, port, verbose)
-        self.track_builder = APITrackBuilder(self.api_controller)
+        self.track_builder = APITrackBuilder(self.api_controller, verbose=verbose)
         self.skip_ride_testing = False  # Can be set by wrappers to skip entrance/exit and testing
 
         # Unified potential-based reward config (wrappers override per phase).
         self.reward_params = RewardParams()
         self._phi_prev = 0.0  # Phi(s) carried between steps for PBRS shaping
+
+        # Warm-start reverse curriculum: the wrapper stages a loop prefix here before
+        # reset(); the env replays it one-shot (see _apply_warm_start / warm_start.py).
+        self.warm_start_actions = None
+        self.warm_start_suffix_k = None  # planned agent-built suffix length (sizes the budget)
+        self._warm_prefix_len = 0
+        self._warm_cold = True
+        self._warm_aborted = False       # prefix replay failed mid-way (infrastructure event)
+        self._warm_track_cap = None      # scaffolded-episode piece budget (None = full budget)
+        self._warm_step_cap = None       # scaffolded-episode step budget (None = full budget)
+        self._loop_library = None  # lazily bound to _LOOP_LIBRARY_PATH on first harvest
 
         # Connect to API server
         if not self.api_controller.connect():
@@ -133,6 +177,11 @@ class OpenRCT2Env(gym.Env):
         self.steps_since_collision = 0  # Track steps since last collision for remove masking
         self.auto_backtrack_enabled = True
         self.max_consecutive_failures = 3
+        # A timed-out request may have been APPLIED server-side (placements are not
+        # idempotent): the client head is then possibly desynced from the real track.
+        # When set, the episode is sacrificed (truncated) -- resetEpisode is retry-safe
+        # and rebuilds both sides from a clean slate.
+        self._connection_suspect = False
 
         # Initialize state variables
         self.current_position = None
@@ -169,11 +218,15 @@ class OpenRCT2Env(gym.Env):
         self.last_ride_intensity = 0.0
         self.last_ride_nausea = 0.0
 
+        # Must match the OpenRCT2 API's direction encoding (probe_corridor.py: a straight from the
+        # station output -- API dir 0 -- moves -X). The env stores RAW API directions, and these
+        # vectors build the egocentric observation (goal_disp / angle_to_goal / forward-aligned map),
+        # so a mismatched convention rotates the agent's whole spatial sense 90deg from reality.
         self.direction_vectors = [
-            (0, 1),   # North (0)
-            (1, 0),   # East (1)
-            (0, -1),  # South (2)
-            (-1, 0)   # West (3)
+            (-1, 0),  # 0: West   (API dir 0; the train docks heading this way)
+            (0, 1),   # 1: North
+            (1, 0),   # 2: East
+            (0, -1),  # 3: South
         ]
 
         # Redesigned observation space: egocentric 2.5D map + structured build-history
@@ -190,12 +243,17 @@ class OpenRCT2Env(gym.Env):
         removed_entry = self.track_builder.history[-1] if (action == 31 and self.track_builder.history) else None
         success, new_position, new_direction = self.track_builder.take_action(action, self.current_position, self.current_direction)
 
+        # A failure caused by a request TIMEOUT is not a normal collision: the server may
+        # have applied the action anyway, desyncing the head. Sacrifice the episode.
+        if not success and getattr(self.api_controller, "last_request_timed_out", False):
+            self._connection_suspect = True
+
         # Track collisions and failures
         if not success and action != 31:  # Failed to place a piece (not a remove action)
             self.consecutive_failures += 1
             self.collision_count += 1
             self.steps_since_collision = 0  # Reset collision window
-            
+
             # Auto-backtrack if enabled and too many consecutive failures
             if self.auto_backtrack_enabled and self.consecutive_failures >= self.max_consecutive_failures:
                 if len(self.track_builder.history) > 0:
@@ -207,11 +265,11 @@ class OpenRCT2Env(gym.Env):
                     removed_entry = self.track_builder.history[-1] if self.track_builder.history else None
                     success, new_position, new_direction = self.track_builder.take_action(action, self.current_position, self.current_direction)
                     self.consecutive_failures = 0
-        else:
+        elif success:
+            # Only a SUCCESS is a recovery: a failed remove must not reset the counter
+            # (it would delay the next auto-backtrack indefinitely).
             self.consecutive_failures = 0
-            # Increment steps since collision on successful actions
-            if success:
-                self.steps_since_collision += 1
+            self.steps_since_collision += 1
         
         # Check if the last placement completed the circuit
         # Trust the API's isCircuitComplete flag - if the game says it's complete, it's complete
@@ -235,25 +293,13 @@ class OpenRCT2Env(gym.Env):
                 if self.height_history:
                     self.height_history.pop()
                 self._revert_chain_lift(removed_entry)
+                self.last_piece_type = action
+                self.current_position = new_position
+                self.current_direction = new_direction
+                self.position_history.append(self.current_position.copy())
             else:
-                self.track_length += 1
-                self.track_pieces.append(action)
-                self.height_history.append(new_position[2])  # Track height at this piece
-                # Chain-lift bookkeeping (count distinct chain-lift endpoints; reverted on
-                # remove by _revert_chain_lift). Kept out of the reward, which no longer
-                # pays a chain-lift bonus.
-                if action in (9, 10):
-                    pos_key = tuple(new_position)
-                    if (pos_key not in self.chain_lift_positions
-                            and self.chain_lift_count < self.max_chain_lifts):
-                        self.chain_lift_count += 1
-                        self.chain_lift_positions.add(pos_key)
-
-            self.last_piece_type = action
-            self.current_position = new_position
-            self.current_direction = new_direction
-            # Track position history for trend analysis
-            self.position_history.append(self.current_position.copy())
+                # Single bookkeeping path shared with the warm-start prefix replay.
+                self._record_placement(action, new_position, new_direction)
 
         self.last_action = action
 
@@ -264,11 +310,18 @@ class OpenRCT2Env(gym.Env):
                 print(f"Loop has been completed, great success!")
             # Learn the closing geometry from the first completion (applied next reset).
             self._maybe_capture_closing_geometry()
+            # Harvest the loop into the warm-start library (dedup'd; scaffolded repeats no-op).
+            self._harvest_completed_loop()
         terminated = self.loop_completed
 
         # Now calculate reward (with correct loop_completed status)
         observation = self._get_observation()
         reward = self._calculate_reward(success, action)
+        # A forced auto-backtrack executes a remove ON BEHALF of a FAILED agent action: the
+        # remove's PBRS delta must not replace the failure's penalty (the chosen action
+        # would otherwise escape it exactly when it fails repeatedly).
+        if auto_backtracked:
+            reward += self.reward_params.fail_penalty
 
         # Track metrics that don't depend on the final reward value.
         current_distance = self._calculate_distance_to_start()[0]
@@ -292,6 +345,12 @@ class OpenRCT2Env(gym.Env):
             # collectives (extra synchronized round-trips to all workers every step).
             'track_length': self.track_length,
             'current_distance': current_distance,
+            # Warm-start provenance: gates and the entropy controller must distinguish
+            # cold (true-task) episodes from scaffolded ones; aborted prefixes are
+            # infrastructure events excluded from annealer accounting.
+            'cold_start': self._warm_cold,
+            'warm_prefix_len': self._warm_prefix_len,
+            'warm_aborted': self._warm_aborted,
         }
         
         if self.verbose >= 2 and (self.steps % 10 == 0 or auto_backtracked):  # Log less frequently or when backtracking
@@ -372,12 +431,14 @@ class OpenRCT2Env(gym.Env):
                 'roundtrip': float(getattr(self, '_roundtrip_awarded', False)),
                 'summit': float(getattr(self, '_summit_awarded', False)),
                 'return_potential': float(self._return_potential(self.reward_params)),
+                'route_potential': float(self.reward_params.w_route * self._route_progress()),
                 'max_gain': max((h['next_position'][2] - self.STATION_HEIGHT
                                  for h in self.track_builder.history), default=0.0),
                 'track_length': self.track_length,
                 'phase_rewards': dict(self.phase_rewards),
                 'collision_count': self.collision_count,
-                'loop_completed': self.loop_completed
+                'loop_completed': self.loop_completed,
+                'warm_prefix_len': self._warm_prefix_len,
             }
 
         return observation, reward, terminated, truncated, info
@@ -403,11 +464,19 @@ class OpenRCT2Env(gym.Env):
         for action in valid_actions:
             if 0 <= action < self.action_space.n:
                 mask[action] = True
-        
+
         # If no valid actions, at least allow remove
-        if not mask.any() and len(self.track_builder.history) > 0:
-            mask[31] = True
-            
+        if not mask.any():
+            if len(self.track_builder.history) > 0:
+                mask[31] = True
+            else:
+                # Nothing valid and nothing to remove == the API failed us: an all-False
+                # mask makes MaskablePPO sample uniformly over KNOWN-INVALID actions (all
+                # masked logits equal). Allow everything for this step and sacrifice the
+                # episode instead of grinding silent failures.
+                self._connection_suspect = True
+                mask[:] = True
+
         return mask
     
     def reset(self, seed=None, options=None):
@@ -417,12 +486,18 @@ class OpenRCT2Env(gym.Env):
         # API hardcodes the station start at [61, 66, 14] - we must match this
         self.station_start_position = [61, 66, 14]  # Where the first station piece is (matches API)
         self.current_position = self.station_start_position.copy()
-        # Goal = the station's dock endpoint itself. verify_goal_position.py confirmed the API
-        # closes the circuit AT station_start (heading startDir), NOT one tile east. The old
-        # +1-east offset assumed a straight-in closure; real loops dock from many approaches, so the
-        # invariant target is the dock endpoint, not a staging tile (which also made the provisional
-        # goal disagree with the calibrated close_pos by a tile).
-        self.goal_position = list(self.station_start_position)
+        # Goal = the STAGING tile the closing piece is placed FROM -- one tile on the approach side
+        # (opposite the entry direction) of the dock. probe_corridor.py confirmed: from this tile,
+        # heading the entry direction, SEVEN different pieces dock the circuit at station_start. The
+        # head can never sit ON the dock tile (occupied by BeginStation), so the goal must be this
+        # adjacent staging tile. (Reverts the goal-=-dock change, which sent the head onto the station
+        # tile and collapsed completion to 0%.)
+        _ex, _ey = self.direction_vectors[self._STATION_ENTRY_DIR]
+        self.goal_position = [
+            self.station_start_position[0] - _ex,
+            self.station_start_position[1] - _ey,
+            self.station_start_position[2],
+        ]
         # Phi's geometric anchor: calibrated closing head if known, else provisional.
         self._init_closing_target()
         self.current_direction = 0
@@ -439,6 +514,7 @@ class OpenRCT2Env(gym.Env):
         self.collision_count = 0
         self.consecutive_failures = 0
         self.steps_since_collision = 0
+        self._connection_suspect = False
         self.previous_distance = None
         self.position_history = deque(maxlen=self.POSITION_HISTORY_MAXLEN)
         self.chain_lift_positions = set()
@@ -469,15 +545,137 @@ class OpenRCT2Env(gym.Env):
         else:
             self._legacy_reset()
 
-        self._roundtrip_awarded = False  # round-trip milestone fires at most once per episode
-        self._summit_awarded = False     # summit milestone fires at most once per episode
+        # Warm-start prefix replay (reverse curriculum): the wrapper may have staged a
+        # known-completable loop prefix. Replayed BEFORE the Phi seeding below, so the
+        # first agent step gets no shaping windfall from the pre-built track.
+        self._apply_warm_start()
 
-        # Seed the PBRS potential at the true starting head (post-station-build).
+        # Once-per-episode climb milestones must pay AGENT work only: pre-latch whatever the
+        # PREFIX already satisfies (a hill prefix that summited-and-returned otherwise banks
+        # R_summit+R_roundtrip on the agent's first step, every scaffolded episode). A prefix
+        # cut at the summit leaves the round-trip earnable -- the descent IS the agent's work.
+        _prefix_summited = (self._warm_prefix_len > 0
+                            and self._chain_max_gain() >= self.reward_params.roundtrip_gain)
+        _head_z = self.current_position[2]
+        self._summit_awarded = _prefix_summited
+        self._roundtrip_awarded = (
+            _prefix_summited
+            and abs(_head_z - self.STATION_HEIGHT) <= 1
+            and _head_z < self.STATION_HEIGHT + self.reward_params.roundtrip_gain)
+
+        # Seed the PBRS potential at the true starting head (post-station-build + prefix).
         self._phi_prev = self._potential(self.reward_params)
 
         observation = self._get_observation()
         info = {}
         return observation, info
+
+    def _record_placement(self, action, new_position, new_direction):
+        """Bookkeeping for one successfully PLACED piece -- the single path shared by
+        step() and the warm-start prefix replay, so prefix pieces are indistinguishable
+        from agent placements to every consumer (obs history buffer, chain gates, energy
+        model, track budget)."""
+        self.track_length += 1
+        self.track_pieces.append(action)
+        self.height_history.append(new_position[2])  # Track height at this piece
+        # Chain-lift bookkeeping (count distinct chain-lift endpoints; reverted on
+        # remove by _revert_chain_lift). Kept out of the reward, which no longer
+        # pays a chain-lift bonus.
+        if action in (9, 10):
+            pos_key = tuple(new_position)
+            if (pos_key not in self.chain_lift_positions
+                    and self.chain_lift_count < self.max_chain_lifts):
+                self.chain_lift_count += 1
+                self.chain_lift_positions.add(pos_key)
+        self.last_piece_type = action
+        self.current_position = new_position
+        self.current_direction = new_direction
+        # Track position history for trend analysis
+        self.position_history.append(self.current_position.copy())
+
+    def _apply_warm_start(self):
+        """Replay the staged warm-start prefix (one-shot); returns pieces actually placed.
+
+        Every placed piece goes through _record_placement (identical bookkeeping to agent
+        placements). A failed placement aborts the remainder -- keep what placed, the
+        episode continues from there. If a prefix piece unexpectedly closes the circuit
+        (impossible for k>=1 library prefixes unless geometry drifts) it is removed and
+        the prefix aborted: reset() must never yield a completed episode. Emits no reward
+        and consumes no steps; prefix pieces DO consume the max_track_length budget.
+        """
+        actions = self.warm_start_actions
+        suffix_k = self.warm_start_suffix_k
+        self.warm_start_actions = None            # one-shot: auto-resets can't replay stale plans
+        self.warm_start_suffix_k = None
+        self._warm_cold = not actions
+        self._warm_prefix_len = 0
+        self._warm_aborted = False
+        self._warm_track_cap = None
+        self._warm_step_cap = None
+        if not actions:
+            return 0
+        for action in actions:
+            success, new_position, new_direction = self.track_builder.take_action(
+                int(action), self.current_position, self.current_direction)
+            if not success:
+                self._warm_aborted = True
+                if self._warm_prefix_len == 0:
+                    # Nothing placed: the episode is bit-identical to a cold one -- classify
+                    # it as cold so recurring infra hiccups don't starve the cold gate windows.
+                    self._warm_cold = True
+                if self.verbose >= 1:
+                    print(f"⚠️ Warm-start prefix aborted at piece "
+                          f"{self._warm_prefix_len + 1}/{len(actions)} (placement failed); "
+                          f"episode continues from here")
+                break
+            self._record_placement(int(action), new_position, new_direction)
+            self._warm_prefix_len += 1
+            if self.track_builder.history and self.track_builder.history[-1].get("is_complete"):
+                removed_entry = self.track_builder.history[-1]
+                ok, pos, direction = self.track_builder.take_action(
+                    31, self.current_position, self.current_direction)
+                if ok:
+                    if self.track_pieces:
+                        self.track_pieces.pop()
+                        self.track_length -= 1
+                    if self.height_history:
+                        self.height_history.pop()
+                    self._revert_chain_lift(removed_entry)
+                    self.last_piece_type = 31   # mirror step()'s remove branch for the obs
+                    self.current_position = pos
+                    self.current_direction = direction
+                    self.position_history.append(self.current_position.copy())
+                    self._warm_prefix_len -= 1
+                self._warm_aborted = True
+                if self.verbose >= 1:
+                    print("⚠️ Warm-start prefix closed the circuit unexpectedly; "
+                          "reopened and aborted the prefix")
+                break
+        # Tight scaffolded-episode budget: the episode exists to practice the LAST k
+        # decisions, so a failed attempt must truncate fast. Without this, a wandering
+        # policy burned ~100 steps/episode at k<=3 (first smoke run) and the docking
+        # gradient drowned in noise. Cold episodes keep the full phase budget. An ABORTED
+        # prefix leaves the head far from closure -- the tight budget would make the episode
+        # geometrically impossible, so aborted episodes run with the full budget instead
+        # (and the wrapper excludes them from annealer accounting via the info flag).
+        if self._warm_prefix_len > 0 and suffix_k and not self._warm_aborted:
+            self._warm_track_cap = self._warm_prefix_len + int(suffix_k) + self.WARM_TRACK_SLACK
+            self._warm_step_cap = self.WARM_STEP_FACTOR * (int(suffix_k) + self.WARM_TRACK_SLACK)
+        return self._warm_prefix_len
+
+    def _harvest_completed_loop(self):
+        """Persist this completion's action sequence into the warm-start loop library
+        (dedup makes scaffolded repeats no-ops; cold discoveries are new material).
+        Best-effort: library I/O must never break training."""
+        try:
+            if len(self.track_builder.history) > self.HARVEST_MAX_LEN:
+                return
+            if self._loop_library is None or self._loop_library.path != self._LOOP_LIBRARY_PATH:
+                self._loop_library = LoopLibrary(self._LOOP_LIBRARY_PATH)
+            self._loop_library.add(
+                LoopLibrary.record_from_history(self.track_builder.history))
+        except Exception:
+            pass
 
     def _calculate_reward(self, success, action):
         """Unified potential-based reward: ``reward = F + sparse terms``.
@@ -516,8 +714,14 @@ class OpenRCT2Env(gym.Env):
         # matches the wrapper's chain_count>=1 qualifier and stops a non-chain climb from farming
         # the bonus or burning the once-per-episode flag.
         if params.R_roundtrip > 0.0 and not getattr(self, "_roundtrip_awarded", False):
+            head_z = self.current_position[2]
+            # "Returned" == near station height (matching the wrapper's abs<=1 mirror; the
+            # old z<=station+1 paid a climb-then-DIVE) and strictly below the required-climb
+            # threshold -- at roundtrip_gain=1 the +1 tolerance CONTAINED the summit, so one
+            # chain stub fired summit+roundtrip+gate with no return ever happening.
             if (self._chain_max_gain() >= params.roundtrip_gain
-                    and self.current_position[2] <= self.STATION_HEIGHT + 1):
+                    and abs(head_z - self.STATION_HEIGHT) <= 1
+                    and head_z < self.STATION_HEIGHT + params.roundtrip_gain):
                 reward += params.R_roundtrip
                 self._roundtrip_awarded = True
 
@@ -639,9 +843,12 @@ class OpenRCT2Env(gym.Env):
             return
         if not self.track_builder.history:
             return
-        self._probe_log_closing(self.track_builder.history[-1])   # TEMP: empirical closing-geometry probe
         if OpenRCT2Env._close_cache is not None:
             return
+        # Empirical closing-geometry probe: logs only UNTIL the anchor locks (its purpose --
+        # confirming the deterministic closing connection -- is fulfilled then; unbounded
+        # per-completion appends over a long run are pure disk growth).
+        self._probe_log_closing(self.track_builder.history[-1])
         record = self._closing_record_from_history(self.track_builder.history)
         if record is None:
             return
@@ -726,13 +933,33 @@ class OpenRCT2Env(gym.Env):
         target = self._reward_target_position()
         px, py, pz = self.current_position
         tx, ty, tz = target
-        m_xy = min(1.0, float(np.hypot(tx - px, ty - py)) / params.d_xy)
+        close_dir = self._reward_target_direction()
         m_z = abs(pz - tz) / params.d_z
         # numerically-stable logistic of the energy margin -> viability in (0, 1)
         v = 0.5 * (1.0 + np.tanh(0.5 * self._calculate_energy_margin() / params.e_scale))
-        phi = (params.w_xy * (1.0 - m_xy)
+        # Entry-axis projection of the head (shared by the broad approach term below, the
+        # near-closure funnel further down, and the observation's corridor scalars).
+        along, perp = self._corridor_coords()
+        # DIRECTIONAL horizontal approach: reward closing in ALONG the entry corridor (a cone that
+        # widens away from the dock so the head is caught as it rounds back to the -entry side) and
+        # give ZERO pull from the wrong side -- removing the isotropic attractor that let the head
+        # park behind/beside the station. Falls back to the isotropic radial term before the axis is
+        # calibrated (close_dir None) or when approach_perp_range == 0.
+        if along is not None and params.approach_perp_range > 0.0:
+            if along >= 0.0:
+                perp_tol = params.approach_perp_range + along
+                m_approach = max(0.0, 1.0 - along / params.d_xy) * max(0.0, 1.0 - perp / perp_tol)
+            else:
+                m_approach = 0.0
+        else:
+            m_approach = 1.0 - min(1.0, float(np.hypot(tx - px, ty - py)) / params.d_xy)
+        phi = (params.w_xy * m_approach
                + params.w_z * (1.0 - m_z)
                + params.w_e * v)
+        # Route progress: dense angular pull around the station toward the approach side, filling
+        # the along<0 hole the directional cone leaves on the whole start side (see RewardParams).
+        if params.w_route > 0.0:
+            phi += params.w_route * self._route_progress()
         # Discovery term: highest elevation banked via CHAIN-LIFT pieces (a plain climb of the
         # same geometry earns nothing here). Keying on the chain flag makes action 9/10 strictly
         # better than the identical-geometry plain climb 5/11, so the dense gradient points at the
@@ -742,31 +969,75 @@ class OpenRCT2Env(gym.Env):
         phi += params.w_h * (chain_gain / params.h_scale)
         # Descent/return shaping: 0 at/above the summit (no double-pay), rising on the way home.
         phi += self._return_potential(params)
-        # Steep, local near-closure bonus: ramps to w_close only in the final close_range tiles at
-        # station height, so the agent gets a strong gradient to COMMIT to the closing tile that the
-        # gentle w_xy approach term (~0.25/tile) cannot supply in a cold start. Pure state function.
-        # Near-dock position proximity (steep ramp over the final close_range tiles). Used for the
-        # close bonus AND to COUPLE the heading term to the dock (below).
-        near_xy = (max(0.0, 1.0 - float(np.hypot(tx - px, ty - py)) / params.close_range)
-                   if params.close_range > 0.0 else 1.0)
+        # Steep, local near-closure FUNNEL: ramps to w_close only in the final close_range tiles at
+        # station height, so the agent gets a strong gradient to COMMIT to the closing tile. Reuses
+        # the (along, perp) entry-axis projection computed above (the API closes the circuit only
+        # from the -entry-side staging tile heading the entry direction; probe_corridor.py). Rewards
+        # only the on-axis approach from the correct side. Pure state function -> PBRS-clean.
+        if along is not None and params.close_range > 0.0:
+            near_along = max(0.0, 1.0 - along / params.close_range) if along >= 0.0 else 0.0
+            # Perp tolerance opens from a point at the throat (along=0) to close_perp_range over
+            # close_throat_pinch tiles, so the off-axis tiles beside the dock are excluded.
+            if params.close_perp_range <= 0.0:
+                near_perp = 1.0
+            else:
+                perp_range = (params.close_perp_range * min(1.0, max(0.0, along) / params.close_throat_pinch)
+                              if params.close_throat_pinch > 0.0 else params.close_perp_range)
+                if perp_range > 0.0:
+                    near_perp = max(0.0, 1.0 - perp / perp_range)
+                else:
+                    near_perp = 1.0 if perp <= 0.0 else 0.0   # throat: only the exact centerline
+            near_corridor = near_along * near_perp
+        else:
+            near_corridor = 1.0
         if params.w_close > 0.0:
             near_z = max(0.0, 1.0 - abs(pz - tz) / params.close_z_range)
-            phi += params.w_close * near_xy * near_z
-        # Heading alignment to the dock entry axis, COUPLED to the dock via near_xy: ~0 while routing
-        # (so the agent is free to turn through the loop) and only rewarded for aligning to the
-        # closing heading AS the head docks. Additive (it never multiplies the pull-to-dock), so a
-        # curved closing approach -- which arrives a few tiles out heading some non-entry direction
-        # (verify_goal_position.py: head was heading W two tiles from the dock before the closing
-        # right-curve) -- is not penalised on its position bonus. Pure state function -> PBRS-clean.
-        # (Was a GLOBAL heading reward, which fought the mid-loop turns the agent must make.)
-        close_dir = self._reward_target_direction()
+            phi += params.w_close * near_corridor * near_z
+        # Heading alignment to the entry direction, gated by the corridor (rewarded only as the head
+        # lines up to dock, leaving it free to turn while routing the loop).
         if close_dir is not None:
             cur = self.direction_vectors[self.current_direction]
             tgt = self.direction_vectors[close_dir]
             cos_theta = cur[0] * tgt[0] + cur[1] * tgt[1]  # unit cardinal vectors
             m_dir = (1.0 - cos_theta) / 2.0
-            phi += params.w_dir * (1.0 - m_dir) * near_xy
+            phi += params.w_dir * (1.0 - m_dir) * near_corridor
         return float(phi)
+
+    def _corridor_coords(self):
+        """(along, perp) of the head's offset from the closing target, projected onto the
+        entry axis; (None, None) until the closing direction is known.
+
+        along > 0 == on the -entry (approach) side of the staging tile; perp == off-axis
+        distance. Single geometry authority: _potential's approach cone / funnel and the
+        observation's corridor scalars must agree, or the policy sees a different corridor
+        than the one the reward pays on.
+        """
+        close_dir = self._reward_target_direction()
+        if close_dir is None:
+            return None, None
+        tx, ty, _ = self._reward_target_position()
+        ex, ey = self.direction_vectors[close_dir]           # entry direction (head docks heading this)
+        ox = self.current_position[0] - tx
+        oy = self.current_position[1] - ty
+        return -(ox * ex + oy * ey), abs(ox * ey - oy * ex)
+
+    def _route_progress(self):
+        """Angular progress of the build head around the station center, in [0, 1].
+
+        0 on the start-side bearing (the entry direction, where the head exits the station)
+        rising monotonically to 1 on the opposite/approach bearing -- along BOTH the north and
+        south detours. Pure function of current_position (and the fixed station geometry), so
+        the w_route Phi term telescopes. 0.5 at the (unreachable) center degeneracy.
+        """
+        ex, ey = self.direction_vectors[self._STATION_ENTRY_DIR]
+        cx = self.station_start_position[0] + ex * (self.station_length - 1) / 2.0
+        cy = self.station_start_position[1] + ey * (self.station_length - 1) / 2.0
+        vx = self.current_position[0] - cx
+        vy = self.current_position[1] - cy
+        n = float(np.hypot(vx, vy))
+        if n < 1e-6:
+            return 0.5
+        return float(np.arccos(np.clip((vx * ex + vy * ey) / n, -1.0, 1.0)) / np.pi)
 
     def _return_potential(self, params):
         """Climb-gated descent-shaping component of Phi (PBRS).
@@ -820,6 +1091,10 @@ class OpenRCT2Env(gym.Env):
         chain_count = sum(1 for h in hist if h.get("action") in (9, 10))
         has_drop = any(h.get("action") in (6, 8, 12, 14) for h in hist)
         chain_q = min(chain_count / params.struct_chain_target, 1.0)
+        # Elevation factor: chain PIECES alone are farmable (three scattered 1-z stubs are
+        # not a lift hill); scale by chain-banked height against the stage's climb bar.
+        if params.roundtrip_gain > 0:
+            chain_q *= min(self._chain_max_gain() / params.roundtrip_gain, 1.0)
         drop_q = 1.0 if has_drop else 0.0
         return min(params.struct_w_chain * chain_q + params.struct_w_drop * drop_q, 1.0)
 
@@ -855,9 +1130,21 @@ class OpenRCT2Env(gym.Env):
             self.chain_lift_count = max(0, self.chain_lift_count - 1)
 
     def _is_trunkated(self):
+        # Possibly-desynced client/server track state (request timeout, all-invalid mask):
+        # every further transition would be corrupt -- sacrifice the episode.
+        if self._connection_suspect:
+            return True
+
         # Check for extreme distance termination
         current_distance = self._calculate_distance_to_start()[0]
         too_far = current_distance > 100  # Terminate if more than 100 units away
+
+        # Scaffolded-episode budget (see _apply_warm_start): a failed dock attempt must
+        # truncate fast instead of wandering the full phase budget.
+        if self._warm_track_cap is not None and self.track_length >= self._warm_track_cap:
+            return True
+        if self._warm_step_cap is not None and self.steps >= self._warm_step_cap:
+            return True
 
         # No need to check for stuck patterns - symmetric removal prevents exploitation
 
@@ -1013,6 +1300,19 @@ class OpenRCT2Env(gym.Env):
         energy_margin = self._calculate_energy_margin()
         track_len_frac = self.track_length / max(1, self.max_track_length)
 
+        # Corridor scalars: the exact coordinates Phi's approach cone / funnel / heading /
+        # route terms pay on, so the policy sees the reward manifold instead of having to
+        # infer it from map+disp. Neutral zeros while the entry axis is uncalibrated (the
+        # route progress is station-geometry-only and always defined).
+        along, perp = self._corridor_coords()
+        close_dir = self._reward_target_direction()
+        if close_dir is not None:
+            cur = self.direction_vectors[self.current_direction]
+            tgt = self.direction_vectors[close_dir]
+            heading_cos = float(cur[0] * tgt[0] + cur[1] * tgt[1])
+        else:
+            heading_cos = 0.0
+
         scalars = np.clip(np.array([
             current_distance / 100.0,
             angle_to_goal / np.pi,
@@ -1022,6 +1322,10 @@ class OpenRCT2Env(gym.Env):
             self.last_ride_intensity / 15.0,
             self.last_ride_nausea / 15.0,
             energy_margin / 100.0,
+            0.0 if along is None else along / 16.0,
+            0.0 if perp is None else perp / 8.0,
+            heading_cos,
+            self._route_progress(),
         ], dtype=np.float32), -10.0, 10.0)
 
         tokens, feats, mask = self._build_history_buffer()
@@ -1188,7 +1492,15 @@ class OpenRCT2Env(gym.Env):
     UPHILL_COST = 5          # Extra cost climbing without chain
     TURN_FRICTION = 1        # Extra friction for turns
     STATION_HEIGHT = 14      # z-coordinate of station
-    _STATION_ENTRY_DIR = 0   # cardinal dir the train enters BeginStation with (North; station built startDir=0)
+    _STATION_ENTRY_DIR = 0   # cardinal dir the train enters BeginStation with (dir 0 = West/(-1,0); station built startDir=0)
+
+    # Scaffolded-episode budget: extra pieces beyond the planned suffix k, and the step
+    # multiplier that bounds no-progress churn (failures, place/remove).
+    WARM_TRACK_SLACK = 4
+    WARM_STEP_FACTOR = 4
+    # Harvest policy: long meander completions are legal but junk scaffolds -- they swamp
+    # the pool over a long run and slow every prefix replay. Seeded loops are 12-18 pieces.
+    HARVEST_MAX_LEN = 24
 
     # How many recent positions to retain for the observation's distance-trend signal.
     POSITION_HISTORY_MAXLEN = 8

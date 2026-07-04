@@ -168,3 +168,65 @@ def test_get_observation_last_piece_type_shift_and_sentinel():
     hist = [_entry(9, (61, 70, 14), (61, 71, 15))]
     env = _bare_env(history=hist, current_position=(61, 71, 15))
     assert int(env._get_observation()["last_piece_type"]) == 10
+
+
+# ------------------------------------------- corridor / route scalars (obs upgrade)
+# The policy could only infer the closing corridor from map+disp; scalars[8:12] now expose
+# the EXACT coordinates Phi pays on (along/perp entry-axis projection, heading match, route
+# progress), aligning the observation with the reward manifold.
+
+def test_corridor_coords_hand_computed():
+    env = _bare_env(history=[], current_position=(65, 67, 14), current_direction=3)
+    env.close_pos = [62, 66, 14]
+    env.close_dir = 3                      # entry axis West in this file's DIRS
+    along, perp = env._corridor_coords()
+    assert along == pytest.approx(3.0)     # 3 tiles out on the approach side
+    assert perp == pytest.approx(1.0)      # 1 tile off-axis
+
+
+def test_corridor_coords_signed_on_wrong_side():
+    env = _bare_env(history=[], current_position=(58, 66, 14))
+    env.close_pos = [62, 66, 14]
+    env.close_dir = 3
+    along, perp = env._corridor_coords()
+    assert along == pytest.approx(-4.0)    # behind the staging tile (start side)
+    assert perp == pytest.approx(0.0)
+
+
+def test_corridor_coords_none_before_calibration():
+    env = _bare_env(history=[])            # no close_dir set on the bare env
+    assert env._corridor_coords() == (None, None)
+
+
+def test_scalars_extended_to_12_with_corridor_features():
+    env = _bare_env(history=[], current_position=(65, 67, 14), current_direction=3)
+    env.close_pos = [62, 66, 14]
+    env.close_dir = 3
+    obs = env._get_observation()
+    s = obs["scalars"]
+    assert s.shape == (12,)
+    assert s[8] == pytest.approx(3.0 / 16.0)              # along / 16 (signed)
+    assert s[9] == pytest.approx(1.0 / 8.0)               # perp / 8
+    assert s[10] == pytest.approx(1.0)                    # heading aligned with close_dir
+    assert s[11] == pytest.approx(env._route_progress())  # route progress in [0, 1]
+    assert env.observation_space.contains(obs)
+    # opposed heading reads -1 (cardinal dot product)
+    env.current_direction = 1                             # East vs entry West
+    assert env._get_observation()["scalars"][10] == pytest.approx(-1.0)
+
+
+def test_scalar_corridor_features_zero_safe_without_close_dir():
+    env = _bare_env(history=[], current_position=(65, 67, 14))
+    obs = env._get_observation()
+    s = obs["scalars"]
+    assert s.shape == (12,)
+    assert s[8] == 0.0 and s[9] == 0.0 and s[10] == 0.0   # undefined corridor -> neutral zeros
+    assert s[11] == pytest.approx(env._route_progress())  # station-geometry-only, always defined
+    assert env.observation_space.contains(obs)
+
+
+def test_goal_disp_scale_matches_corridor_range():
+    """SCALE=32 (was 100): phase-1 distances are <=~30 tiles, so goal_disp actually uses the
+    [-1,1] range instead of idling in [-0.25, 0.25]."""
+    from openrct2_gym.envs.obs_config import SCALE
+    assert SCALE == 32.0
