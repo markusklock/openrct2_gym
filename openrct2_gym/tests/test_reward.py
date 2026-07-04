@@ -295,11 +295,14 @@ def test_quality_bonus_peaks_at_target_band_and_is_bounded():
     assert env._quality_bonus(12.0, 9.0, 8.0, p) < peak
 
 
-def test_quality_bonus_symmetric_excitement_falloff():
+def test_quality_bonus_monotone_ramp_below_target():
+    """Replaces the symmetric-falloff pin: quality is now ramp+band, so the below-target
+    side is strictly MONOTONE (every excitement increment pays -- the Phase-5 plateau fix)
+    and the above-target side keeps the ramp half (see the overshoot test)."""
     env = _bare_env()
     p = RewardParams(R_quality_max=500.0)
-    assert env._quality_bonus(7.0, 5.5, 2.0, p) == pytest.approx(
-        env._quality_bonus(9.0, 5.5, 2.0, p), rel=1e-6)
+    vals = [env._quality_bonus(e, 5.5, 2.0, p) for e in (1.0, 3.0, 5.0, 7.0, 8.0)]
+    assert all(b > a for a, b in zip(vals, vals[1:]))
 
 
 def test_quality_bonus_bounded_and_finite_on_extremes():
@@ -672,11 +675,13 @@ def test_phase_reward_params_structural_per_phase():
     assert (p2c.R_struct_max, p2c.struct_w_chain, p2c.struct_w_drop, p2c.struct_chain_target) \
         == (250.0, 1.0, 0.0, 3)                         # stage 2.3: tighten to >=3 chains
     p3 = W._phase_reward_params(3)
-    assert (p3.R_struct_max, p3.struct_w_chain, p3.struct_w_drop, p3.struct_chain_target) \
-        == (250.0, 0.5, 0.5, 2)                         # chains AND drop, target 2 (matches >=2 gate)
+    # P3/P4 redesign: struct credit is graded height/drop/length toward per-phase targets
+    # (piece counting alone was already satisfied by the 2.3 mini-loop and taught nothing).
+    assert (p3.R_struct_max, p3.struct_w_chain, p3.struct_w_height, p3.struct_w_drop,
+            p3.struct_w_length) == (250.0, 0.0, 0.4, 0.4, 0.2)
     p4 = W._phase_reward_params(4)
-    assert (p4.R_struct_max, p4.struct_w_chain, p4.struct_w_drop, p4.struct_chain_target) \
-        == (250.0, 0.5, 0.5, 3)                         # integration, target 3
+    assert (p4.R_struct_max, p4.struct_w_chain, p4.struct_w_height, p4.struct_w_drop,
+            p4.struct_w_length) == (250.0, 0.0, 0.4, 0.4, 0.2)
     p5 = W._phase_reward_params(5)
     assert p5.R_struct_max == 0.0 and p5.R_quality_max == 500.0   # struct off, quality on
     # discovery potential: ON only in the hill-building phases 2-4; OFF in the
@@ -730,15 +735,18 @@ def test_discovery_potential_off_in_phase1_and_5_on_in_phase2():
 # ---- structural bonus
 
 def _struct_env(chains=0, drops=0):
-    """A bare env whose history has `chains` chain-lift pieces (action 9) climbing, then
-    `drops` drop pieces (action 6) descending."""
-    hist, z = [], 14
+    """A bare env whose history has `chains` chain-lift pieces (action 9) climbing +1 z each,
+    then `drops` drop pieces (action 6) descending -1 z each. Entries carry full positions
+    (the drop-z accounting reads entry AND exit z, like real take_action histories)."""
+    hist, z, x = [], 14, 0
     for _ in range(chains):
+        hist.append({"action": 9, "position": [x, 0, z], "next_position": [x + 1, 0, z + 1]})
         z += 1
-        hist.append({"action": 9, "next_position": [0, 0, z]})
+        x += 1
     for _ in range(drops):
+        hist.append({"action": 6, "position": [x, 0, z], "next_position": [x + 1, 0, z - 1]})
         z -= 1
-        hist.append({"action": 6, "next_position": [0, 0, z]})
+        x += 1
     return _bare_env(history=hist)
 
 
@@ -1472,7 +1480,8 @@ def _no_geo(P):
 
 
 def _ladder_rung(P, *, chains, head_z, completed):
-    hist = [{"action": 9, "next_position": [0, 0, 20]} for _ in range(chains)]  # gain 6 >= 4
+    hist = [{"action": 9, "position": [i, 0, 14], "next_position": [i + 1, 0, 20]}
+            for i in range(chains)]                                          # gain 6 >= 4
     env = _bare_env(current_position=(0, 0, head_z), history=hist)
     env.reward_params = _no_geo(P)
     env._phi_prev = 0.0
@@ -1612,11 +1621,13 @@ def test_phase_switch_keeps_single_reward_method_and_only_changes_params(monkeyp
     wrapper._update_phase_settings()
     assert base_env._calculate_reward == reward_fn             # SAME method (no per-phase swap)
     assert base_env.reward_params.R_quality_max == 500.0       # only params changed
-    assert base_env.reward_params.step_cost < 0
+    assert base_env.reward_params.step_cost == 0.0             # P5 no longer punishes length
     assert base_env.skip_ride_testing is False
 
 
-def test_p3_qualified_requires_chains_and_drop():
+def test_p2_qualified_stage_predicates():
+    """P2 stage predicates (P3/P4 now have their own scale gates, covered by the
+    test_p3/p4_qualified_* tests)."""
     W = ImprovedPhasedCurriculumWrapper
     w = W.__new__(W)                          # no __init__/env needed for the predicate
 
@@ -1627,11 +1638,6 @@ def test_p3_qualified_requires_chains_and_drop():
             current_position=[0, 0, current_z],
             _roundtrip_awarded=roundtrip)
 
-    w.current_phase = 3
-    assert w._is_qualified(base([9, 9, 6]), True) is True     # 2 chains AND a drop
-    assert w._is_qualified(base([9, 9]), True) is False       # chains, no drop
-    assert w._is_qualified(base([6]), True) is False          # drop only
-    assert w._is_qualified(base([9, 9, 6]), False) is False   # not completed
     w.current_phase = 2
     w.phase2_stage = 1
     assert w._is_qualified(base([9], roundtrip=True), False) is True    # P2.1: no completion needed
@@ -1642,8 +1648,8 @@ def test_p3_qualified_requires_chains_and_drop():
     w.phase2_stage = 3
     assert w._is_qualified(base([9, 9, 9]), True) is True      # P2.3: >=3 chains
     assert w._is_qualified(base([9, 9]), True) is False
-    w.current_phase = 4
-    assert w._is_qualified(base([9, 9, 6]), True) is None     # no structural gate
+    w.current_phase = 5
+    assert w._is_qualified(base([9, 9, 6]), True) is None     # P5: no structural gate
 
 
 def test_phase2_summit_signal_tracks_chain_climb():
@@ -2137,3 +2143,281 @@ def test_probe_log_stops_after_anchor_locks():
     env._maybe_capture_closing_geometry()
     path = os.path.join(os.path.dirname(OpenRCT2Env._CLOSE_CACHE_PATH), "closing_probe.jsonl")
     assert not os.path.exists(path)            # locked anchor -> no more probe lines
+
+
+# --------------------------------------------- P3-5 redesign: structure quality + quality ramp
+
+def _tall_hill_env(track_len_pad=0):
+    """History with a +5z chain climb and a full 5z descent (drop_z 5), optionally padded
+    with flat pieces to stretch track_length."""
+    hist = [
+        {"action": 10, "position": [0, 0, 14], "next_position": [1, 0, 15]},
+        {"action": 9, "position": [1, 0, 15], "next_position": [2, 0, 17]},
+        {"action": 9, "position": [2, 0, 17], "next_position": [3, 0, 19]},
+        {"action": 12, "position": [3, 0, 19], "next_position": [4, 0, 18]},
+        {"action": 6, "position": [4, 0, 18], "next_position": [5, 0, 16]},
+        {"action": 6, "position": [5, 0, 16], "next_position": [6, 0, 14]},
+    ] + [{"action": 0, "position": [6 + i, 0, 14], "next_position": [7 + i, 0, 14]}
+         for i in range(track_len_pad)]
+    return _bare_env(history=hist)
+
+
+def test_total_drop_z_sums_descents_only():
+    env = _tall_hill_env()
+    assert env._total_drop_z() == pytest.approx(5.0)      # 1 + 2 + 2, climbs ignored
+
+
+def test_structure_quality_grades_height_drop_length():
+    """P3/P4 structural bonus components: chain height, total drop-z, completed length,
+    each ramping toward per-phase targets (partial progress pays -- no cliffs)."""
+    p = RewardParams(R_struct_max=250.0, struct_w_chain=0.0, struct_w_height=0.4,
+                     struct_height_target=4.0, struct_w_drop=0.4, struct_drop_target=4.0,
+                     struct_w_length=0.2, struct_length_target=25.0)
+    env = _tall_hill_env()                                # height 5, drop 5, length 6
+    expected = 0.4 * 1.0 + 0.4 * 1.0 + 0.2 * (6 / 25)
+    assert env._hill_quality(p) == pytest.approx(expected)
+    long_env = _tall_hill_env(track_len_pad=19)           # length 25 -> full length credit
+    assert long_env._hill_quality(p) == pytest.approx(1.0)
+    small = _struct_env(chains=1)                         # 1z stub, no real drop, tiny
+    assert small._hill_quality(p) < 0.3
+
+
+def test_structure_quality_defaults_preserve_legacy_behavior():
+    """New component weights default to 0: every pre-redesign params object computes the
+    exact same hill quality as before."""
+    p = RewardParams(R_struct_max=250.0, struct_chain_target=3, struct_w_chain=1.0,
+                     struct_w_drop=0.0)
+    assert _struct_env(chains=3)._structural_bonus(p) == pytest.approx(250.0)
+
+
+def test_quality_ramp_pays_partial_progress():
+    """The Phase-5 plateau: exc ~1.5 vs a band at 8 paid ZERO for any improvement short of
+    ~6 (two runs converged to the identical +90 nausea-only bonus). The ramp half pays
+    every increment from 0 up; the band half still peaks at the target."""
+    env = _bare_env()
+    p = RewardParams(R_quality_max=500.0)
+    q = lambda e: env._quality_bonus(e, 5.5, 1.0, p)      # intensity/nausea held at target
+    assert q(2.0) > q(1.5) > q(1.0)                       # gradient exists at the plateau
+    assert q(2.0) - q(1.0) > 10.0                         # ...and is material, not epsilon
+    assert q(8.0) == max(q(e) for e in (1, 2, 4, 6, 7, 8))  # still peaks at the target
+    assert q(8.0) > 0.95 * (p.q_w_exc + p.q_w_int + p.q_w_nausea * 0.97) * 500 * 0.95
+
+
+def test_quality_overshoot_halves_not_zeroes():
+    """Above-target stats keep the ramp half (an 8.5-excitement coaster is not worthless)
+    while the band half decays -- replaces the old symmetric falloff."""
+    env = _bare_env()
+    p = RewardParams(R_quality_max=500.0)
+    at = env._quality_bonus(8.0, 5.5, 1.0, p)
+    over = env._quality_bonus(11.0, 5.5, 1.0, p)
+    under = env._quality_bonus(5.0, 5.5, 1.0, p)
+    assert under < over < at                              # overshoot beats equal undershoot
+    assert over > 0.55 * at                               # but keeps at least the ramp half
+
+
+def test_r_viable_paid_only_when_ride_test_returns_stats(monkeypatch):
+    """P4's 'the train physically made it around' bonus: paid on completion ONLY when the
+    ride test came back with nonzero stats."""
+    monkeypatch.setattr(oe_mod, "APIController", CompletingAPI)
+    env = OpenRCT2Env(verbose=0)
+    env.skip_ride_testing = False                         # CompletingAPI serves stats instantly
+    env.reward_params = RewardParams(R_viable=150.0, roundtrip_gain=0.0)
+    env.reset()
+    phi_prev_before, reward, terminated, _, info = _drive_to_terminal(env)
+    assert terminated
+    p = env.reward_params
+    rr = info['ride_rating']
+    quality = env._quality_bonus(rr['excitement'], rr['intensity'], rr['nausea'], p)
+    assert reward == pytest.approx(p.R_complete - phi_prev_before + quality + 150.0)
+    assert env._last_test_ok is True
+    assert info['episode_metrics']['test_ok'] is True
+
+    env2 = OpenRCT2Env(verbose=0)
+    env2.skip_ride_testing = True                         # untested -> all-zero stats
+    env2.reward_params = RewardParams(R_viable=150.0, roundtrip_gain=0.0)
+    env2.reset()
+    phi_prev_before, reward, terminated, _, info = _drive_to_terminal(env2)
+    assert terminated
+    assert reward == pytest.approx(env2.reward_params.R_complete - phi_prev_before)  # no bonus
+    assert env2._last_test_ok is False
+
+
+def test_episode_metrics_expose_structure_diagnostics(monkeypatch):
+    monkeypatch.setattr(oe_mod, "APIController", CompletingAPI)
+    env = OpenRCT2Env(verbose=0)
+    env.skip_ride_testing = True
+    env.reset()
+    info = {}
+    for _ in range(6):
+        _, _, terminated, truncated, info = env.step(9)
+        if terminated or truncated:
+            break
+    m = info['episode_metrics']
+    assert {'drop_z', 'chain_height', 'test_ok'}.issubset(m)
+
+
+# --------------------------------------------- P3/P4 scale phases + P5 quality phase
+
+def test_phase34_scale_params_and_p5_step_cost():
+    """P3 'Real Drops & Scale' and P4 'Big & Verified': structure credit moves from piece
+    counting to graded height/drop/length toward per-phase targets; P4 pays the verified-
+    viability bonus and turns ride testing on; P5 stops punishing length (step_cost 0)."""
+    W = ImprovedPhasedCurriculumWrapper
+    p3 = W._phase_reward_params(3)
+    assert (p3.struct_w_height, p3.struct_height_target) == (0.4, 4.0)
+    assert (p3.struct_w_drop, p3.struct_drop_target) == (0.4, 4.0)
+    assert (p3.struct_w_length, p3.struct_length_target) == (0.2, 25.0)
+    assert p3.struct_w_chain == 0.0 and p3.R_viable == 0.0
+    assert p3.h_scale == 8.0                      # taller climbs keep paying discovery
+    p4 = W._phase_reward_params(4)
+    assert (p4.struct_w_height, p4.struct_height_target) == (0.4, 6.0)
+    assert (p4.struct_w_drop, p4.struct_drop_target) == (0.4, 8.0)
+    assert (p4.struct_w_length, p4.struct_length_target) == (0.2, 40.0)
+    assert p4.R_viable == 150.0 and p4.h_scale == 8.0
+    # completion-conditioned bonuses stay strictly below R_complete
+    assert p4.R_struct_max + p4.R_viable < p4.R_complete
+    p5 = W._phase_reward_params(5)
+    assert p5.step_cost == 0.0                    # the one phase that WANTS length
+
+
+def _scale_base(actions_z, head_z=14, track_length=None, energy=10.0, test_ok=True):
+    """SimpleNamespace base env for the qualified predicates: actions_z is a list of
+    (action, entry_z, exit_z)."""
+    hist = [{"action": a, "position": [i, 0, z0], "next_position": [i + 1, 0, z1]}
+            for i, (a, z0, z1) in enumerate(actions_z)]
+    return SimpleNamespace(
+        track_builder=SimpleNamespace(history=hist),
+        current_position=[0, 0, head_z],
+        track_length=len(hist) if track_length is None else track_length,
+        STATION_HEIGHT=14,
+        _calculate_energy_margin=lambda: energy,
+        _last_test_ok=test_ok,
+        _summit_awarded=False, _roundtrip_awarded=False,
+    )
+
+
+def _big_hill(chain_peak=19, steep=False, length=30):
+    """(action, z_in, z_out) rows: chain climb to chain_peak, descent back to 14, flat pad."""
+    rows, z, a_idx = [], 14, 0
+    rows.append((10, z, z + 1)); z += 1
+    while z < chain_peak:
+        rows.append((9, z, min(z + 2, chain_peak))); z = min(z + 2, chain_peak)
+    if steep:
+        rows += [(12, z, z - 1), (27, z - 1, z - 5), (28, z - 5, z - 9), (14, z - 9, z - 10)]
+        z -= 10
+    while z > 14:
+        rows.append((6, z, max(z - 2, 14))); z = max(z - 2, 14)
+    while len(rows) < length:
+        rows.append((0, 14, 14))
+    return rows
+
+
+def test_p3_qualified_requires_height_drop_length_energy():
+    W = ImprovedPhasedCurriculumWrapper
+    w = W.__new__(W)
+    w.current_phase = 3
+    good = _scale_base(_big_hill(chain_peak=19, length=26))     # h5, drop 5, len 26
+    assert w._is_qualified(good, True) is True
+    assert w._is_qualified(good, False) is False                # must complete
+    small = _scale_base(_big_hill(chain_peak=17, length=26))    # h3 < 4
+    assert w._is_qualified(small, True) is False
+    short = _scale_base(_big_hill(chain_peak=19, length=10), track_length=10)
+    assert w._is_qualified(short, True) is False                # len < 25
+    stalled = _scale_base(_big_hill(chain_peak=19, length=26), energy=-5.0)
+    assert w._is_qualified(stalled, True) is False              # energy proxy says the train dies
+
+
+def test_p4_qualified_requires_steep_and_verified():
+    W = ImprovedPhasedCurriculumWrapper
+    w = W.__new__(W)
+    w.current_phase = 4
+    good = _scale_base(_big_hill(chain_peak=25, steep=True, length=41))   # h11, drop>=10+steep
+    assert w._is_qualified(good, True) is True
+    unverified = _scale_base(_big_hill(chain_peak=25, steep=True, length=41), test_ok=False)
+    assert w._is_qualified(unverified, True) is False           # train never demonstrably ran
+    no_steep = _scale_base(_big_hill(chain_peak=25, steep=False, length=41))
+    assert w._is_qualified(no_steep, True) is False             # 60-degree segment required
+
+
+def test_p4_advancement_uses_qualified_window():
+    from collections import deque
+    W = ImprovedPhasedCurriculumWrapper
+    w = W.__new__(W)
+    w.current_phase = 4
+    w.phase4_success_threshold = 0.30
+    w._track_stats = True
+    w.verbose = 0
+    w.phases_completed = []
+    w.phase_episode_count = 50
+    w.total_loops_completed = 0
+    w.episode_results = deque([True] * 50, maxlen=50)           # raw completions maxed...
+    w.episode_qualified_results = deque([False] * 50, maxlen=50)  # ...but nothing qualifies
+    advanced = []
+    w._advance_to_phase = lambda p: advanced.append(p)
+    assert w._check_phase_advancement() is False                # raw success must NOT advance P4
+    w.episode_qualified_results = deque([True] * 20 + [False] * 30, maxlen=50)   # 40% qualified
+    w._check_phase_advancement()
+    assert advanced == [5]
+
+
+def test_ride_testing_enabled_from_phase4(monkeypatch):
+    monkeypatch.setattr(oe_mod, "APIController", FakeAPI)
+    base = OpenRCT2Env(verbose=0)
+    wrapper = ImprovedPhasedCurriculumWrapper(base, verbose=0)
+    for phase, expect_skip in ((1, True), (2, True), (3, True), (4, False), (5, False)):
+        wrapper.current_phase = phase
+        wrapper._update_phase_settings()
+        assert base.skip_ride_testing is expect_skip, f"phase {phase}"
+
+
+# --------------------------------------------- unrated-ride sentinel (live-probe finding)
+
+class SentinelThenRatedAPI(CompletingAPI):
+    """The live plugin returns excitement=-0.01 (RCT2's 'not yet rated' -1/100) until the
+    test train has actually run: the poll must reject non-positive ratings and keep waiting."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.stat_calls = 0
+
+    def get_ride_stats(self):
+        self.stat_calls += 1
+        if self.stat_calls < 3:
+            return {"success": True, "payload": {"excitement": -0.01, "intensity": 0, "nausea": 0}}
+        return super().get_ride_stats()
+
+
+class NeverRatedAPI(CompletingAPI):
+    def get_ride_stats(self):
+        return {"success": True, "payload": {"excitement": -0.01, "intensity": 0, "nausea": 0}}
+
+
+def test_poll_rejects_unrated_sentinel_then_accepts_real_stats(monkeypatch):
+    monkeypatch.setattr(oe_mod, "APIController", SentinelThenRatedAPI)
+    env = OpenRCT2Env(verbose=0)
+    stats = env._poll_for_ride_stats(max_wait=2, poll_interval=0.01)
+    assert stats['excitement'] == pytest.approx(8.0)      # waited past the sentinel
+    assert env.api_controller.stat_calls >= 3
+
+
+def test_unrated_ride_is_not_test_ok_and_earns_nothing(monkeypatch):
+    """A test that never rates (train still running / stalled) must NOT count as verified,
+    must NOT pay R_viable, and must NOT collect the nausea-term freebie through the quality
+    bonus (nausea=0 on an UNRATED ride is not a calm ride)."""
+    monkeypatch.setattr(oe_mod, "APIController", NeverRatedAPI)
+    env = OpenRCT2Env(verbose=0)
+    env.skip_ride_testing = False
+    env.reward_params = RewardParams(R_viable=150.0, R_quality_max=500.0, roundtrip_gain=0.0)
+    env.ride_test_max_wait = 0.05                          # keep the test fast
+    env.reset()
+    phi_prev_before, reward, terminated, _, info = _drive_to_terminal(env)
+    assert terminated
+    assert env._last_test_ok is False
+    assert reward == pytest.approx(env.reward_params.R_complete - phi_prev_before)
+
+
+def test_quality_bonus_gates_out_sentinel_stats():
+    env = _bare_env()
+    p = RewardParams(R_quality_max=500.0)
+    assert env._quality_bonus(-0.01, 0.0, 0.0, p) == 0.0   # unrated sentinel -> no freebie
+    assert env._quality_bonus(1.5, 1.0, 0.5, p) > 0.0      # real (low) ratings still score

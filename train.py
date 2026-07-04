@@ -102,6 +102,18 @@ BOOT_ENT_HI = 0.55                  # is itself a freeze while discovering -> ba
 BOOT_ENT_BOOST = 0.04               # must exceed the 0.025 floor to be a boost at all
 ENT_MODE_MIN_HOLD = 10              # min updates between mode flips (anti-thrash)
 
+# Phase-5 quality exploration floor (the plateau fix's second half). Two from-scratch runs
+# converged onto a ~0.2-nat mini-loop policy earning the identical +90/500 nausea-only
+# quality bonus: even with the reward reshaped into a ramp, a policy with no entropy left
+# cannot DISCOVER the bigger coasters the ramp now pays for. While the fleet is in phase 5
+# and the median tested excitement sits below the floor target, the resting ent_coef is
+# raised and the collapse guard uses the raised (bootstrap) band; once excitement clears
+# the bar, the proven exploit config returns.
+P5_QUALITY_ENT_COEF = 0.02
+QUALITY_EXC_TARGET_FLOOR = 4.0      # median excitement that releases the quality floor
+QUALITY_WINDOW = 200                # tested-episode window (pooled across envs)
+QUALITY_MIN_SAMPLES = 30            # min tested episodes before the median is trusted
+
 # Fixed PPO hyperparameters, module-level so tests can pin them (n_steps/batch_size are
 # computed per run). Starts in the phase-1 config; the callback arms OPT_GUARDED later.
 PPO_HYPERPARAMS = dict(
@@ -231,6 +243,10 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
         self._cold_window = deque(maxlen=COLD_RATE_WINDOW)  # cold episodes (TB tag + gates readout)
         self._ent_mode_calls = 0       # _maybe_update_ent_mode invocations (one per rollout end)
         self._ent_mode_last_flip = 0   # call index of the last mode flip (min-hold anchor)
+        # Phase-4+ ride-test telemetry: tested-episode excitement (drives the P5 quality
+        # floor) and test-success outcomes, pooled across envs.
+        self._exc_window = deque(maxlen=QUALITY_WINDOW)
+        self._test_window = deque(maxlen=QUALITY_WINDOW)
 
     def _note_env_phase(self, env_idx, info):
         """Record one worker's curriculum phase/stage and refresh the fleet view."""
@@ -264,24 +280,43 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
             self.model.ent_coef = self._phase_base_ent_coef()
         print(f"🛡️ Phase 2 reached: armed guard {OPT_GUARDED}")
 
+    def _median_excitement(self):
+        """Median excitement over pooled TESTED episodes, or None until enough samples."""
+        if len(self._exc_window) < QUALITY_MIN_SAMPLES:
+            return None
+        return float(np.median(self._exc_window))
+
+    def _p5_quality_boost_active(self):
+        """Whether the Phase-5 exploration floor is held: fleet in phase 5 and median tested
+        excitement below the floor target (or unknown -- entering P5 holds exploration until
+        the telemetry says quality is climbing)."""
+        if self._phase < 5:
+            return False
+        med = self._median_excitement()
+        return med is None or med < QUALITY_EXC_TARGET_FLOOR
+
     def _phase_base_ent_coef(self):
         """The ent_coef the entropy guard restores to: the raised bootstrap floor while phase 1
         still has ~zero cold completions, the proven phase-1 value once they flow, then the
-        guarded floor after the KL guard arms -- raised to PHASE2_EARLY_ENT_COEF through the
-        early Phase-2 chain stages (sub-stages 2.1 discovery and 2.2 integration)."""
+        guarded floor after the KL guard arms -- raised through the early Phase-2 chain stages
+        and again in Phase 5 while quality is still below the floor target."""
         if not self._opt_guarded:
             if self._phase == 1 and self._ent_mode == "bootstrap":
                 return PHASE1_BOOTSTRAP_ENT_COEF
             return OPT_PHASE1['ent_coef']
+        if self._phase >= 5 and self._p5_quality_boost_active():
+            return P5_QUALITY_ENT_COEF
         if self._phase == 2 and self._phase2_stage in (1, 2):
             return PHASE2_EARLY_ENT_COEF
         return OPT_GUARDED['ent_coef']
 
     def _ent_band(self):
-        """(lo, hi, boost) for the collapse guard: the raised bootstrap band while discovering
-        (the legacy 'dormant zone' ~0.2 nats is itself a freeze there), the proven band after.
-        Never the bootstrap band once the KL guard armed -- past phase 1, exploitation rules."""
+        """(lo, hi, boost) for the collapse guard: the raised band while DISCOVERING (phase-1
+        bootstrap, or phase-5 quality still below its floor -- the legacy 'dormant zone'
+        ~0.2 nats is itself a freeze in both), the proven band while exploiting."""
         if (not self._opt_guarded) and self._phase == 1 and self._ent_mode == "bootstrap":
+            return BOOT_ENT_LO, BOOT_ENT_HI, BOOT_ENT_BOOST
+        if self._phase >= 5 and self._p5_quality_boost_active():
             return BOOT_ENT_LO, BOOT_ENT_HI, BOOT_ENT_BOOST
         return ENT_COLLAPSE_LO, ENT_COLLAPSE_HI, ENT_COLLAPSE_BOOST
 
@@ -390,9 +425,13 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
         self.logger.record('optim/phase2_stage',
                            float(self._phase2_stage or 0) if self._phase == 2 else 0.0)
         self.logger.record('optim/ent_floor_mode', 1.0 if self._ent_mode == "bootstrap" else 0.0)
+        self.logger.record('optim/p5_quality_boost', 1.0 if self._p5_quality_boost_active() else 0.0)
         cold_rate = self._cold_completion_rate()
         if cold_rate is not None:
             self.logger.record('success/cold_completion_rate', cold_rate)
+        median_exc = self._median_excitement()
+        if median_exc is not None:
+            self.logger.record('quality/median_excitement', median_exc)
 
     def _on_step(self) -> bool:
         # Track total steps for throughput calculation
@@ -441,6 +480,25 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
                 self._completion_window.append(bool(loop_completed))
                 if self.locals['infos'][env_idx].get('cold_start', False):
                     self._cold_window.append(bool(loop_completed))
+
+                # Ride-quality telemetry (phase 4+ only: earlier phases skip testing and
+                # emit all-zero sentinels that must not pollute the windows). Untested
+                # completions count against test success but not excitement.
+                _info_q = self.locals['infos'][env_idx]
+                rr = _info_q.get('ride_rating')
+                phase_i = _info_q.get('learning_phase', self._env_phase.get(env_idx, 1))
+                if rr is not None and phase_i >= 4:
+                    # POSITIVE stats only (the -0.01 unrated sentinel is truthy)
+                    tested = bool(rr.get('excitement', 0) > 0 or rr.get('intensity', 0) > 0
+                                  or rr.get('nausea', 0) > 0)
+                    self._test_window.append(tested)
+                    if tested:
+                        self._exc_window.append(float(rr.get('excitement', 0.0)))
+                        self.logger.record('quality/excitement', float(rr.get('excitement', 0.0)))
+                        self.logger.record('quality/intensity', float(rr.get('intensity', 0.0)))
+                        self.logger.record('quality/nausea', float(rr.get('nausea', 0.0)))
+                    self.logger.record('quality/test_success_rate',
+                                       sum(self._test_window) / len(self._test_window))
                 
                 # Print episode details in verbose mode
                 if self.training_verbose >= 1:
@@ -544,6 +602,13 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
                             self.logger.record('rewards/return_potential', info_metrics['return_potential'])
                         if 'route_potential' in info_metrics:
                             self.logger.record('rewards/route_potential', info_metrics['route_potential'])
+                        # scale diagnostics (P3-5 redesign): is the agent actually building bigger?
+                        if 'drop_z' in info_metrics:
+                            self.logger.record('structure/drop_z', info_metrics['drop_z'])
+                        if 'chain_height' in info_metrics:
+                            self.logger.record('structure/chain_height', info_metrics['chain_height'])
+                        if 'track_length' in info_metrics:
+                            self.logger.record('structure/completed_length', info_metrics['track_length'])
                         if 'remove_count' in info_metrics:
                             self.logger.record('behavior/remove_count', info_metrics['remove_count'])
 
@@ -674,7 +739,8 @@ def mask_fn(env: gym.Env) -> np.ndarray:
 def create_curriculum_masked_env(port: int, verbose: int = 0,
                                  warm_start_enabled: bool = True,
                                  loop_library_path: Optional[str] = None,
-                                 p_cold: float = 0.25) -> gym.Env:
+                                 p_cold: float = 0.25,
+                                 game_speed: int = 8) -> gym.Env:
     """Create an improved-curriculum environment with action masking for a port."""
     # A custom library path must redirect BOTH sides: the wrapper's read pool AND the
     # env's harvest destination (class attr; this runs inside each SubprocVecEnv worker).
@@ -684,6 +750,16 @@ def create_curriculum_masked_env(port: int, verbose: int = 0,
 
     # Base environment with specific port and verbosity
     base_env = gym.make('OpenRCT2-v0', host='localhost', port=port, verbose=verbose)
+
+    # Ride ratings take ~35s of SIM time; speed 8 makes P4/P5 ride tests ~4-5s. Best-effort:
+    # an older plugin without setGameSpeed just declines (env still works, tests just slow).
+    if game_speed and game_speed > 1:
+        api = base_env.unwrapped.api_controller
+        set_speed = getattr(api, "set_game_speed", None)
+        resp = set_speed(game_speed) if callable(set_speed) else {"success": False}
+        if not resp.get("success") and verbose >= 1:
+            print(f"⚠️ setGameSpeed unsupported on port {port} (deploy the updated plugin "
+                  f"for ~{game_speed}x faster ride tests)")
 
     # Add OpenRCT2Wrapper to expose valid_action_mask method
     # This is crucial for the mask_fn to work
@@ -724,12 +800,13 @@ def create_curriculum_masked_env(port: int, verbose: int = 0,
 def make_env_factory(port: int, verbose: int = 0,
                      warm_start_enabled: bool = True,
                      loop_library_path: Optional[str] = None,
-                     p_cold: float = 0.25) -> Callable[[], gym.Env]:
+                     p_cold: float = 0.25,
+                     game_speed: int = 8) -> Callable[[], gym.Env]:
     """Create a factory function for an environment on a specific port"""
     def _init() -> gym.Env:
         try:
             env = create_curriculum_masked_env(port, verbose, warm_start_enabled,
-                                               loop_library_path, p_cold)
+                                               loop_library_path, p_cold, game_speed)
             print(f"✅ Successfully connected to OpenRCT2 on port {port}")
             return env
         except Exception as e:
@@ -764,6 +841,7 @@ def train(
     warm_start_enabled: bool = True,
     loop_library_path: Optional[str] = None,
     p_cold: float = 0.25,
+    game_speed: int = 8,
 ):
     """Train agent with curriculum learning AND action masking on multiple parallel environments"""
 
@@ -818,7 +896,7 @@ def train(
 
     # Create environment factories for each port
     env_factories = [make_env_factory(port, verbose, warm_start_enabled,
-                                      loop_library_path, p_cold) for port in ports]
+                                      loop_library_path, p_cold, game_speed) for port in ports]
 
     # Create vectorized environments
     print(f"\n🔌 Connecting to {n_envs} OpenRCT2 instances...")
@@ -1095,6 +1173,10 @@ def main():
     parser.add_argument("--p-cold", type=float, default=0.25,
                        help="Base probability of a cold (unscaffolded) episode while warm starts "
                             "are active; rises automatically as the anneal progresses (default 0.25)")
+    parser.add_argument("--game-speed", type=int, default=8,
+                       help="Requested OpenRCT2 game speed (needs the plugin's setGameSpeed "
+                            "endpoint). Ride ratings take ~35s of sim time; speed 8 makes "
+                            "P4/P5 ride tests ~4-5s. Set 1 to leave the game untouched.")
     args = parser.parse_args()
     
     # Parse ports
@@ -1179,6 +1261,7 @@ def main():
         warm_start_enabled=not args.no_warm_start,
         loop_library_path=args.loop_library,
         p_cold=args.p_cold,
+        game_speed=args.game_speed,
     )
     # Training function already evaluates between chunks and closes env.
     # No additional evaluation here to avoid interfering with API ports.

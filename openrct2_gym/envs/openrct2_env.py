@@ -69,7 +69,17 @@ class RewardParams:
     R_struct_max: float = 0.0      # 0 in P1/P5; 250 in P2-4
     struct_chain_target: int = 3   # chain-lift count for full chain credit (matches the phase gate)
     struct_w_chain: float = 1.0    # weight on the chain-lift component
-    struct_w_drop: float = 0.0     # weight on the drop component
+    struct_w_drop: float = 0.0     # weight on the drop component (graded: total drop-z / target)
+    struct_drop_target: float = 1.0   # total drop-z for full drop credit (1 == legacy any-drop)
+    # Scale components (P3/P4 redesign: "bigger but viable"). Weights default 0 -> every
+    # pre-redesign params object computes the exact same structural quality as before.
+    struct_w_height: float = 0.0      # weight on chain-banked height / struct_height_target
+    struct_height_target: float = 4.0
+    struct_w_length: float = 0.0      # weight on completed track length / struct_length_target
+    struct_length_target: float = 25.0
+    # Verified-viability bonus (P4+): paid on completion ONLY when the ride test returned
+    # nonzero stats -- "the train physically made it around" as a paid, verified event.
+    R_viable: float = 0.0
     # Fraction of R_complete a HILL-LESS completion earns. 1.0 = no gating (P1/P5); 0.25 in
     # the hill phases means a flat loop pays only 250 while a full hill pays the rest -- a
     # flat-completer can no longer ignore the lift hill (it leaves 75% of R_complete on the
@@ -378,11 +388,13 @@ class OpenRCT2Env(gym.Env):
                     if self.verbose >= 2:
                         print(f"🎢 Ride test started: {test_result.get('payload', '')}")
 
-                    # Smart polling for ride stats. Early-exits as soon as non-zero stats land,
-                    # so this cap only bites when the test never produces stats. Bounded at 5s
-                    # (was 10) to limit how long a completing worker can stall the synchronized
-                    # vector-step barrier in phase 5 (phases 1-4 skip ride testing entirely).
-                    ride_rating = self._poll_for_ride_stats(max_wait=5)
+                    # Smart polling for ride stats. Early-exits as soon as POSITIVE stats land,
+                    # so this cap only bites when the test never rates (train stalled or still
+                    # running). The train needs real time to complete a circuit before RCT2
+                    # rates the ride, so the wait is a tunable (default 15s) -- a timeout
+                    # honestly reports unrated (test_ok False) instead of junk stats.
+                    ride_rating = self._poll_for_ride_stats(
+                        max_wait=getattr(self, 'ride_test_max_wait', 15))
                 else:
                     if self.verbose >= 1:
                         print(f"⚠️ Failed to start ride test: {test_result.get('error')}")
@@ -404,9 +416,17 @@ class OpenRCT2Env(gym.Env):
             # ride test. Gated to 0 when disabled (R_quality_max==0, phases 1-4) or when
             # the ride was skipped/untested (all stats zero), so completion is never punished.
             rr = info['ride_rating']
+            # POSITIVE stats only: the unrated sentinel (-0.01/0/0) is truthy but means the
+            # train never demonstrably ran.
+            self._last_test_ok = bool(rr.get('excitement', 0) > 0 or rr.get('intensity', 0) > 0
+                                      or rr.get('nausea', 0) > 0)
             reward += self._quality_bonus(
                 rr.get('excitement', 0), rr.get('intensity', 0), rr.get('nausea', 0),
                 self.reward_params)
+            # Verified-viability bonus: the train demonstrably made it around (nonzero test
+            # stats). Completion-conditioned by construction (this is the terminal branch).
+            if self.reward_params.R_viable > 0.0 and self._last_test_ok:
+                reward += self.reward_params.R_viable
         # Truncation gets no partial-credit bonus: PBRS already pays approach progress
         # as-you-go (a non-potential terminal bonus would be farmable and break invariance).
 
@@ -439,6 +459,10 @@ class OpenRCT2Env(gym.Env):
                 'collision_count': self.collision_count,
                 'loop_completed': self.loop_completed,
                 'warm_prefix_len': self._warm_prefix_len,
+                # scale/viability diagnostics (P3-5 redesign)
+                'drop_z': self._total_drop_z(),
+                'chain_height': float(self._chain_max_gain()),
+                'test_ok': bool(getattr(self, '_last_test_ok', False)),
             }
 
         return observation, reward, terminated, truncated, info
@@ -515,6 +539,7 @@ class OpenRCT2Env(gym.Env):
         self.consecutive_failures = 0
         self.steps_since_collision = 0
         self._connection_suspect = False
+        self._last_test_ok = False
         self.previous_distance = None
         self.position_history = deque(maxlen=self.POSITION_HISTORY_MAXLEN)
         self.chain_lift_positions = set()
@@ -1064,13 +1089,31 @@ class OpenRCT2Env(gym.Env):
         """
         if params.R_quality_max <= 0:
             return 0.0
-        if excitement == 0 and intensity == 0 and nausea == 0:
+        # Unrated gate: RCT2 reports -1 (plugin: -0.01) until the test train has actually
+        # run; nausea=0 on an UNRATED ride is a sentinel, not a calm ride -- scoring it paid
+        # a ~+96 'nausea freebie' for rides that never demonstrably completed a circuit.
+        if excitement <= 0 and intensity <= 0 and nausea <= 0:
             return 0.0
-        q_e = float(np.exp(-((excitement - params.exc_target) ** 2) / (2.0 * params.exc_sigma ** 2)))
-        q_i = float(np.exp(-((intensity - params.int_target) ** 2) / (2.0 * params.int_sigma ** 2)))
+        # Ramp + band (the Phase-5 plateau fix): the pure Gaussian band paid ZERO for any
+        # excitement short of ~target-2sigma, so an agent at exc ~1.5 had no gradient and two
+        # independent runs converged onto the identical minimal-loop optimum. The ramp half
+        # pays every increment toward the target; the band half still peaks AT it (and decays
+        # on overshoot -- an 11-intensity coaster keeps the ramp but loses the band).
+        def ramp_band(stat, target, sigma):
+            ramp = min(max(float(stat), 0.0) / target, 1.0)
+            band = float(np.exp(-((stat - target) ** 2) / (2.0 * sigma ** 2)))
+            return 0.5 * ramp + 0.5 * band
+        q_e = ramp_band(excitement, params.exc_target, params.exc_sigma)
+        q_i = ramp_band(intensity, params.int_target, params.int_sigma)
         q_n = 0.5 * (1.0 + np.tanh(0.5 * (params.nausea_max - nausea) / params.nausea_tau))
         return float(params.R_quality_max
                      * (params.q_w_exc * q_e + params.q_w_int * q_i + params.q_w_nausea * q_n))
+
+    def _total_drop_z(self):
+        """Total z dropped over DESCENT pieces in the removal-safe history (climbs ignored).
+        The 'real drop' measure for the P3/P4 scale components and gates."""
+        hist = getattr(self.track_builder, "history", None) or []
+        return float(sum(max(0.0, h["position"][2] - h["next_position"][2]) for h in hist))
 
     def _chain_max_gain(self):
         """Highest elevation (z above station) reached via CHAIN-LIFT pieces (actions 9/10) in
@@ -1089,14 +1132,22 @@ class OpenRCT2Env(gym.Env):
         gate). Used by both the structural bonus and the completion gate."""
         hist = getattr(self.track_builder, "history", None) or []
         chain_count = sum(1 for h in hist if h.get("action") in (9, 10))
-        has_drop = any(h.get("action") in (6, 8, 12, 14) for h in hist)
         chain_q = min(chain_count / params.struct_chain_target, 1.0)
         # Elevation factor: chain PIECES alone are farmable (three scattered 1-z stubs are
         # not a lift hill); scale by chain-banked height against the stage's climb bar.
         if params.roundtrip_gain > 0:
             chain_q *= min(self._chain_max_gain() / params.roundtrip_gain, 1.0)
-        drop_q = 1.0 if has_drop else 0.0
-        return min(params.struct_w_chain * chain_q + params.struct_w_drop * drop_q, 1.0)
+        # Graded scale components (all ramps toward per-phase targets -- no cliffs):
+        drop_q = (min(self._total_drop_z() / params.struct_drop_target, 1.0)
+                  if params.struct_drop_target > 0 else 0.0)
+        height_q = (min(self._chain_max_gain() / params.struct_height_target, 1.0)
+                    if params.struct_height_target > 0 else 0.0)
+        length_q = (min(self.track_length / params.struct_length_target, 1.0)
+                    if params.struct_length_target > 0 else 0.0)
+        return min(params.struct_w_chain * chain_q
+                   + params.struct_w_drop * drop_q
+                   + params.struct_w_height * height_q
+                   + params.struct_w_length * length_q, 1.0)
 
     def _structural_bonus(self, params):
         """Completion-conditioned bonus for building the lift-hill / drop structure each
@@ -1385,10 +1436,13 @@ class OpenRCT2Env(gym.Env):
                     "intensity" in stats and
                     "nausea" in stats
                 )
+                # POSITIVE ratings only: RCT2 reports -1 (plugin: -0.01) while the ride is
+                # still unrated -- '!= 0' accepted that sentinel on the very first poll and
+                # returned junk stats for rides whose test train had not run yet.
                 has_nonzero = (
-                    stats.get("excitement", 0) != 0 or
-                    stats.get("intensity", 0) != 0 or
-                    stats.get("nausea", 0) != 0
+                    stats.get("excitement", 0) > 0 or
+                    stats.get("intensity", 0) > 0 or
+                    stats.get("nausea", 0) > 0
                 )
 
                 if has_ratings and has_nonzero:
@@ -1498,9 +1552,10 @@ class OpenRCT2Env(gym.Env):
     # multiplier that bounds no-progress churn (failures, place/remove).
     WARM_TRACK_SLACK = 4
     WARM_STEP_FACTOR = 4
-    # Harvest policy: long meander completions are legal but junk scaffolds -- they swamp
-    # the pool over a long run and slow every prefix replay. Seeded loops are 12-18 pieces.
-    HARVEST_MAX_LEN = 24
+    # Harvest policy: meander completions beyond this are junk scaffolds. Raised 24 -> 40
+    # for the P3/P4 scale-up (their completions are prime big-loop material; the library's
+    # per-class caps keep growth bounded and the 'big' class keeps minis from crowding them).
+    HARVEST_MAX_LEN = 40
 
     # How many recent positions to retain for the observation's distance-trend signal.
     POSITION_HISTORY_MAXLEN = 8

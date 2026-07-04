@@ -67,10 +67,13 @@ This is a Gymnasium environment for training RL agents to build roller coasters 
 
 **openrct2_gym/envs/improved_phased_curriculum_wrapper.py**: 5-phase curriculum learning
 - Phase 1: Return Practice (40 pieces) - Learn navigation
-- Phase 2: Lift Hill Building (40 pieces) - Learn chain lifts and energy
-- Phase 3: Drop & Turn (60 pieces) - Learn drops and turnarounds
-- Phase 4: Circuit Mastery (80 pieces) - Full integration
-- Phase 5: Quality Optimization (80-120 pieces) - Optimize ride ratings
+- Phase 2: Lift Hill Building (40 pieces) - Learn chain lifts and energy (staged 2.1/2.2/2.3)
+- Phase 3: Real Drops & Scale (60 pieces) - chain height >=4z, drops >=4z, length >=25,
+  energy-viable at completion (graded structure credit, not piece counting)
+- Phase 4: Big & Verified (80 pieces) - height >=6z, drops >=8z incl. a 60-degree segment,
+  length >=40; ride testing ON, R_viable=150 paid only when the test returns real stats
+- Phase 5: Quality Optimization (80-120 pieces) - ramp+band quality bonus (every increment
+  toward E8/I5.5 pays), no step cost, P5 exploration floor while median excitement < 4
 
 **openrct2_gym/envs/api_track_builder.py**: Manages track construction logic
 - Translates discrete actions to API calls

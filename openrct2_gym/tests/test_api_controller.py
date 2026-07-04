@@ -95,3 +95,16 @@ def test_garbage_response_drops_socket():
     resp = ctrl.send_request({"endpoint": "getRideStats"})
     assert resp["success"] is False
     assert ctrl.sock is None
+
+
+def test_set_game_speed_request_shape():
+    import json as _json
+    ok = _json.dumps({"success": True, "payload": {"speed": 8}}) + "\n"
+    ctrl = _controller([[ok]])
+    sent = []
+    orig_sock = ctrl.sock
+    orig_sendall = orig_sock.sendall
+    orig_sock.sendall = lambda data: sent.append(_json.loads(data.decode()))
+    resp = ctrl.set_game_speed(8)
+    assert resp["success"] is True
+    assert sent[0] == {"endpoint": "setGameSpeed", "params": {"speed": 8}}

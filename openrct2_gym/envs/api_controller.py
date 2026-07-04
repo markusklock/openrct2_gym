@@ -223,6 +223,15 @@ class APIController:
         }
         return self.send_request(req)
     
+    def set_game_speed(self, speed):
+        """Best-effort game-speed request (needs the plugin's setGameSpeed endpoint).
+
+        Ride ratings take ~35s of SIM time (measured live) -- at speed 8 the ride-test
+        wait shrinks to ~4-5s, which is what makes P4/P5 testing viable at scale. An
+        'Unknown endpoint' failure is benign (older plugin); callers must tolerate it.
+        """
+        return self.send_request({"endpoint": "setGameSpeed", "params": {"speed": int(speed)}})
+
     def get_valid_next_pieces(self):
         if self.ride_id is None:
             return {"success": False, "error": "No ride created"}

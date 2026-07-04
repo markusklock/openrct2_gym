@@ -17,6 +17,7 @@ from openrct2_gym.envs.api_controller import APIController
 from openrct2_gym.envs.api_track_builder import APITrackBuilder
 from openrct2_gym.envs.warm_start import (
     LoopLibrary, LoopRecord, generate_candidates, generate_hill_candidates,
+    generate_big_candidates,
 )
 
 STATION_START = (61, 66, 14)   # must match OpenRCT2Env.reset()
@@ -72,6 +73,8 @@ def main():
     parser.add_argument("--library", type=str, default="logs/loop_library.jsonl")
     parser.add_argument("--hill", action="store_true",
                         help="Seed chain-hill loop variants for the Phase-2 pool")
+    parser.add_argument("--big", action="store_true",
+                        help="Seed big tall/steep loop variants for the Phase-3/4 pool")
     parser.add_argument("--tail-max", type=int, default=16,
                         help="Max closure-walk straights after a candidate skeleton")
     args = parser.parse_args()
@@ -83,7 +86,12 @@ def main():
     library = LoopLibrary(args.library)
     print(f"📚 Library {args.library}: {len(library)} loops before seeding")
 
-    candidates = generate_hill_candidates() if args.hill else generate_candidates()
+    if args.big:
+        candidates = generate_big_candidates()
+    elif args.hill:
+        candidates = generate_hill_candidates()
+    else:
+        candidates = generate_candidates()
     verified = added = 0
     for skeleton in candidates:
         placed, closed, gain = replay(api, skeleton, tail_max=args.tail_max)
@@ -99,9 +107,11 @@ def main():
         if library.add(record):
             added += 1
             print(f"  ✓ verified len={record.length} chains={record.chain_count} "
-                  f"gain={record.max_gain:.0f}: {list(record.actions)}")
-        else:
+                  f"gain={record.max_gain:.0f} drop={record.drop_z:.0f}: {list(record.actions)}")
+        elif record.actions in library._records:
             print(f"  = already in library (len {record.length})")
+        else:
+            print(f"  ⚠ refused (class cap?) len={record.length}")
 
     api.disconnect()
     print(f"\n📚 Done: {verified} verified this run, {added} new, "

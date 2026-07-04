@@ -17,22 +17,38 @@ Initially I tried using UI automation with pyautogui to click buttons in the gam
 The project has evolved significantly from its UI automation origins. It now features:
 
 - **API-based control**: Direct communication with OpenRCT2 via HTTP API with retry logic
-- **Potential-based reward (PBRS)**: a single, unified, policy-invariant reward that gives a dense gradient toward closing the circuit — and is provably un-farmable (no place/remove exploit)
-- **Auto-calibrated closing target**: the geometry required to close the circuit is learned from the first completion, so the reward always points at the true closable state
-- **5-phase curriculum learning**: Progressive skill acquisition from navigation to ride quality optimization
+  and protocol hardening (a timed-out placement sacrifices the episode rather than risking a
+  silently desynced track; a hung game instance fails loudly instead of stalling the fleet)
+- **Warm-start reverse curriculum**: completion is a *discovery* problem (a minimal loop is 12
+  exact pieces — eight earlier runs never got past ~0.02% completion before entropy collapsed).
+  The env replays a prefix of a live-verified loop at reset and the agent builds only the last
+  k pieces; k anneals upward on success until episodes are cold (unscaffolded). Phase gates
+  count cold episodes only, and every completion is harvested back into the loop library.
+  This took the curriculum from "stuck in Phase 1 forever" to "all five phases in <1M steps".
+- **Potential-based reward (PBRS)**: a single, unified reward that gives a dense gradient
+  toward closing the circuit — and is provably un-farmable (no place/remove exploit)
+- **Auto-calibrated closing target**: the closing heading is deterministic from the station
+  build (active from step 1); the exact closing geometry is refined from real completions
+- **5-phase curriculum learning**: navigation → lift hills → real drops & scale → big,
+  train-verified coasters → ride-quality optimization
 - **Parallel training**: Multiple OpenRCT2 instances on different ports using SubprocVecEnv
 - **Action masking**: Prevents invalid track placements
-- **Ride quality optimization**: Phase 5 targets Excitement 7-9, Intensity 4.5-6.5, Nausea <4.5
-- **3D-aware observation + build memory**: an egocentric, forward-aligned 2.5D map (occupancy / signed height / goal+station marker / chain-lift trail) gives spatial awareness, and a structured build-history buffer (last 128 pieces: learned piece-type embedding + per-piece relative geometry) gives the agent memory of what it has built. Both are encoded by a custom feature extractor (`openrct2_gym/envs/feature_extractor.py`) with a GRU over the history and a CNN over the map, plus `VecNormalize` over the continuous scalars.
+- **Ride quality optimization**: Phase 5 targets Excitement 7-9, Intensity 4.5-6.5, Nausea <4.5,
+  with a ramp+band bonus so every excitement increment pays (a pure target band gave no
+  gradient from low excitement — two runs plateaued identically until this was reshaped)
+- **3D-aware observation + build memory**: an egocentric, forward-aligned 2.5D map (occupancy / signed height / goal+station marker / chain-lift trail) gives spatial awareness, and a structured build-history buffer (last 128 pieces: learned piece-type embedding + per-piece relative geometry) gives the agent memory of what it has built. Both are encoded by a custom feature extractor (`openrct2_gym/envs/feature_extractor.py`) with a GRU over the history and a CNN over the map, plus `VecNormalize` over the continuous scalars. The scalar block also exposes the closing-corridor coordinates the reward pays on (along/perp/heading/route progress).
 
 > **Note:** The observation space was redesigned (see `openrct2_gym/envs/obs_config.py`). This changes the model input shape, so **models trained before this change cannot be loaded** — retrain from scratch. Each checkpoint now has a matching `*_vecnormalize.pkl` stats file that must accompany the model when resuming or running it.
 
 The improved curriculum teaches the agent to:
 1. **Phase 1**: Navigate back to the station (basic circuit completion)
-2. **Phase 2**: Build proper lift hills with chain lifts (energy accumulation)
-3. **Phase 3**: Create drops and turnarounds (use stored energy)
-4. **Phase 4**: Integrate all skills for consistent circuit completion
-5. **Phase 5**: Optimize ride ratings for quality roller coasters
+2. **Phase 2**: Build proper lift hills with chain lifts (staged one-chain → three-chain bridge)
+3. **Phase 3**: Scale up — taller chained climbs, real multi-z drops, longer loops that stay
+   energy-viable
+4. **Phase 4**: Go big and prove it — steep (60°) drop segments, 40+ piece coasters, and the
+   ride test verifying the train actually makes it all the way around
+5. **Phase 5**: Optimize ride ratings (excitement/intensity/nausea) on an already-big,
+   already-verified coaster
 
 ## Installation
 
@@ -71,6 +87,26 @@ python train.py --ports 8080,8081,8082,8083 --timesteps 1000000
 
 `train.py` always uses the improved 5-phase curriculum with the potential-based reward (see [Reward System](#reward-system-potential-based-shaping)). When two or more available ports are provided, training automatically uses `SubprocVecEnv`; with one available port it uses `DummyVecEnv`.
 
+### Seed the warm-start loop library (once per map)
+
+```bash
+python build_loop_library.py --port 8080          # flat loops (Phase 1)
+python build_loop_library.py --port 8080 --hill   # chain-hill loops (Phase 2)
+python build_loop_library.py --port 8080 --big    # tall/steep big loops (Phases 3-4)
+```
+
+Each candidate is replayed against the live game and only enters `logs/loop_library.jsonl`
+after a clean second replay also closes the circuit. Training harvests every completion back
+into the library (dedup'd, per-class capped), so agent discoveries become future scaffolds.
+Warm-start flags: `--no-warm-start`, `--loop-library PATH`, `--p-cold F`.
+
+> **Game speed matters for Phases 4-5**: ride ratings take ~35s of *simulation* time
+> (measured live), and Phase 4+ blocks on the ride test at each completion. `train.py`
+> requests game speed 8 at startup (`--game-speed`, needs the plugin's `setGameSpeed`
+> endpoint — redeploy the plugin after updating it), which shrinks the wait to ~4-5s.
+> Rides that never rate within `ride_test_max_wait` honestly count as unverified
+> (RCT2's −0.01 "unrated" sentinel is rejected, never scored).
+
 ### Monitor Training Progress
 
 ```bash
@@ -99,17 +135,27 @@ reward = F + sparse terms,    where   F = γ·Φ(s′) − Φ(s)
 
 **Why potential-based?** PBRS is *provably policy-invariant*: shaping changes how fast the agent learns, never the optimal policy. Two consequences:
 - Place-then-remove **telescopes to ≈(γ−1)·Φ < 0**, so it can never be farmed — the place/remove exploit is impossible by construction (no symmetric-removal bookkeeping needed).
-- The Φ weights are **fixed across all phases**, preserving global invariance — only the sparse objectives below vary by phase.
+- The **core** Φ geometry weights are fixed across all phases; a few auxiliary Φ terms
+  (climb discovery, descent shaping, closure funnel, route-around-the-station progress) are
+  deliberately phase-gated — invariance holds within a phase.
 
 ### Sparse objectives (the real goals)
 
-- **Circuit completion: +1000** — the dominant signal. Completion always strictly outweighs all accumulated shaping, so the agent is *completion-first*.
-- **Ride quality (phase 5 only): 0–500** — a smooth, bounded, **non-negative** bonus peaking at Excitement ≈ 8, Intensity ≈ 5.5, low Nausea. Applied only on a completed, ride-tested circuit, so a finished ride is never punished.
-- **Small penalties** — a tiny failed-placement penalty, plus an optional small per-step cost in phase 5 to discourage stalling.
+- **Circuit completion: +1000** — the dominant signal. Completion always strictly outweighs all accumulated shaping, so the agent is *completion-first*. In the hill phases a flat loop earns only a fraction (the hill gate), so structure is required for full pay.
+- **Structural bonus (phases 2-4): 0–250, completion-conditioned** — graded credit for chain
+  count/height, total drop-z, and completed length toward per-phase targets. All components
+  are ramps (partial progress pays); chain credit is elevation-scaled so chain-stub
+  decoration on a flat loop cannot pay as a lift hill.
+- **Verified viability (phase 4+): +150, completion-conditioned** — paid only when the ride
+  test returns real stats, i.e. the train demonstrably made it all the way around.
+- **Ride quality (phase 5): 0–500** — ramp+band per stat: half the credit ramps monotonically
+  toward the target (every increment pays), half peaks at it (Excitement ≈ 8, Intensity ≈ 5.5,
+  low Nausea). Applied only on a completed, ride-tested circuit, so a finished ride is never punished.
+- **Small penalties** — a tiny failed-placement penalty (kept even when auto-backtrack fires).
 
 ### Closing target: deterministic heading + calibrated refinement
 
-`goal_position` is the station's **dock endpoint** (verified by `verify_goal_position.py`: the API closes the circuit at `station_start`, so the guide points exactly at the closable tile — it was previously a tile off); the game itself decides completion via its `isCircuitComplete` flag. The **closing heading is deterministic from the station build** — the station is created with `startDir=0`, so every circuit re-enters BeginStation heading North — and Φ is handed this heading (`_STATION_ENTRY_DIR`) from step 1, the heading reward **coupled to the dock** (gated by the near-closure factor) so the agent routes freely and only aligns as it docks. This is what lets the agent learn the final connection during the **Phase-1 cold start**: previously the heading term stayed disabled until the *first* completion calibrated it, a chicken-and-egg (no heading → no completion → no heading) that stalled bootstrapping. The full closing geometry (the exact pre-close head position/direction) is still refined from real completions and cached to `logs/close_geometry.json`, but the anchor is **locked only after ≥3 completions agree** (median position, modal direction) so a single fluky closure can't poison Φ for the rest of the run.
+`goal_position` is the **staging tile one step on the approach side of the dock** (the head can never sit on the dock tile itself — it is occupied by BeginStation; the closing piece is placed *from* the staging tile onto the dock); the game itself decides completion via its `isCircuitComplete` flag. The **closing heading is deterministic from the station build** — the station is created with `startDir=0`, so every circuit re-enters BeginStation heading the entry direction — and Φ is handed this heading (`_STATION_ENTRY_DIR`) from step 1, the heading reward **coupled to the dock** (gated by the near-closure factor) so the agent routes freely and only aligns as it docks. The full closing geometry (the exact pre-close head position/direction) is still refined from real completions and cached to `logs/close_geometry.json`, but the anchor is **locked only after ≥3 completions agree** (median position, modal direction) so a single fluky closure can't poison Φ for the rest of the run.
 
 ### Energy model (feeds Φ's viability term)
 
@@ -124,30 +170,34 @@ The **energy margin** estimates whether the current track can still return to th
 
 All five phases share the **same reward and the same Φ**; they differ only in the track-length limit, whether ride-testing/quality is active, and the advancement criterion:
 
-| Phase | Name | Max Pieces | What it adds | Advancement |
-|-------|------|------------|--------------|-------------|
+| Phase | Name | Max Pieces | What it adds | Advancement (cold episodes only) |
+|-------|------|------------|--------------|--------------|
 | 1 | Return Practice | 40 | completion only | 50% completion |
 | 2 | Lift Hill Building | 40 | staged chain-lift bridge | 2.1 one-chain roundtrip, 2.2 one-chain completion, 2.3 three-chain completion |
-| 3 | Drop & Turn | 60 | completion with lift/drop structure | 35% with chain lifts and a drop |
-| 4 | Circuit Mastery | 80 | completion only | 30% completion |
-| 5 | Quality Optimization | 80–120 | ride testing + quality bonus (+ tiny step cost) | progressive length |
+| 3 | Real Drops & Scale | 60 | chain height ≥4z, drops ≥4z, length ≥25, energy-viable | 35% qualified |
+| 4 | Big & Verified | 80 | height ≥6z, drops ≥8z incl. a 60° segment, length ≥40, **ride-test verified** | 30% qualified |
+| 5 | Quality Optimization | 80–120 | quality bonus only (no step cost) | progressive length |
+
+Phases 1–4 are scaffolded by the warm-start reverse curriculum (each phase's pool prefers
+loops that can satisfy its own gate); Phase 5 always builds cold. Gate advancement counts
+**cold (unscaffolded) episodes only**, so a scaffolded win can never advance a phase.
 
 Circuit completion is whatever the game engine accepts via `isCircuitComplete` — there are no artificial restrictions on which piece may close the loop. Height, flatness, and heading near the station are handled smoothly by Φ's alignment terms rather than by hard rules.
 
 ## Observation Space
 
-The agent receives comprehensive information about the current state:
+A `Dict` space (see `openrct2_gym/envs/obs_config.py`), all egocentric / rotation-invariant:
 
-- **track_pieces**: Array of placed track piece IDs (up to 250)
-- **current_position**: 3D coordinates (x, y, z)
-- **current_direction**: Facing direction (0=North, 1=East, 2=South, 3=West)
-- **distance_to_start**: Euclidean distance to station
-- **track_length**: Number of pieces placed
-- **last_piece_type**: ID of last placed piece
-- **goal_direction**: Normalized 2D vector pointing to station
-- **angle_to_goal**: Radians to turn to face station
-- **distance_trend**: Change in distance (positive = getting closer)
-- **last_ride_excitement/intensity/nausea**: Ratings from previous completed ride (for learning)
+- **local_map**: 4×24×24 forward-aligned 2.5D crop — occupancy, signed height, goal+station
+  marker, chain-lift trail
+- **build_history_tokens/feats/mask**: the last 128 placed pieces (piece-type tokens plus
+  per-piece relative geometry), encoded by a GRU
+- **goal_disp / goal_direction3**: displacement and unit direction to the closing target in
+  the agent's frame
+- **scalars (12)**: distance, angle-to-goal, distance trend, track budget used, last ride's
+  excitement/intensity/nausea, energy margin, and the closing-corridor coordinates the reward
+  pays on (signed along-axis distance, off-axis distance, heading match, route progress)
+- **current_direction / last_piece_type**: categorical state
 
 ## Action Space
 
@@ -179,11 +229,22 @@ The training scripts provide extensive metrics in Tensorboard:
 
 ## Recent Improvements
 
-- **Potential-based reward (PBRS)**: a single unified, policy-invariant reward replacing the old per-step shaping — provably un-farmable
-- **Auto-calibrated closing target**: the closing geometry is learned from the first completed circuit, so the reward targets the true closable state
-- **Completion-first objective**: a large completion bonus dominates; ride quality is a smooth, bounded bonus in phase 5
-- **5-phase curriculum**: phases now only set parameters — the reward and potential stay identical throughout
-- **Parallel training**: `train.py` uses `SubprocVecEnv` automatically for multi-port training and `DummyVecEnv` for single-port training
+- **Warm-start reverse curriculum**: solved the Phase-1/2 discovery problem that killed eight
+  consecutive runs — the full curriculum now falls in <1M steps, reproducibly, from scratch
+- **Descent placement fix**: the plugin takes a piece's *base* z but validates its *train
+  entry* — every descending piece had silently failed to place in every earlier run. Drops
+  (including 60° segments) are now actually part of the action space
+- **P3/P4 scale phases + verified viability**: graded height/drop/length targets replace
+  piece-count gates that the Phase-2 mini-loop already satisfied; Phase 4 turns the ride test
+  on and pays only when the train demonstrably completes the circuit
+- **Quality ramp**: the Phase-5 excitement/intensity bonus pays partial progress instead of
+  being a dead band (two runs plateaued at the identical nausea-only score before this)
+- **Progress-conditional exploration**: entropy floors hold exploration up exactly while a
+  discovery problem is unsolved (Phase-1 completions, Phase-5 quality) and hand back to the
+  proven exploit config once telemetry says the skill is learned
+- **Protocol hardening**: timed-out placements sacrifice the episode (they may have been
+  applied server-side), poisoned sockets are dropped, hung instances fail loudly, and the
+  final model is saved even when a worker died
 
 ## Future Improvements
 

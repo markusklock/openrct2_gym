@@ -579,15 +579,17 @@ def test_library_caps_flat_and_hill_classes_separately(tmp_path):
     every slot and silently refuse Phase-2's first hill discoveries -- exactly the records
     the phase-2 pool exists for. Flat and hill loops are capped independently."""
     lib = LoopLibrary(str(tmp_path / "cap.jsonl"))
-    for i in range(LoopLibrary.MAX_RECORDS_PER_CLASS):                  # fill the FLAT class
-        # tail action from 0..6 only: 9/10 would make the record a HILL and leak classes
-        assert lib.add(LoopRecord.from_actions([4, 4] + [0] * (i % 36) + [i % 7], "harvest"))
+    # fixed-length unique tails (digits 0-4: no chain actions, stays below BIG_LEN)
+    def digits(i):
+        return [i // 125 % 5, i // 25 % 5, i // 5 % 5, i % 5]
+    for i in range(LoopLibrary.MAX_RECORDS_PER_CLASS):                  # fill the small-FLAT class
+        assert lib.add(LoopRecord.from_actions([4, 4] + digits(i), "harvest"))
     assert lib.add(LoopRecord.from_actions([3, 3, 0, 1, 2], "harvest")) is False   # flat full
     hill = LoopRecord.from_actions([4, 4, 10, 9, 13, 12, 6, 14, 0], "harvest")
     assert lib.add(hill) is True                                        # hill class still open
     assert len(lib) == LoopLibrary.MAX_RECORDS_PER_CLASS + 1
-    for i in range(LoopLibrary.MAX_RECORDS_PER_CLASS - 1):              # now fill the HILL class
-        assert lib.add(LoopRecord.from_actions([4, 4, 10, 9, 13, 12, 6, 14] + [0] * (i % 36) + [i % 7 + 1],
+    for i in range(LoopLibrary.MAX_RECORDS_PER_CLASS - 1):              # now fill the small-HILL class
+        assert lib.add(LoopRecord.from_actions([4, 4, 10, 9, 13, 12, 6, 14] + digits(i),
                                                "harvest")) is True
     assert lib.add(LoopRecord.from_actions([3, 3, 10, 9, 13, 12, 6, 14, 1], "harvest")) is False
 
@@ -689,12 +691,31 @@ def test_wrapper_evaluation_mode_forces_cold(monkeypatch, tmp_path):
     assert wrapper._current_plan.cold is False                      # training resumes scaffolded
 
 
-def test_wrapper_warm_starts_only_in_phases_1_and_2(monkeypatch, tmp_path):
+def test_wrapper_warm_starts_through_phase4_cold_in_phase5(monkeypatch, tmp_path):
+    """Scale-up redesign: the scaffold now covers every discovery cliff (phases 1-4);
+    phase 5 (quality) builds cold. P3/P4 request their gate-matching pool criteria."""
     wrapper, base = _wrapped(monkeypatch, tmp_path, p_cold=0.0)
+    seen = []
+    orig = wrapper._annealer.sample_plan
+
+    def spy(library, phase, max_len, **kw):
+        seen.append((phase, kw))
+        return orig(library, phase, max_len, **kw)
+
+    wrapper._annealer.sample_plan = spy
     wrapper.current_phase = 3
     wrapper._update_phase_settings()
     wrapper.reset()
-    assert wrapper._current_plan.cold is True                       # P3+ builds cold
+    assert wrapper._current_plan.cold is False                      # P3 scaffolds now
+    assert seen[-1] == (3, {'min_chains': 2, 'min_len': 20, 'min_drop_z': 4})
+    wrapper.current_phase = 4
+    wrapper._update_phase_settings()
+    wrapper.reset()
+    assert seen[-1] == (4, {'min_chains': 3, 'min_len': 25, 'min_drop_z': 8})
+    wrapper.current_phase = 5
+    wrapper._update_phase_settings()
+    wrapper.reset()
+    assert wrapper._current_plan.cold is True                       # quality phase builds cold
 
 
 def test_phase_gate_counts_only_cold_episodes(monkeypatch, tmp_path):
@@ -782,3 +803,83 @@ def test_get_phase_stats_includes_warm_start_state(monkeypatch, tmp_path):
     assert 'warm_k_max' in stats and 'loop_library_size' in stats
     assert stats['warm_k_max'] == wrapper._annealer.k_max
     assert stats['loop_library_size'] == 1
+
+
+# ------------------------------------------------ big-loop scaffolds (P3/P4 redesign)
+
+from openrct2_gym.envs.warm_start import (
+    ACTION_DROP_Z, ACTION_CLIMB_Z, generate_big_candidates,
+)
+
+
+def test_loop_record_computes_drop_z():
+    """drop_z is static per-action geometry (verified live via the offset probes), so the
+    pool can prefer real-drop loops without replaying them."""
+    assert LoopRecord.from_actions(FLAT, "scripted").drop_z == 0
+    assert LoopRecord.from_actions(HILL, "scripted").drop_z == 4          # 12+6+14 -> 1+2+1
+    steep = [4, 4, 10, 9, 9, 9, 9, 13, 12, 27, 28, 14, 4, 4, 0]
+    assert LoopRecord.from_actions(steep, "scripted").drop_z == 10        # 1+4+4+1
+
+
+def test_library_caps_big_loops_as_their_own_class(tmp_path):
+    """Four cap classes (chain x big): P1/P2 mini-loop floods must not evict or lock out
+    the big P3/P4 scaffold material."""
+    lib = LoopLibrary(str(tmp_path / "cap4.jsonl"))
+    def digits(i):
+        return [i // 125 % 5, i // 25 % 5, i // 5 % 5, i % 5]
+    for i in range(LoopLibrary.MAX_RECORDS_PER_CLASS):                    # fill small-flat
+        assert lib.add(LoopRecord.from_actions([4, 4] + digits(i), "harvest"))
+    assert lib.add(LoopRecord.from_actions([3, 3, 0, 1, 2], "harvest")) is False   # small-flat full
+    big_flat = LoopRecord.from_actions([4, 4] + [0] * 28 + [1], "harvest")         # len 31
+    assert big_flat.length >= LoopLibrary.BIG_LEN
+    assert lib.add(big_flat) is True                                      # big-flat class open
+    small_hill = LoopRecord.from_actions(HILL, "harvest")
+    assert lib.add(small_hill) is True                                    # small-hill class open
+
+
+def test_pool_tiers_degrade_gracefully(tmp_path):
+    """P3/P4 prefer big real-drop hill loops but must never silently turn the scaffold off:
+    tiers degrade all-criteria -> chains -> any-hill -> flats."""
+    big_steep = [0, 0, 0, 4, 4, 10, 9, 9, 9, 9, 13, 12, 27, 28, 14, 4, 4] + [0] * 8   # len 25, drop 10
+    lib = _lib(tmp_path, [FLAT, HILL, big_steep])
+    tier1 = lib.pool(phase=3, max_len=60, min_chains=2, min_len=20, min_drop_z=8)
+    assert [r.actions for r in tier1] == [tuple(big_steep)]
+    no_big = _lib(tmp_path.joinpath("nb"), [FLAT, HILL])
+    tier2 = no_big.pool(phase=3, max_len=60, min_chains=2, min_len=20, min_drop_z=8)
+    assert [r.actions for r in tier2] == [tuple(HILL)]                    # chains-only fallback
+    flats = _lib(tmp_path.joinpath("f"), [FLAT])
+    tier4 = flats.pool(phase=3, max_len=60, min_chains=2, min_len=20, min_drop_z=8)
+    assert [r.actions for r in tier4] == [tuple(FLAT)]                    # never empty
+
+
+def test_generate_big_candidates_are_height_balanced_racetracks():
+    cands = generate_big_candidates()
+    assert cands
+    saw_steep = saw_tall25 = False
+    for c in cands:
+        turns = [a for a in c if a in (3, 4)]
+        assert len(turns) == 4 and len(set(turns)) == 1                   # racetrack skeleton
+        climb = sum(ACTION_CLIMB_Z.get(a, 0) for a in c)
+        drop = sum(ACTION_DROP_Z.get(a, 0) for a in c)
+        assert climb == drop and climb >= 8                               # tall AND net z 0
+        rec = LoopRecord.from_actions(c, "scripted")
+        assert rec.chain_count >= 4                                       # 10 + 9{3,4}
+        saw_steep = saw_steep or any(a in (27, 28) for a in c)
+        saw_tall25 = saw_tall25 or (drop >= 8 and not any(a in (8, 27, 28) for a in c))
+    assert saw_steep and saw_tall25                                       # both families present
+    assert max(len(c) for c in cands) >= 21                               # long skeletons exist
+
+
+def test_scripted_seeds_bypass_harvest_caps(tmp_path):
+    """The per-class caps bound the HARVEST flood; curated scripted seeds are finite by
+    construction and are the pool's backbone -- a cap-saturated library must never refuse
+    them (observed live: all 36 verified big loops were refused by a full small-hill class)."""
+    lib = LoopLibrary(str(tmp_path / "seed.jsonl"))
+    def digits(i):
+        return [i // 125 % 5, i // 25 % 5, i // 5 % 5, i % 5]
+    for i in range(LoopLibrary.MAX_RECORDS_PER_CLASS):          # saturate small-hill via harvests
+        assert lib.add(LoopRecord.from_actions([4, 4, 10, 9, 13, 12, 6, 14] + digits(i), "harvest"))
+    assert lib.add(LoopRecord.from_actions([3, 3, 10, 9, 13, 12, 6, 14, 1], "harvest")) is False
+    seed = LoopRecord.from_actions([4, 4, 10, 9, 9, 9, 9, 13, 12, 27, 28, 14, 4, 4, 0], "scripted")
+    assert lib.add(seed) is True                                # curated seed admitted
+    assert lib.add(LoopRecord.from_actions([3, 3, 10, 9, 13, 12, 6, 14, 2], "harvest")) is False

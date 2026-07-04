@@ -174,8 +174,9 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
 
         Curriculum logic: master completion FIRST (phase 1, no climb distraction), THEN bridge
         into hills gradually (P2.1/P2.2/P2.3), THEN add drops and integration."""
-        if phase >= 5:  # quality only; discovery off
-            return RewardParams(R_quality_max=500.0, step_cost=-0.01, w_h=0.0)
+        if phase >= 5:  # quality only; discovery off. step_cost 0: the -0.01 punished length
+            # in the one phase that wants it (quality scales with size).
+            return RewardParams(R_quality_max=500.0, step_cost=0.0, w_h=0.0)
         if phase == 2:
             if phase2_stage == 1:  # 2.1 climb-and-return: find the chain hill, no completion gate
                 # Closure-first: a RESTORED completion floor (0.2) keeps closing a loop always
@@ -243,29 +244,45 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                 w_close=8.0,
                 w_route=3.0,
             )
-        if phase == 3:  # gate: >=2 chains AND drop
+        if phase == 3:  # "Real Drops & Scale": graded height/drop/length toward targets the
+            # 2.3 mini-loop does NOT meet (h>=4, drop>=4, len>=25) -- the old piece-count gate
+            # was already satisfied on entry and taught nothing (cleared in ~30k steps twice).
             return RewardParams(
                 R_struct_max=250.0,
                 struct_chain_target=2,
-                struct_w_chain=0.5,
-                struct_w_drop=0.5,
+                struct_w_chain=0.0,        # height carries the chain credit now
+                struct_w_height=0.4,
+                struct_height_target=4.0,
+                struct_w_drop=0.4,
+                struct_drop_target=4.0,
+                struct_w_length=0.2,
+                struct_length_target=25.0,
                 completion_hill_floor=0.0,
                 R_roundtrip=100.0,
                 w_return=3.0,
                 w_close=8.0,
                 w_route=3.0,
+                h_scale=8.0,               # taller climbs keep paying the discovery term
             )
-        if phase == 4:  # integration: hill + drop
+        if phase == 4:  # "Big & Verified": steeper/taller/longer, and the ride test is ON --
+            # R_viable pays only when the train demonstrably made it around (nonzero stats).
             return RewardParams(
                 R_struct_max=250.0,
                 struct_chain_target=3,
-                struct_w_chain=0.5,
-                struct_w_drop=0.5,
+                struct_w_chain=0.0,
+                struct_w_height=0.4,
+                struct_height_target=6.0,
+                struct_w_drop=0.4,
+                struct_drop_target=8.0,
+                struct_w_length=0.2,
+                struct_length_target=40.0,
                 completion_hill_floor=0.0,
                 R_roundtrip=100.0,
+                R_viable=150.0,
                 w_return=3.0,
                 w_close=8.0,
                 w_route=3.0,
+                h_scale=8.0,
             )
         # phase 1: struct+discovery off; closure densified; route term guides the detour
         return RewardParams(w_h=0.0, w_close=8.0, w_route=3.0)
@@ -281,6 +298,20 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
         """Whether the track history contains a drop/descent piece."""
         history = getattr(base_env.track_builder, 'history', [])
         return any(h.get('action') in (6, 8, 12, 14) for h in history)
+
+    @staticmethod
+    def _history_drop_z(base_env):
+        """Total z dropped over descent pieces (mirrors env._total_drop_z)."""
+        history = getattr(base_env.track_builder, 'history', [])
+        return float(sum(max(0.0, h['position'][2] - h['next_position'][2])
+                         for h in history
+                         if h.get('position') is not None and h.get('next_position') is not None))
+
+    @staticmethod
+    def _history_has_steep_drop(base_env):
+        """Whether the history contains a 60-degree descent piece (actions 8/27/28)."""
+        history = getattr(base_env.track_builder, 'history', [])
+        return any(h.get('action') in (8, 27, 28) for h in history)
 
     @staticmethod
     def _history_chain_max_gain(base_env):
@@ -352,8 +383,24 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                 return signals['phase2_complete_chain1']
             return signals['phase2_complete_chain3']
         if self.current_phase == 3:
-            return bool(success and self._history_chain_count(base_env) >= 2
-                        and self._history_has_drop(base_env))
+            # "Real Drops & Scale": the thresholds are the phase's own structure targets
+            # (single source of truth), plus the cheap energy-viability proxy.
+            P = self._phase_reward_params(3)
+            return bool(success
+                        and self._history_chain_max_gain(base_env) >= P.struct_height_target
+                        and self._history_drop_z(base_env) >= P.struct_drop_target
+                        and getattr(base_env, 'track_length', 0) >= P.struct_length_target
+                        and base_env._calculate_energy_margin() >= 0.0)
+        if self.current_phase == 4:
+            # "Big & Verified": steeper/taller/longer AND the ride test actually returned
+            # stats -- the train demonstrably made it around.
+            P = self._phase_reward_params(4)
+            return bool(success
+                        and self._history_chain_max_gain(base_env) >= P.struct_height_target
+                        and self._history_drop_z(base_env) >= P.struct_drop_target
+                        and self._history_has_steep_drop(base_env)
+                        and getattr(base_env, 'track_length', 0) >= P.struct_length_target
+                        and getattr(base_env, '_last_test_ok', False))
         return None
 
     def _update_phase_settings(self):
@@ -368,7 +415,7 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
             1: (self.phase1_max_length, True),
             2: (self.phase2_max_length, True),
             3: (self.phase3_max_length, True),
-            4: (self.phase4_max_length, True),
+            4: (self.phase4_max_length, False),   # ride test ON: P4 verifies the train runs
             5: (self.phase5_current_length, False),
         }
 
@@ -436,9 +483,15 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                     return True
 
         elif self.current_phase == 4:
-            if success_rate >= self.phase4_success_threshold:
-                self._advance_to_phase(5)
-                return True
+            # Qualified window, not raw completions: raw success was already ~100% on entry
+            # (the old gate advanced without any new capability being learned).
+            if len(self.episode_qualified_results) >= 50:
+                qualified_rate = sum(self.episode_qualified_results) / len(
+                    self.episode_qualified_results
+                )
+                if qualified_rate >= self.phase4_success_threshold:
+                    self._advance_to_phase(5)
+                    return True
 
         elif self.current_phase == 5:
             # Handle phase 5 sub-stage progression
@@ -568,18 +621,24 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
 
     def _sample_warm_start(self):
         """This episode's warm-start plan. Cold when disabled, during evaluation (eval must
-        measure the true task), or outside the scaffolded phases 1-2. Stage 2.3 prefers
-        loops that can actually satisfy its 3-chain gate."""
+        measure the true task), or past the scaffolded phases (1-4). Each phase prefers
+        loops that can actually satisfy its gate (with graceful pool fallback)."""
         if (not self.warm_start_enabled or not self._track_stats
-                or self.current_phase not in (1, 2)):
+                or self.current_phase > 4):
             return WarmStartPlan(prefix=[], k=0, loop_len=0, cold=True)
         self._loop_library.maybe_refresh()   # pick up other workers' harvested loops
         base_env = self._get_base_env()
-        min_chains = 3 if (self.current_phase == 2 and self.phase2_stage >= 3) else 1
+        min_chains, min_len, min_drop_z = 1, 0, 0
+        if self.current_phase == 2 and self.phase2_stage >= 3:
+            min_chains = 3
+        elif self.current_phase == 3:
+            min_chains, min_len, min_drop_z = 2, 20, 4
+        elif self.current_phase == 4:
+            min_chains, min_len, min_drop_z = 3, 25, 8
         return self._annealer.sample_plan(
             self._loop_library, self.current_phase,
             getattr(base_env, 'max_track_length', 40),
-            min_chains=min_chains)
+            min_chains=min_chains, min_len=min_len, min_drop_z=min_drop_z)
 
     def reset(self, **kwargs):
         """Reset environment and check for phase advancement"""

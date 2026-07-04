@@ -74,6 +74,10 @@ Key metrics (with warm starts active, `success/overall_loop_completion_rate` and
 - `curriculum/loop_library_size`: verified loops in the shared pool.
 - `optim/ent_floor_mode`: 1 while the Phase-1 bootstrap entropy floor is held, 0 after cold
   completions flow (≥2%) and the proven exploit config is restored.
+- `quality/excitement|intensity|nausea`, `quality/median_excitement`, `quality/test_success_rate`:
+  ride-test telemetry (phase 4+). `optim/p5_quality_boost`: 1 while the Phase-5 exploration
+  floor is held (median excitement < 4).
+- `structure/drop_z|chain_height|completed_length`: is the agent actually building bigger?
 - `rewards/route_potential`: episode-end value of the west-side route-shaping term.
 - `success/overall_loop_completion_rate`: completion rate across all environments (scaffold-mixed).
 - `curriculum/phase`: current 5-phase curriculum phase.
@@ -91,9 +95,16 @@ The maintained curriculum is `ImprovedPhasedCurriculumWrapper`:
 
 1. Phase 1, Return Practice: 40 pieces, completion-focused.
 2. Phase 2, Lift Hill Building: 40 pieces, staged bridge from one-chain roundtrip to one-chain completion to three-chain completion.
-3. Phase 3, Drop & Turn: 60 pieces, completion with lift/drop structure.
-4. Phase 4, Circuit Mastery: 80 pieces, integrated completion.
-5. Phase 5, Quality Optimization: 80-120 pieces, ride testing and quality bonus.
+3. Phase 3, Real Drops & Scale: 60 pieces; gate = completion with chain height ≥4z, total
+   drops ≥4z, length ≥25 and a non-negative energy margin.
+4. Phase 4, Big & Verified: 80 pieces; ride testing turns ON; gate = completion with height
+   ≥6z, drops ≥8z including a 60° segment, length ≥40, and nonzero test stats (the train
+   demonstrably runs the circuit; pays R_viable=150).
+5. Phase 5, Quality Optimization: 80-120 pieces, ramp+band quality bonus (partial excitement/
+   intensity progress pays), no step cost, exploration floor until median excitement ≥ 4.
+
+Warm-start scaffolding covers phases 1-4 (each phase's pool prefers loops meeting its own
+gate; seed with `build_loop_library.py` using `--hill` and `--big`); Phase 5 builds cold.
 
 The reward function stays unified across phases. The curriculum changes track-length limits, ride-testing settings, and reward parameters; it does not swap in a separate legacy reward method.
 
@@ -104,6 +115,9 @@ The reward function stays unified across phases. The curriculum changes track-le
 - If training throughput is low, run multiple OpenRCT2 instances on separate ports and pass all ports through `--ports`.
 - If resume behavior looks degraded, verify the model and its sibling `*_vecnormalize.pkl` file are both present.
 - If completion stalls after early progress, inspect `optim/ent_coef`, `train/entropy_loss`, and `curriculum/phase` to see whether the entropy-collapse guard or phase-2 KL guard is active.
+- If `quality/test_success_rate` is ~0 in Phase 4+, the game is likely running at normal speed:
+  ratings take ~35s of sim time. Deploy the plugin's `setGameSpeed` endpoint and keep the
+  default `--game-speed 8` (ratings then land in ~4-5s, within `ride_test_max_wait`).
 
 ## Running A Model
 

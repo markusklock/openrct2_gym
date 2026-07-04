@@ -20,6 +20,12 @@ from dataclasses import dataclass
 
 CHAIN_ACTIONS = (9, 10)          # matches openrct2_env / api_track_builder chain-lift actions
 
+# Static per-action z geometry (live-verified via the base-z offset probes): descents drop
+# by their span, ascents climb by theirs. Lets the pool grade loops by real drop height and
+# lets template generators balance climbs against descents without touching the game.
+ACTION_DROP_Z = {6: 2, 8: 8, 12: 1, 14: 1, 27: 4, 28: 4}
+ACTION_CLIMB_Z = {5: 2, 7: 8, 9: 2, 10: 1, 11: 1, 13: 1, 25: 4, 26: 4}
+
 
 @dataclass(frozen=True)
 class LoopRecord:
@@ -28,6 +34,7 @@ class LoopRecord:
     length: int
     chain_count: int
     max_gain: float              # peak z above the start height (0 for flat loops)
+    drop_z: float                # total z dropped over descent pieces (static per-action geometry)
     source: str                  # "scripted" | "harvest"
 
     @staticmethod
@@ -38,6 +45,7 @@ class LoopRecord:
             length=len(acts),
             chain_count=sum(1 for a in acts if a in CHAIN_ACTIONS),
             max_gain=float(max_gain),
+            drop_z=float(sum(ACTION_DROP_Z.get(a, 0) for a in acts)),
             source=str(source),
         )
 
@@ -52,10 +60,11 @@ class LoopLibrary:
     """
 
     # Growth bound: dedup alone does not cap a long run's harvest stream (every distinct
-    # closing variant is a new record). Capped PER CLASS (flat vs hill): a single global
-    # cap would be first-come-forever -- Phase-1 flat harvests would fill every slot and
-    # silently lock Phase-2's first hill discoveries out of the pool they exist for.
+    # closing variant is a new record). Capped PER CLASS (flat/hill x small/big): a single
+    # global cap would be first-come-forever -- Phase-1 mini-loop floods would fill every
+    # slot and silently lock later phases' hill/big discoveries out of the pool.
     MAX_RECORDS_PER_CLASS = 250
+    BIG_LEN = 25                 # loops this long are P3/P4 scaffold material (own cap class)
 
     def __init__(self, path="logs/loop_library.jsonl"):
         self.path = path
@@ -95,14 +104,24 @@ class LoopLibrary:
             self._calls_since_refresh = 0
             self.load()
 
+    @classmethod
+    def _class_key(cls, record):
+        return (record.chain_count >= 1, record.length >= cls.BIG_LEN)
+
     def add(self, record):
-        """Dedup + per-class growth cap, then append one JSONL line. Returns True if stored."""
+        """Dedup + per-class growth cap, then append one JSONL line. Returns True if stored.
+
+        The cap bounds the HARVEST flood only: curated scripted seeds are finite by
+        construction and are the pool's backbone -- a cap-saturated library must never
+        refuse them (nor do they consume the harvest budget)."""
         if record is None or record.length == 0 or record.actions in self._records:
             return False
-        is_hill = record.chain_count >= 1
-        n_class = sum(1 for r in self._records.values() if (r.chain_count >= 1) == is_hill)
-        if n_class >= self.MAX_RECORDS_PER_CLASS:
-            return False
+        if record.source != "scripted":
+            key = self._class_key(record)
+            n_class = sum(1 for r in self._records.values()
+                          if r.source != "scripted" and self._class_key(r) == key)
+            if n_class >= self.MAX_RECORDS_PER_CLASS:
+                return False
         self._records[record.actions] = record
         try:
             directory = os.path.dirname(self.path)
@@ -111,7 +130,7 @@ class LoopLibrary:
             line = json.dumps({
                 "actions": list(record.actions), "length": record.length,
                 "chain_count": record.chain_count, "max_gain": record.max_gain,
-                "source": record.source,
+                "drop_z": record.drop_z, "source": record.source,
             }) + "\n"
             with open(self.path, "a") as f:
                 f.write(line)
@@ -119,16 +138,21 @@ class LoopLibrary:
             pass                           # in-memory record kept; persistence is best-effort
         return True
 
-    def pool(self, phase, max_len, min_chains=1):
+    def pool(self, phase, max_len, min_chains=1, min_len=0, min_drop_z=0):
         """Loops usable this episode: must fit the track budget with margin for the suffix
-        search. Phase >= 2 prefers hill loops with at least ``min_chains`` chain pieces
-        (stage 2.3 gates on 3), degrading to any-hill and then to the flat pool so the
-        mechanism never silently turns off."""
+        search. Phase >= 2 prefers loops matching ALL the phase's structure criteria
+        (chains, length, drop height), degrading tier by tier (all-criteria -> enough
+        chains -> any hill -> everything) so the scaffold never silently turns off."""
         fits = [r for r in self._records.values() if r.length <= max_len - 2]
         if phase >= 2:
-            best = [r for r in fits if r.chain_count >= min_chains]
+            best = [r for r in fits if (r.chain_count >= min_chains
+                                        and r.length >= min_len
+                                        and r.drop_z >= min_drop_z)]
             if best:
                 return best
+            chained = [r for r in fits if r.chain_count >= min_chains]
+            if chained:
+                return chained
             hills = [r for r in fits if r.chain_count >= 1]
             if hills:
                 return hills
@@ -207,10 +231,12 @@ class WarmStartAnnealer:
     def _cold_plan():
         return WarmStartPlan(prefix=[], k=0, loop_len=0, cold=True)
 
-    def sample_plan(self, library, phase, max_track_length, min_chains=1):
+    def sample_plan(self, library, phase, max_track_length, min_chains=1, min_len=0, min_drop_z=0):
         """The episode's warm-start plan. Cold when the die says so, the pool is empty,
         or the sampled k has annealed past the loop length (natural end of the scaffold)."""
-        pool = library.pool(phase, max_track_length, min_chains=min_chains) if library is not None else []
+        pool = (library.pool(phase, max_track_length, min_chains=min_chains,
+                             min_len=min_len, min_drop_z=min_drop_z)
+                if library is not None else [])
         if not pool or self._rng.random() < self.p_cold:
             return self._cold_plan()
         rec = pool[self._rng.randrange(len(pool))]
@@ -255,6 +281,38 @@ def generate_candidates():
     for t in (4, 3):
         for p in range(0, 4):
             out.append([0] * p + [t, t] + [0] * (7 + p) + [t, t])
+    return out
+
+
+def generate_big_candidates():
+    """Big-loop skeletons for the P3/P4 scale-up scaffold, in two height-balanced families:
+
+      * tall-25:  climb [10,9,9,9,13]   (+8 z) / descend [12,6,6,6,14]  (-8 z) -- 10 east tiles
+      * steep-60: climb [10,9,9,9,9,13] (+10 z) / descend [12,27,28,14] (-10 z) -- 10 east tiles
+        (the steep family exercises the 60-degree pieces, unusable before the base-z fix)
+
+    East leg = 7 + p (live-verified racetrack geometry) so the tallest blocks need p >= 3;
+    summit straights (mid) stretch the loop toward the P3/P4 length targets; the closure
+    scan supplies the west tail. Every candidate is climb/drop balanced (net z 0) so the
+    second U-turn is back at station height.
+    """
+    out = []
+    families = (
+        ([10, 9, 9, 9, 13], [12, 6, 6, 6, 14]),
+        ([10, 9, 9, 9, 9, 13], [12, 27, 28, 14]),
+    )
+    for t in (4, 3):
+        for climb, descent in families:
+            block = len(climb) + len(descent)
+            for p in range(3, 7):
+                east = 7 + p
+                for mid in (0, 1, 2, 4):
+                    rest = east - block - mid
+                    if rest < 0:
+                        continue
+                    out.append([0] * p + [t, t]
+                               + climb + [0] * mid + descent + [0] * rest
+                               + [t, t])
     return out
 
 

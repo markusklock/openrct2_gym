@@ -873,3 +873,116 @@ def test_resumed_model_with_armed_guard_is_recognized():
     cb._on_rollout_end()
     assert cb._opt_guarded is True
     assert cb.model.ent_coef == T.OPT_GUARDED['ent_coef'] # guarded floor, not bootstrap 0.025
+
+
+# --------------------------- quality telemetry + P5 exploration floor (P3-5 redesign)
+
+def _quality_step(cb, env_idx, phase, excitement, intensity=3.0, nausea=1.0, tested=True):
+    from types import SimpleNamespace
+    logger_store = {}
+    cb.model.logger = SimpleNamespace(
+        name_to_value={}, record=lambda k, v, *a, **kw: logger_store.__setitem__(k, v))
+    rr = ({'excitement': excitement, 'intensity': intensity, 'nausea': nausea}
+          if tested else {'excitement': 0, 'intensity': 0, 'nausea': 0})
+    cb.locals = {
+        'dones': [True],
+        'infos': [{'loop_completed': True, 'cold_start': True, 'learning_phase': phase,
+                   'ride_rating': rr, 'track_length': 30, 'current_distance': 0.0,
+                   'collision_count': 0,
+                   'episode_metrics': {'track_length': 30, 'drop_z': 8.0, 'chain_height': 6.0,
+                                       'test_ok': tested, 'min_distance': 0.0}}],
+    }
+    cb._on_step()
+    return logger_store
+
+
+def test_callback_logs_quality_and_structure_tags():
+    """We inferred the Phase-5 plateau arithmetically because ride stats were never logged.
+    Never again: excitement/intensity/nausea, test success, and the scale diagnostics all
+    stream to TB from phase-4+ episodes."""
+    from types import SimpleNamespace
+    cb = T.ParallelCurriculumMaskableCallback(n_envs=1)
+    cb.model = SimpleNamespace(target_kl=None, ent_coef=0.01, get_env=lambda: None)
+    store = _quality_step(cb, 0, phase=5, excitement=3.2)
+    assert store['quality/excitement'] == pytest.approx(3.2)
+    assert store['quality/intensity'] == pytest.approx(3.0)
+    assert store['quality/nausea'] == pytest.approx(1.0)
+    assert store['quality/test_success_rate'] == pytest.approx(1.0)
+    assert store['structure/drop_z'] == pytest.approx(8.0)
+    assert store['structure/chain_height'] == pytest.approx(6.0)
+    assert store['structure/completed_length'] == 30
+    # an untested (all-zero) completion counts against test success but not excitement
+    store = _quality_step(cb, 0, phase=5, excitement=0.0, tested=False)
+    assert store['quality/test_success_rate'] == pytest.approx(0.5)
+    assert list(cb._exc_window) == [pytest.approx(3.2)]
+
+
+def test_quality_tags_ignored_before_phase4():
+    """Phases 1-3 skip ride testing; their all-zero ride_rating sentinels must not pollute
+    the test-success or excitement windows."""
+    from types import SimpleNamespace
+    cb = T.ParallelCurriculumMaskableCallback(n_envs=1)
+    cb.model = SimpleNamespace(target_kl=None, ent_coef=0.01, get_env=lambda: None)
+    store = _quality_step(cb, 0, phase=2, excitement=0.0, tested=False)
+    assert 'quality/test_success_rate' not in store
+    assert len(cb._exc_window) == 0
+
+
+def test_p5_quality_floor_holds_exploration_while_excitement_low():
+    """The converged mini-loop policy has ~0.2 nats of entropy left -- no way to discover
+    bigger coasters even with a reward gradient. While the fleet is in P5 and median
+    excitement is below the floor target, the resting ent_coef is raised and the collapse
+    band uses the raised (bootstrap) thresholds; once excitement clears the bar, the
+    proven exploit config returns."""
+    from types import SimpleNamespace
+    cb = T.ParallelCurriculumMaskableCallback(n_envs=1)
+    cb.model = SimpleNamespace(target_kl=0.04, ent_coef=0.015)
+    cb._opt_guarded = True
+    cb._ent_mode = "normal"
+    cb._phase = 5
+    assert cb._p5_quality_boost_active() is True            # no data yet -> hold exploration
+    assert cb._phase_base_ent_coef() == T.P5_QUALITY_ENT_COEF
+    assert cb._ent_band() == (T.BOOT_ENT_LO, T.BOOT_ENT_HI, T.BOOT_ENT_BOOST)
+    for _ in range(T.QUALITY_MIN_SAMPLES):
+        cb._exc_window.append(2.0)                          # stuck below the bar
+    assert cb._p5_quality_boost_active() is True
+    cb._exc_window.clear()
+    for _ in range(T.QUALITY_MIN_SAMPLES):
+        cb._exc_window.append(5.5)                          # quality climbing -> hand back
+    assert cb._p5_quality_boost_active() is False
+    assert cb._phase_base_ent_coef() == T.OPT_GUARDED['ent_coef']
+    assert cb._ent_band() == (T.ENT_COLLAPSE_LO, T.ENT_COLLAPSE_HI, T.ENT_COLLAPSE_BOOST)
+
+
+def test_p5_quality_floor_inactive_below_phase5():
+    from types import SimpleNamespace
+    cb = T.ParallelCurriculumMaskableCallback(n_envs=1)
+    cb.model = SimpleNamespace(target_kl=0.04, ent_coef=0.015)
+    cb._opt_guarded = True
+    cb._ent_mode = "normal"
+    cb._phase = 3
+    assert cb._p5_quality_boost_active() is False
+    assert cb._phase_base_ent_coef() == T.OPT_GUARDED['ent_coef']
+
+
+def test_env_factory_requests_game_speed_best_effort(monkeypatch, tmp_path):
+    """Ride ratings take ~35s of SIM time (measured live) -- at game speed 8 that is ~4-5s,
+    which is what makes P4/P5 ride testing viable. The factory requests it best-effort; an
+    older plugin without the endpoint must not break env creation."""
+    from openrct2_gym.envs.openrct2_env import OpenRCT2Env
+    monkeypatch.setattr(OpenRCT2Env, "_LOOP_LIBRARY_PATH", str(tmp_path / "lib.jsonl"))
+    calls = []
+
+    class SpeedFakeAPI(FakeAPI):
+        def set_game_speed(self, speed):
+            calls.append(speed)
+            return {"success": True, "payload": {"speed": speed}}
+
+    monkeypatch.setattr(oe_mod, "APIController", SpeedFakeAPI)
+    env = T.create_curriculum_masked_env(8080, verbose=0, game_speed=8)
+    assert calls == [8]
+    env.close()
+
+    monkeypatch.setattr(oe_mod, "APIController", FakeAPI)   # no set_game_speed at all
+    env = T.create_curriculum_masked_env(8080, verbose=0, game_speed=8)   # must not raise
+    env.close()
