@@ -592,6 +592,13 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
                             self.logger.record('chain_lift/history_count', info_metrics['chain_count'])
                         if 'struct_bonus' in info_metrics:
                             self.logger.record('rewards/struct_bonus', info_metrics['struct_bonus'])
+                        # length-trap fix diagnostics: watch the length gate bite
+                        # (completion_gate < 1 on short loops) and the phase-gate
+                        # qualification bonus start to flow in P3/P4
+                        if 'completion_gate' in info_metrics:
+                            self.logger.record('rewards/completion_gate', info_metrics['completion_gate'])
+                        if 'qualify_bonus' in info_metrics:
+                            self.logger.record('rewards/qualify_bonus', info_metrics['qualify_bonus'])
                         if 'max_gain' in info_metrics:
                             self.logger.record('height/max_gain', info_metrics['max_gain'])
                         if 'roundtrip' in info_metrics:
@@ -605,6 +612,8 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
                         # scale diagnostics (P3-5 redesign): is the agent actually building bigger?
                         if 'drop_z' in info_metrics:
                             self.logger.record('structure/drop_z', info_metrics['drop_z'])
+                        if 'steep_drop_z' in info_metrics:  # the P4 60-degree leg: watch it lift off 0
+                            self.logger.record('structure/steep_drop_z', info_metrics['steep_drop_z'])
                         if 'chain_height' in info_metrics:
                             self.logger.record('structure/chain_height', info_metrics['chain_height'])
                         if 'track_length' in info_metrics:

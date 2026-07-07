@@ -77,6 +77,13 @@ class RewardParams:
     struct_height_target: float = 4.0
     struct_w_length: float = 0.0      # weight on completed track length / struct_length_target
     struct_length_target: float = 25.0
+    # Steepness component (P4): z dropped via 60-degree pieces (actions 8/27/28) toward
+    # struct_steep_target. P4's qualified gate requires a 60-degree segment, but that leg was
+    # reward-INVISIBLE outside the full R_qualify conjunction -- 9h of fixed-P4 training never
+    # placed one steep piece (entropy at the collapse line makes joint discovery ~impossible).
+    # Steepness is a piece-type swap (not extra pieces), so a graded additive ramp is enough.
+    struct_w_steep: float = 0.0       # weight on steep-dropped z / struct_steep_target
+    struct_steep_target: float = 8.0  # one minimal 25->60->25 segment (4z + 4z)
     # Verified-viability bonus (P4+): paid on completion ONLY when the ride test returned
     # nonzero stats -- "the train physically made it around" as a paid, verified event.
     R_viable: float = 0.0
@@ -85,6 +92,22 @@ class RewardParams:
     # flat-completer can no longer ignore the lift hill (it leaves 75% of R_complete on the
     # table). Completion stays first: even the gated floor (250) >> Phi_max (~27).
     completion_hill_floor: float = 1.0
+    # Length analogue of the hill gate (P3/P4). Fraction of the (hill-gated) completion payout
+    # a min-length loop earns; the rest ramps in with track_length/struct_length_target. 1.0 =
+    # no gating. The ADDITIVE struct length credit cannot carry this incentive: at P3 scale it
+    # pays ~+2/piece while gamma-discounting the ~1200-point completion costs ~-10/piece, so
+    # the Jul-5 overnight run converged on an 18-piece mini-loop with qualified_rate 0. At 0.25
+    # each piece toward the target is worth ~R_complete*0.75/target (~+30/piece in P3) -- the
+    # gradient finally points at the phase gate.
+    completion_length_floor: float = 1.0
+    # Discrete qualification bonus: paid once, on completion, when the episode meets the
+    # phase's qualified-gate targets (the same struct targets the curriculum advances on; see
+    # _qualifies). Makes crossing the gate itself a paid event instead of reward-invisible.
+    # 0 disables (P1/P2/P5).
+    R_qualify: float = 0.0
+    qualify_requires_energy: bool = False      # P3: cheap viability proxy (ride testing is off)
+    qualify_requires_steep_drop: bool = False  # P4: a 60-degree descent segment is required
+    qualify_requires_test: bool = False        # P4: the ride test must return real stats
     # Round-trip milestone: a one-time-per-episode bonus for climbing >= roundtrip_gain above
     # the station AND returning to ~station height, INDEPENDENT of closing the loop. Teaches
     # the climb-and-return sub-skill decoupled from completion (a hill is then a reachable
@@ -427,6 +450,12 @@ class OpenRCT2Env(gym.Env):
             # stats). Completion-conditioned by construction (this is the terminal branch).
             if self.reward_params.R_viable > 0.0 and self._last_test_ok:
                 reward += self.reward_params.R_viable
+            # Qualification bonus: the phase gate as a paid, discrete event. Sits with
+            # R_viable (not in _calculate_reward) because P4's predicate needs the ride-test
+            # verdict, which only settles here.
+            if self.reward_params.R_qualify > 0.0 and self._qualifies(self.reward_params):
+                reward += self.reward_params.R_qualify
+                self._last_qualify_bonus = self.reward_params.R_qualify
         # Truncation gets no partial-credit bonus: PBRS already pays approach progress
         # as-you-go (a non-potential terminal bonus would be farmable and break invariance).
 
@@ -461,8 +490,13 @@ class OpenRCT2Env(gym.Env):
                 'warm_prefix_len': self._warm_prefix_len,
                 # scale/viability diagnostics (P3-5 redesign)
                 'drop_z': self._total_drop_z(),
+                'steep_drop_z': self._steep_drop_z(),
                 'chain_height': float(self._chain_max_gain()),
                 'test_ok': bool(getattr(self, '_last_test_ok', False)),
+                # length-trap fix diagnostics: the combined completion gate actually paid
+                # and whether the phase-gate qualification bonus fired
+                'completion_gate': float(getattr(self, '_last_completion_gate', 0.0)),
+                'qualify_bonus': float(getattr(self, '_last_qualify_bonus', 0.0)),
             }
 
         return observation, reward, terminated, truncated, info
@@ -540,6 +574,8 @@ class OpenRCT2Env(gym.Env):
         self.steps_since_collision = 0
         self._connection_suspect = False
         self._last_test_ok = False
+        self._last_qualify_bonus = 0.0
+        self._last_completion_gate = 0.0
         self.previous_distance = None
         self.position_history = deque(maxlen=self.POSITION_HISTORY_MAXLEN)
         self.chain_lift_positions = set()
@@ -714,6 +750,7 @@ class OpenRCT2Env(gym.Env):
         """
         params = self.reward_params
         self._last_struct_bonus = 0.0          # reset each step (covers the failure early-return)
+        self._last_completion_gate = 0.0
         if not success:
             return float(params.fail_penalty)
 
@@ -727,6 +764,14 @@ class OpenRCT2Env(gym.Env):
             # R_complete; building the lift hill earns the rest (plus the structural bonus).
             # In phases 1/5 the floor is 1.0 so completion is fully paid regardless.
             gate = params.completion_hill_floor + (1.0 - params.completion_hill_floor) * self._hill_quality(params)
+            # Length gate (multiplicative): a short loop discounts the WHOLE completion payout,
+            # so unlike the additive struct length credit it out-bids the gamma-discount cost
+            # of building the extra pieces the phase gate requires.
+            if params.completion_length_floor < 1.0 and params.struct_length_target > 0:
+                length_frac = min(self.track_length / params.struct_length_target, 1.0)
+                gate *= (params.completion_length_floor
+                         + (1.0 - params.completion_length_floor) * length_frac)
+            self._last_completion_gate = gate
             reward += params.R_complete * gate
             # Structural bonus, computed once and stored so episode_metrics reports exactly
             # what was added to the reward.
@@ -1115,6 +1160,14 @@ class OpenRCT2Env(gym.Env):
         hist = getattr(self.track_builder, "history", None) or []
         return float(sum(max(0.0, h["position"][2] - h["next_position"][2]) for h in hist))
 
+    def _steep_drop_z(self):
+        """Total z dropped over STEEP descent pieces (the 60-degree family: 60-down and the
+        25<->60 transitions, actions 8/27/28) in the removal-safe history. Feeds the graded
+        steepness credit; 25-degree descents count toward _total_drop_z only."""
+        hist = getattr(self.track_builder, "history", None) or []
+        return float(sum(max(0.0, h["position"][2] - h["next_position"][2])
+                         for h in hist if h.get("action") in (8, 27, 28)))
+
     def _chain_max_gain(self):
         """Highest elevation (z above station) reached via CHAIN-LIFT pieces (actions 9/10) in
         the removal-safe history; 0.0 if none. Single source of truth for every chain-elevation
@@ -1144,10 +1197,13 @@ class OpenRCT2Env(gym.Env):
                     if params.struct_height_target > 0 else 0.0)
         length_q = (min(self.track_length / params.struct_length_target, 1.0)
                     if params.struct_length_target > 0 else 0.0)
+        steep_q = (min(self._steep_drop_z() / params.struct_steep_target, 1.0)
+                   if params.struct_steep_target > 0 else 0.0)
         return min(params.struct_w_chain * chain_q
                    + params.struct_w_drop * drop_q
                    + params.struct_w_height * height_q
-                   + params.struct_w_length * length_q, 1.0)
+                   + params.struct_w_length * length_q
+                   + params.struct_w_steep * steep_q, 1.0)
 
     def _structural_bonus(self, params):
         """Completion-conditioned bonus for building the lift-hill / drop structure each
@@ -1156,6 +1212,27 @@ class OpenRCT2Env(gym.Env):
         if params.R_struct_max <= 0:
             return 0.0
         return float(params.R_struct_max * self._hill_quality(params))
+
+    def _qualifies(self, params):
+        """Whether the current track meets the phase's qualified-gate targets, from
+        env-native state (mirrors ImprovedPhasedCurriculumWrapper._is_qualified for P3/P4:
+        same struct targets, energy proxy, steep-drop and verified-test legs). Structural
+        targets <= 0 are vacuous. Callers guard on completion (R_qualify is terminal-only)."""
+        if params.struct_height_target > 0 and self._chain_max_gain() < params.struct_height_target:
+            return False
+        if params.struct_drop_target > 0 and self._total_drop_z() < params.struct_drop_target:
+            return False
+        if params.struct_length_target > 0 and self.track_length < params.struct_length_target:
+            return False
+        if params.qualify_requires_energy and self._calculate_energy_margin() < 0.0:
+            return False
+        if params.qualify_requires_steep_drop:
+            hist = getattr(self.track_builder, "history", None) or []
+            if not any(h.get("action") in (8, 27, 28) for h in hist):
+                return False
+        if params.qualify_requires_test and not getattr(self, "_last_test_ok", False):
+            return False
+        return True
 
     def _calculate_distance_to_start(self):
         point_a = np.array(self.current_position)

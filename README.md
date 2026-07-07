@@ -141,13 +141,21 @@ reward = F + sparse terms,    where   F = γ·Φ(s′) − Φ(s)
 
 ### Sparse objectives (the real goals)
 
-- **Circuit completion: +1000** — the dominant signal. Completion always strictly outweighs all accumulated shaping, so the agent is *completion-first*. In the hill phases a flat loop earns only a fraction (the hill gate), so structure is required for full pay.
+- **Circuit completion: +1000, gated** — the dominant signal. Completion always strictly outweighs all accumulated shaping, so the agent is *completion-first*. In the hill phases a flat loop earns only a fraction (the hill gate), and in P3/P4 a **length gate** multiplies in on top (floor 0.25, ramping to full pay at the phase's length target). The length gate must be multiplicative: an additive per-piece credit (~+2/piece) loses to γ-discounting the completion payout (~−10/piece), which is exactly how a Jul-5 run converged onto an 18-piece mini-loop and pinned Phase 3's qualified rate at 0.
 - **Structural bonus (phases 2-4): 0–250, completion-conditioned** — graded credit for chain
-  count/height, total drop-z, and completed length toward per-phase targets. All components
-  are ramps (partial progress pays); chain credit is elevation-scaled so chain-stub
-  decoration on a flat loop cannot pay as a lift hill.
+  count/height, total drop-z, steep-dropped z (P4: the 60° family, one 8z segment for full
+  credit), and completed length toward per-phase targets. All components are ramps (partial
+  progress pays); chain credit is elevation-scaled so chain-stub decoration on a flat loop
+  cannot pay as a lift hill. Every leg of a phase's qualified gate must appear here as a
+  ramp — a leg visible only inside the qualification conjunction has no gradient and is
+  never discovered once entropy tightens (the P4 steep-drop leg went 9h without a single
+  60° piece until it was graded in).
 - **Verified viability (phase 4+): +150, completion-conditioned** — paid only when the ride
   test returns real stats, i.e. the train demonstrably made it all the way around.
+- **Qualification bonus (phases 3-4): +200, completion-conditioned** — paid when the episode
+  meets the phase's full qualified-gate predicate (P3: struct targets + energy proxy; P4:
+  + steep segment + verified test). The advancement gate itself is a paid event, so
+  reward-max and curriculum progress point the same way.
 - **Ride quality (phase 5): 0–500** — ramp+band per stat: half the credit ramps monotonically
   toward the target (every increment pays), half peaks at it (Excitement ≈ 8, Intensity ≈ 5.5,
   low Nausea). Applied only on a completed, ride-tested circuit, so a finished ride is never punished.
@@ -237,6 +245,12 @@ The training scripts provide extensive metrics in Tensorboard:
 - **P3/P4 scale phases + verified viability**: graded height/drop/length targets replace
   piece-count gates that the Phase-2 mini-loop already satisfied; Phase 4 turns the ride test
   on and pays only when the train demonstrably completes the circuit
+- **Phase gates made reward-visible (Jul-7)**: the P3 mini-loop trap (additive length credit
+  lost to γ-discounting; qualified rate decayed to 0 over 13h) is closed by a multiplicative
+  completion length gate + a +200 qualification bonus on the gate predicate itself; the P4
+  steep-drop leg (9h in-phase without one 60° piece placed) is graded into the structure
+  credit. Diagnosed via `rewards/completion_gate`, `rewards/qualify_bonus`,
+  `structure/steep_drop_z` in TensorBoard
 - **Quality ramp**: the Phase-5 excitement/intensity bonus pays partial progress instead of
   being a dead band (two runs plateaued at the identical nausea-only score before this)
 - **Progress-conditional exploration**: entropy floors hold exploration up exactly while a

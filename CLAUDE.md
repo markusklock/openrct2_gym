@@ -72,6 +72,21 @@ This is a Gymnasium environment for training RL agents to build roller coasters 
   energy-viable at completion (graded structure credit, not piece counting)
 - Phase 4: Big & Verified (80 pieces) - height >=6z, drops >=8z incl. a 60-degree segment,
   length >=40; ride testing ON, R_viable=150 paid only when the test returns real stats
+- **P3/P4 length-trap fix (Jul-6)**: the Jul-5 overnight run converged onto an 18-piece
+  mini-loop in P3 (additive length credit paid ~+2/piece vs ~-10/piece gamma-discount of the
+  completion payout; qualified_rate decayed 0.14 -> 0, entropy saturated). Two coupled terms,
+  both diagnosed in TB: `completion_length_floor=0.25` multiplies the completion gate by a
+  length ramp toward `struct_length_target` (~+30/piece; `rewards/completion_gate`), and
+  `R_qualify=200` pays the phase's qualified-gate predicate as a discrete completion bonus
+  (P3: struct targets + energy proxy; P4: + steep drop + verified test; `rewards/qualify_bonus`)
+- **P4 steep credit (Jul-7)**: the qualified gate's 60-degree leg was reward-invisible outside
+  the R_qualify conjunction — 9h of verified-P4 training placed zero steep pieces while entropy
+  sat at the collapse line. `struct_w_steep=0.2` grades steep-dropped z (actions 8/27/28) toward
+  `struct_steep_target=8` (one 25->60->25 segment); P4 height/drop reweighted 0.4->0.3 so a
+  no-steep build caps at 0.8 of struct+gate. Steep premium on a verified 40-piece loop: +450
+  (gate release + struct + qualify). Watch `structure/steep_drop_z`. RULE: every leg of a
+  phase's qualified gate needs its own ramp in the reward — conjunction-only legs don't get
+  discovered once entropy tightens
 - Phase 5: Quality Optimization (80-120 pieces) - ramp+band quality bonus (every increment
   toward E8/I5.5 pays), no step cost, P5 exploration floor while median excitement < 4
 

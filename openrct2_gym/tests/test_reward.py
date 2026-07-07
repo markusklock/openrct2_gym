@@ -680,8 +680,10 @@ def test_phase_reward_params_structural_per_phase():
     assert (p3.R_struct_max, p3.struct_w_chain, p3.struct_w_height, p3.struct_w_drop,
             p3.struct_w_length) == (250.0, 0.0, 0.4, 0.4, 0.2)
     p4 = W._phase_reward_params(4)
+    # Jul-7: height/drop reweighted 0.4->0.3 to grade the steep leg in (see
+    # test_p4_params_grade_steepness); the four components still sum to 1.0.
     assert (p4.R_struct_max, p4.struct_w_chain, p4.struct_w_height, p4.struct_w_drop,
-            p4.struct_w_length) == (250.0, 0.0, 0.4, 0.4, 0.2)
+            p4.struct_w_length) == (250.0, 0.0, 0.3, 0.3, 0.2)
     p5 = W._phase_reward_params(5)
     assert p5.R_struct_max == 0.0 and p5.R_quality_max == 500.0   # struct off, quality on
     # discovery potential: ON only in the hill-building phases 2-4; OFF in the
@@ -2270,8 +2272,8 @@ def test_phase34_scale_params_and_p5_step_cost():
     assert p3.struct_w_chain == 0.0 and p3.R_viable == 0.0
     assert p3.h_scale == 8.0                      # taller climbs keep paying discovery
     p4 = W._phase_reward_params(4)
-    assert (p4.struct_w_height, p4.struct_height_target) == (0.4, 6.0)
-    assert (p4.struct_w_drop, p4.struct_drop_target) == (0.4, 8.0)
+    assert (p4.struct_w_height, p4.struct_height_target) == (0.3, 6.0)
+    assert (p4.struct_w_drop, p4.struct_drop_target) == (0.3, 8.0)
     assert (p4.struct_w_length, p4.struct_length_target) == (0.2, 40.0)
     assert p4.R_viable == 150.0 and p4.h_scale == 8.0
     # completion-conditioned bonuses stay strictly below R_complete
@@ -2358,6 +2360,250 @@ def test_p4_advancement_uses_qualified_window():
     w.episode_qualified_results = deque([True] * 20 + [False] * 30, maxlen=50)   # 40% qualified
     w._check_phase_advancement()
     assert advanced == [5]
+
+
+# ------------------------------- P3/P4 length-trap fix (length gate + qualify bonus)
+# The Jul-5 overnight run converged onto an 18-piece mini-loop in Phase 3: the additive
+# length credit (+2/piece) lost to gamma-discounting the ~1200-point completion payout
+# (-10/piece), so qualified_rate decayed 0.14 -> 0 while reward plateaued at its max.
+# Fix: (a) a multiplicative completion length gate (mirrors completion_hill_floor), and
+# (b) a discrete R_qualify bonus paid when the episode meets the phase's qualified
+# predicate -- the gate the curriculum advances on finally shows up in the reward.
+
+def _env_hist(rows):
+    """(action, z_in, z_out) rows -> env-format history dicts (see _big_hill)."""
+    return [{"action": a, "position": [i, 0, z0], "next_position": [i + 1, 0, z1]}
+            for i, (a, z0, z1) in enumerate(rows)]
+
+
+def test_qualify_fields_default_inert():
+    """New fields must default OFF so every pre-fix params object (P1/P2/P5) is unchanged."""
+    p = RewardParams()
+    assert p.completion_length_floor == 1.0
+    assert p.R_qualify == 0.0
+    assert p.qualify_requires_energy is False
+    assert p.qualify_requires_steep_drop is False
+    assert p.qualify_requires_test is False
+
+
+def test_completion_length_gate_scales_r_complete():
+    """A completed loop below struct_length_target earns only the length-gated fraction of
+    R_complete; at the target the gate releases fully."""
+    params = replace(RewardParams(), completion_length_floor=0.25, struct_length_target=25.0)
+
+    def payout(length):
+        env = _bare_env(history=_env_hist(_big_hill(chain_peak=19, length=length)))
+        env.loop_completed = True
+        env._phi_prev = 0.0
+        env.reward_params = params
+        return env._calculate_reward(True, 0)
+
+    gate18 = 0.25 + 0.75 * (18 / 25)
+    assert payout(18) == pytest.approx(params.R_complete * gate18)
+    assert payout(25) == pytest.approx(params.R_complete)
+
+
+def test_length_gate_composes_with_hill_gate():
+    """P3-style gating multiplies: hill quality gates R_complete AND the short-loop
+    discount applies on top (a hill-ful mini-loop still leaves length money on the table)."""
+    params = replace(
+        RewardParams(),
+        completion_hill_floor=0.0, completion_length_floor=0.25,
+        struct_w_chain=0.0, struct_w_height=0.4, struct_height_target=4.0,
+        struct_w_drop=0.4, struct_drop_target=4.0,
+        struct_w_length=0.2, struct_length_target=25.0,
+    )
+    env = _bare_env(history=_env_hist(_big_hill(chain_peak=19, length=18)))  # h5, drop 5, len 18
+    env.loop_completed = True
+    env._phi_prev = 0.0
+    env.reward_params = params
+    hill_q = 0.4 + 0.4 + 0.2 * (18 / 25)
+    length_gate = 0.25 + 0.75 * (18 / 25)
+    assert env._calculate_reward(True, 0) == pytest.approx(
+        params.R_complete * hill_q * length_gate)
+
+
+def test_qualify_predicate_checks_structure_energy_steep_test():
+    params = replace(RewardParams(), R_qualify=200.0, struct_height_target=4.0,
+                     struct_drop_target=4.0, struct_length_target=25.0,
+                     qualify_requires_energy=True)
+
+    def env_for(rows, energy=10.0, test_ok=True):
+        env = _bare_env(history=_env_hist(rows))
+        env._calculate_energy_margin = lambda: energy
+        env._last_test_ok = test_ok
+        return env
+
+    assert env_for(_big_hill(chain_peak=19, length=26))._qualifies(params) is True
+    assert env_for(_big_hill(chain_peak=17, length=26))._qualifies(params) is False  # h3 < 4
+    assert env_for(_big_hill(chain_peak=19, length=18))._qualifies(params) is False  # len < 25
+    assert env_for(_big_hill(chain_peak=19, length=26), energy=-5.0)._qualifies(params) is False
+    p4ish = replace(params, qualify_requires_energy=False,
+                    qualify_requires_steep_drop=True, qualify_requires_test=True)
+    assert env_for(_big_hill(chain_peak=25, steep=True, length=41))._qualifies(p4ish) is True
+    assert env_for(_big_hill(chain_peak=25, steep=False, length=41))._qualifies(p4ish) is False
+    assert env_for(_big_hill(chain_peak=25, steep=True, length=41),
+                   test_ok=False)._qualifies(p4ish) is False
+
+
+def test_r_qualify_paid_in_terminal_step(monkeypatch):
+    """R_qualify is paid in the terminal step (next to R_viable) so P4 can require the
+    ride test; a completion short of the length target earns nothing."""
+    monkeypatch.setattr(oe_mod, "APIController", CompletingAPI)
+    env = OpenRCT2Env(verbose=0)
+    env.skip_ride_testing = True
+    env.reward_params = replace(RewardParams(), R_qualify=200.0, struct_height_target=0.0,
+                                struct_drop_target=0.0, struct_length_target=2.0)
+    env.reset()
+    phi_prev_before, reward, terminated, _, info = _drive_to_terminal(env)
+    assert terminated
+    assert reward == pytest.approx(env.reward_params.R_complete - phi_prev_before + 200.0)
+    assert info['episode_metrics']['qualify_bonus'] == 200.0
+
+    env2 = OpenRCT2Env(verbose=0)
+    env2.skip_ride_testing = True
+    env2.reward_params = replace(env.reward_params, struct_length_target=99.0)
+    env2.reset()
+    phi_prev_before, reward, terminated, _, info = _drive_to_terminal(env2)
+    assert terminated
+    assert reward == pytest.approx(env2.reward_params.R_complete - phi_prev_before)
+    assert info['episode_metrics']['qualify_bonus'] == 0.0
+
+
+def test_episode_metrics_expose_completion_gate(monkeypatch):
+    monkeypatch.setattr(oe_mod, "APIController", CompletingAPI)
+    env = OpenRCT2Env(verbose=0)
+    env.skip_ride_testing = True
+    env.reset()
+    _, _, terminated, _, info = _drive_to_terminal(env)
+    assert terminated
+    m = info['episode_metrics']
+    assert {'qualify_bonus', 'completion_gate'}.issubset(m)
+    assert m['completion_gate'] == pytest.approx(1.0)     # default floors -> ungated
+
+
+def test_p3_p4_params_pay_the_length_gate():
+    W = ImprovedPhasedCurriculumWrapper
+    p3 = W._phase_reward_params(3)
+    assert p3.completion_length_floor == 0.25
+    assert p3.R_qualify == 200.0
+    assert p3.qualify_requires_energy is True
+    assert (p3.qualify_requires_steep_drop, p3.qualify_requires_test) == (False, False)
+    p4 = W._phase_reward_params(4)
+    assert p4.completion_length_floor == 0.25
+    assert p4.R_qualify == 200.0
+    assert p4.qualify_requires_energy is False
+    assert (p4.qualify_requires_steep_drop, p4.qualify_requires_test) == (True, True)
+    # completion-conditioned extras stay strictly below R_complete (completion-first)
+    assert p4.R_struct_max + p4.R_viable + p4.R_qualify < p4.R_complete
+
+
+def _completion_payout(params, length, chain_peak=19, steep=False, test_ok=False):
+    """Terminal payout of a completed chain-hill loop under `params`, including the
+    step()-level bonuses (R_viable/R_qualify) the terminal branch adds."""
+    env = _bare_env(history=_env_hist(_big_hill(chain_peak=chain_peak, steep=steep,
+                                                length=length)))
+    env.loop_completed = True
+    env._phi_prev = 0.0
+    env.reward_params = params
+    env._calculate_energy_margin = lambda: 10.0     # viable; isolates the length economics
+    env._last_test_ok = test_ok
+    r = env._calculate_reward(True, 0)
+    if test_ok and params.R_viable > 0.0:
+        r += params.R_viable
+    if params.R_qualify > 0.0 and env._qualifies(params):
+        r += params.R_qualify
+    return r
+
+
+def test_p3_extending_to_target_beats_min_loop():
+    """THE regression test for the Jul-5 trap: from the 18-piece mini-loop state, the
+    discounted value of building the 7 more pieces Phase 3's gate requires must
+    decisively beat banking the mini-loop now."""
+    P3 = ImprovedPhasedCurriculumWrapper._phase_reward_params(3)
+    stay = _completion_payout(P3, length=18)
+    extend = (P3.gamma ** 7) * _completion_payout(P3, length=25)
+    assert extend > stay + 100.0
+
+
+def test_p4_extending_to_target_beats_min_loop():
+    """Same economics at the Phase-4 bar (length 40): completing a verified 30-piece
+    hill now must not beat extending to the qualifying length."""
+    P4 = ImprovedPhasedCurriculumWrapper._phase_reward_params(4)
+    stay = _completion_payout(P4, length=30, chain_peak=25, steep=True, test_ok=True)
+    extend = (P4.gamma ** 10) * _completion_payout(P4, length=40, chain_peak=25,
+                                                   steep=True, test_ok=True)
+    assert extend > stay + 100.0
+
+
+# --------------------------------- P4 steep-drop credit (the last reward-invisible leg)
+# 9h into the fixed P4 run: tests verified (0.74), height/drop/length legs green or
+# ramping, but qualified_rate pinned at 0 -- the 60-degree steep-drop leg had NO gradient
+# (zero steep pieces in the last 80 harvested loops; entropy at the collapse line).
+# Fix: grade steepness into the structure credit like every other leg. Steepness is a
+# piece-type swap, not extra pieces, so an additive ramp suffices (no discounting fight).
+
+def test_steep_fields_default_inert():
+    p = RewardParams()
+    assert p.struct_w_steep == 0.0
+    assert p.struct_steep_target == 8.0
+
+
+def test_steep_drop_z_sums_steep_descents_only():
+    """Only the 60-degree family (8/27/28) counts; 25-degree descents are excluded."""
+    env = _bare_env(history=_env_hist([
+        (10, 14, 15), (9, 15, 17),            # chain climb
+        (27, 17, 13), (28, 13, 9),            # steep segment: drops 4 + 4
+        (6, 9, 7), (0, 7, 7),                 # 25-deg drop (2) + flat
+    ]))
+    assert env._steep_drop_z() == pytest.approx(8.0)
+    assert _bare_env(history=_env_hist([(6, 14, 12), (6, 12, 10)]))._steep_drop_z() == 0.0
+
+
+def test_hill_quality_pays_graded_steep_credit():
+    """The steep component ramps with steep-dropped z toward the target -- half a
+    segment pays half the credit (no cliff), a full segment pays it all."""
+    params = replace(RewardParams(), R_struct_max=250.0, struct_w_chain=0.0,
+                     struct_w_drop=0.0, struct_height_target=0.0,
+                     struct_w_steep=1.0, struct_steep_target=8.0)
+    full = _bare_env(history=_env_hist([(27, 22, 18), (28, 18, 14)]))   # 8z steep
+    half = _bare_env(history=_env_hist([(27, 18, 14)]))                 # 4z steep
+    none = _bare_env(history=_env_hist([(6, 16, 14)]))                  # 25-deg only
+    assert full._hill_quality(params) == pytest.approx(1.0)
+    assert half._hill_quality(params) == pytest.approx(0.5)
+    assert none._hill_quality(params) == pytest.approx(0.0)
+
+
+def test_p4_params_grade_steepness():
+    """P4 structure credit reweighted to carry the steep leg (weights still sum to 1.0);
+    P3 keeps steepness out (its gate has no steep requirement)."""
+    W = ImprovedPhasedCurriculumWrapper
+    p4 = W._phase_reward_params(4)
+    assert (p4.struct_w_steep, p4.struct_steep_target) == (0.2, 8.0)
+    assert (p4.struct_w_height, p4.struct_w_drop, p4.struct_w_length) == (0.3, 0.3, 0.2)
+    assert p4.struct_w_steep + p4.struct_w_height + p4.struct_w_drop + p4.struct_w_length \
+        == pytest.approx(1.0)
+    assert W._phase_reward_params(3).struct_w_steep == 0.0
+
+
+def test_p4_steep_segment_is_reward_visible_before_qualifying():
+    """Swapping a steep segment into an otherwise-identical verified P4 completion must
+    raise the payout decisively (gate release + struct credit + qualify), NOT only via
+    the R_qualify conjunction -- that was reward-invisible at low entropy."""
+    P4 = ImprovedPhasedCurriculumWrapper._phase_reward_params(4)
+    no_steep = _completion_payout(P4, length=40, chain_peak=25, steep=False, test_ok=True)
+    with_steep = _completion_payout(P4, length=40, chain_peak=25, steep=True, test_ok=True)
+    assert with_steep > no_steep + 300.0
+
+
+def test_episode_metrics_expose_steep_drop_z(monkeypatch):
+    monkeypatch.setattr(oe_mod, "APIController", CompletingAPI)
+    env = OpenRCT2Env(verbose=0)
+    env.skip_ride_testing = True
+    env.reset()
+    _, _, terminated, _, info = _drive_to_terminal(env)
+    assert terminated
+    assert 'steep_drop_z' in info['episode_metrics']
 
 
 def test_ride_testing_enabled_from_phase4(monkeypatch):

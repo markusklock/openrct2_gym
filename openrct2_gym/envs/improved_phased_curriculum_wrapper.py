@@ -149,10 +149,13 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
             f"{label}: climb milestones {milestones} >= R_complete {params.R_complete} "
             f"-- not closing the loop can out-pay even a perfect completion")
         if params.completion_hill_floor > 0.0:
-            flat = params.completion_hill_floor * params.R_complete
+            # Worst-case completion pay compounds BOTH gates (hill floor x length floor).
+            flat = (params.completion_hill_floor * params.completion_length_floor
+                    * params.R_complete)
             assert milestones < flat, (
                 f"{label}: climb milestones {milestones} >= flat-completion floor {flat} "
-                f"({params.completion_hill_floor}*{params.R_complete}) -- not closing out-pays a flat close")
+                f"({params.completion_hill_floor}*{params.completion_length_floor}"
+                f"*{params.R_complete}) -- not closing out-pays a flat close")
 
     @staticmethod
     def _phase_reward_params(phase, phase2_stage=1):
@@ -258,6 +261,13 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                 struct_w_length=0.2,
                 struct_length_target=25.0,
                 completion_hill_floor=0.0,
+                # Length-trap fix (Jul-5 overnight run: converged 18-piece mini-loop,
+                # qualified_rate 0): gate the completion payout on length so each piece
+                # toward 25 is worth ~+30 (vs the ~-10 discount cost), and pay the phase
+                # gate itself as a discrete event.
+                completion_length_floor=0.25,
+                R_qualify=200.0,
+                qualify_requires_energy=True,
                 R_roundtrip=100.0,
                 w_return=3.0,
                 w_close=8.0,
@@ -270,13 +280,26 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                 R_struct_max=250.0,
                 struct_chain_target=3,
                 struct_w_chain=0.0,
-                struct_w_height=0.4,
+                # Steepness graded in (Jul-7): the qualified gate's 60-degree leg had no
+                # gradient -- 9h of P4 never placed a steep piece. Reweighted so a no-steep
+                # build caps at 0.8 (leaving R_complete + struct money on the table) and one
+                # full 8z steep segment closes the gap; weights still sum to 1.0.
+                struct_w_height=0.3,
                 struct_height_target=6.0,
-                struct_w_drop=0.4,
+                struct_w_drop=0.3,
                 struct_drop_target=8.0,
+                struct_w_steep=0.2,
+                struct_steep_target=8.0,
                 struct_w_length=0.2,
                 struct_length_target=40.0,
                 completion_hill_floor=0.0,
+                # Same length economics as P3, at the P4 bar (40); the qualification
+                # bonus additionally requires the steep drop and the verified ride test,
+                # mirroring _is_qualified's P4 legs.
+                completion_length_floor=0.25,
+                R_qualify=200.0,
+                qualify_requires_steep_drop=True,
+                qualify_requires_test=True,
                 R_roundtrip=100.0,
                 R_viable=150.0,
                 w_return=3.0,
