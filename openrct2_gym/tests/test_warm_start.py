@@ -15,12 +15,16 @@ import pytest
 from openrct2_gym.envs import openrct2_env as oe_mod
 from openrct2_gym.envs.openrct2_env import OpenRCT2Env
 from openrct2_gym.envs.warm_start import (
+    ACTION_CLIMB_Z,
+    ACTION_DROP_Z,
+    CHAIN_ACTIONS,
     LoopRecord,
     LoopLibrary,
     WarmStartAnnealer,
     WarmStartPlan,
     generate_candidates,
     generate_hill_candidates,
+    generate_p4_candidates,
 )
 from openrct2_gym.tests.test_env_smoke import FakeAPI
 from openrct2_gym.tests.test_reward import CompletingAPI
@@ -119,6 +123,63 @@ def test_library_pool_phase2_prefers_hill_loops_with_flat_fallback(tmp_path):
     flat_only = _lib(tmp_path.joinpath("flat"), [FLAT])
     assert [r.actions for r in flat_only.pool(phase=2, max_len=40)] == [tuple(FLAT)]  # fallback
     assert len(lib.pool(phase=1, max_len=40)) == 2              # phase 1 uses everything
+
+
+# ------------------------------------------- steep-aware pool (P4 60-degree scaffold)
+# 12h of steep-credit P4 training: the policy never placed a steep piece on its own --
+# steep prefixes appeared only at their ~7% pool share (replays of short Phase-2-era
+# seeds, too short to qualify). The pool must PREFER qualifying-shaped steep loops in
+# P4, and the seed generator must produce them at P4 length.
+
+STEEP_SMALL = [4, 4, 10, 9, 9, 9, 9, 13, 12, 27, 28, 14, 0, 4, 4, 0]        # len 16
+BIG_NOSTEEP = [4, 4, 10, 9, 9, 9, 13, 12, 6, 6, 6, 14] + [0] * 26 + [4, 4, 0]  # len 41
+BIG_STEEP = [4, 4, 10, 9, 9, 9, 9, 13, 12, 27, 28, 14] + [0] * 26 + [4, 4, 0]  # len 41
+
+
+def test_loop_record_derives_steep_drop_z(tmp_path):
+    """steep_drop_z counts only the 60-degree family (8/27/28) and is derived from the
+    action list, so legacy JSONL entries (no steep field persisted) get it on reload."""
+    assert LoopRecord.from_actions(STEEP_SMALL, "scripted").steep_drop_z == 8.0
+    assert LoopRecord.from_actions(BIG_NOSTEEP, "scripted").steep_drop_z == 0.0
+    lib = _lib(tmp_path, [STEEP_SMALL])
+    reloaded = LoopLibrary(lib.path)                       # fresh load from JSONL
+    assert next(iter(reloaded._records.values())).steep_drop_z == 8.0
+
+
+def test_library_pool_phase4_prefers_steep_when_required(tmp_path):
+    lib = _lib(tmp_path, [BIG_NOSTEEP, BIG_STEEP, STEEP_SMALL])
+    best = lib.pool(phase=4, max_len=80, min_chains=3, min_len=40, min_drop_z=8,
+                    min_steep_z=8)
+    assert [r.actions for r in best] == [tuple(BIG_STEEP)]  # full-criteria tier only
+    # No big steep loop yet -> degrade to ANY steep loop (the short seeds), never to
+    # the non-steep big loop that dilutes the steep signal.
+    no_big = _lib(tmp_path.joinpath("nb"), [BIG_NOSTEEP, STEEP_SMALL])
+    tier2 = no_big.pool(phase=4, max_len=80, min_chains=3, min_len=40, min_drop_z=8,
+                        min_steep_z=8)
+    assert [r.actions for r in tier2] == [tuple(STEEP_SMALL)]
+    # No steep anywhere -> the scaffold must not turn off: chained fallback.
+    no_steep = _lib(tmp_path.joinpath("ns"), [BIG_NOSTEEP])
+    tier3 = no_steep.pool(phase=4, max_len=80, min_chains=3, min_len=40, min_drop_z=8,
+                          min_steep_z=8)
+    assert [r.actions for r in tier3] == [tuple(BIG_NOSTEEP)]
+
+
+def test_generate_p4_candidates_are_qualifying_shaped():
+    """Every P4 seed skeleton: net-z balanced, carries a full 27/28 steep segment and a
+    >=6z chain climb, and is long enough that the closed loop lands at >=40 pieces
+    (skeleton >= 37 + the ~3-piece closure tail), within the P4 track budget."""
+    cands = generate_p4_candidates()
+    assert len(cands) >= 16
+    for c in cands:
+        assert 37 <= len(c) <= 78
+        assert 27 in c and 28 in c
+        z, chain_peak = 0, 0
+        for a in c:
+            z += ACTION_CLIMB_Z.get(a, 0) - ACTION_DROP_Z.get(a, 0)
+            if a in CHAIN_ACTIONS:
+                chain_peak = max(chain_peak, z)
+        assert z == 0                                      # returns to station height
+        assert chain_peak >= 6                             # P4 height target reachable
 
 
 def test_library_maybe_refresh_picks_up_other_workers_appends(tmp_path):
@@ -707,11 +768,15 @@ def test_wrapper_warm_starts_through_phase4_cold_in_phase5(monkeypatch, tmp_path
     wrapper._update_phase_settings()
     wrapper.reset()
     assert wrapper._current_plan.cold is False                      # P3 scaffolds now
-    assert seen[-1] == (3, {'min_chains': 2, 'min_len': 20, 'min_drop_z': 4})
+    assert seen[-1] == (3, {'min_chains': 2, 'min_len': 20, 'min_drop_z': 4,
+                            'min_steep_z': 0})
     wrapper.current_phase = 4
     wrapper._update_phase_settings()
     wrapper.reset()
-    assert seen[-1] == (4, {'min_chains': 3, 'min_len': 25, 'min_drop_z': 8})
+    # Jul-8: P4 criteria raised to the gate itself (len 40, steep 8) so scaffold
+    # prefixes are qualifying-shaped instead of recycled P3 material.
+    assert seen[-1] == (4, {'min_chains': 3, 'min_len': 40, 'min_drop_z': 8,
+                            'min_steep_z': 8})
     wrapper.current_phase = 5
     wrapper._update_phase_settings()
     wrapper.reset()

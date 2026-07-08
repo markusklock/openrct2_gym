@@ -19,6 +19,7 @@ from dataclasses import dataclass
 
 
 CHAIN_ACTIONS = (9, 10)          # matches openrct2_env / api_track_builder chain-lift actions
+STEEP_ACTIONS = (8, 27, 28)      # 60-degree family (matches env._steep_drop_z / P4's gate leg)
 
 # Static per-action z geometry (live-verified via the base-z offset probes): descents drop
 # by their span, ascents climb by theirs. Lets the pool grade loops by real drop height and
@@ -48,6 +49,13 @@ class LoopRecord:
             drop_z=float(sum(ACTION_DROP_Z.get(a, 0) for a in acts)),
             source=str(source),
         )
+
+    @property
+    def steep_drop_z(self):
+        """z dropped via the 60-degree family only. A property (derived from actions),
+        so every legacy JSONL entry gets it on load without a schema migration."""
+        return float(sum(ACTION_DROP_Z.get(a, 0) for a in self.actions
+                         if a in STEEP_ACTIONS))
 
 
 class LoopLibrary:
@@ -138,18 +146,27 @@ class LoopLibrary:
             pass                           # in-memory record kept; persistence is best-effort
         return True
 
-    def pool(self, phase, max_len, min_chains=1, min_len=0, min_drop_z=0):
+    def pool(self, phase, max_len, min_chains=1, min_len=0, min_drop_z=0, min_steep_z=0):
         """Loops usable this episode: must fit the track budget with margin for the suffix
         search. Phase >= 2 prefers loops matching ALL the phase's structure criteria
-        (chains, length, drop height), degrading tier by tier (all-criteria -> enough
-        chains -> any hill -> everything) so the scaffold never silently turns off."""
+        (chains, length, drop height, steep-dropped height), degrading tier by tier
+        (all-criteria -> any-steep -> enough chains -> any hill -> everything) so the
+        scaffold never silently turns off. The any-steep tier exists because steepness is
+        the rarest skill in the pool: without it, steep prefixes appear only at their
+        pool share (~7% observed) and the 60-degree leg never gets practiced."""
         fits = [r for r in self._records.values() if r.length <= max_len - 2]
         if phase >= 2:
             best = [r for r in fits if (r.chain_count >= min_chains
                                         and r.length >= min_len
-                                        and r.drop_z >= min_drop_z)]
+                                        and r.drop_z >= min_drop_z
+                                        and r.steep_drop_z >= min_steep_z)]
             if best:
                 return best
+            if min_steep_z > 0:
+                steep = [r for r in fits if (r.steep_drop_z >= min_steep_z
+                                             and r.chain_count >= 1)]
+                if steep:
+                    return steep
             chained = [r for r in fits if r.chain_count >= min_chains]
             if chained:
                 return chained
@@ -231,11 +248,13 @@ class WarmStartAnnealer:
     def _cold_plan():
         return WarmStartPlan(prefix=[], k=0, loop_len=0, cold=True)
 
-    def sample_plan(self, library, phase, max_track_length, min_chains=1, min_len=0, min_drop_z=0):
+    def sample_plan(self, library, phase, max_track_length, min_chains=1, min_len=0,
+                    min_drop_z=0, min_steep_z=0):
         """The episode's warm-start plan. Cold when the die says so, the pool is empty,
         or the sampled k has annealed past the loop length (natural end of the scaffold)."""
         pool = (library.pool(phase, max_track_length, min_chains=min_chains,
-                             min_len=min_len, min_drop_z=min_drop_z)
+                             min_len=min_len, min_drop_z=min_drop_z,
+                             min_steep_z=min_steep_z)
                 if library is not None else [])
         if not pool or self._rng.random() < self.p_cold:
             return self._cold_plan()
@@ -307,6 +326,41 @@ def generate_big_candidates():
             for p in range(3, 7):
                 east = 7 + p
                 for mid in (0, 1, 2, 4):
+                    rest = east - block - mid
+                    if rest < 0:
+                        continue
+                    out.append([0] * p + [t, t]
+                               + climb + [0] * mid + descent + [0] * rest
+                               + [t, t])
+    return out
+
+
+def generate_p4_candidates():
+    """Qualifying-shaped steep skeletons for the Phase-4 pool: >=40-piece closed loops
+    carrying a full 27/28 steep segment and a >=6z chain climb.
+
+    The Jul-7/8 steep-credit run showed the reward alone cannot teach the 60-degree leg:
+    the policy never samples it (12h, zero steep pieces of its own), and the existing
+    steep seeds (p<=6, ~18-26 closed pieces) are too short to qualify at the P4 length
+    bar. Same racetrack geometry as generate_big_candidates -- the east leg (7+p tiles)
+    always returns the head to the dock column, so p alone stretches the loop:
+    skeleton = 2p+11(+1 tall), p in 13..16 -> 37-44 pieces + the ~3-piece closure tail
+    lands the closed loop at 40+. Families (both net-z 0):
+
+      * steep-60:      climb [10,9,9,9,9,13]   (+10 z, chain peak 9)  / [12,27,28,14]   (-10 z)
+      * steep-60 tall: climb [10,9,9,9,9,9,13] (+12 z, chain peak 11) / [12,27,28,6,14] (-12 z)
+    """
+    out = []
+    families = (
+        ([10, 9, 9, 9, 9, 13], [12, 27, 28, 14]),
+        ([10, 9, 9, 9, 9, 9, 13], [12, 27, 28, 6, 14]),
+    )
+    for t in (4, 3):
+        for climb, descent in families:
+            block = len(climb) + len(descent)
+            for p in range(13, 17):
+                east = 7 + p
+                for mid in (0, 3):
                     rest = east - block - mid
                     if rest < 0:
                         continue

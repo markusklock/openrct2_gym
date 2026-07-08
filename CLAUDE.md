@@ -87,6 +87,14 @@ This is a Gymnasium environment for training RL agents to build roller coasters 
   (gate release + struct + qualify). Watch `structure/steep_drop_z`. RULE: every leg of a
   phase's qualified gate needs its own ramp in the reward — conjunction-only legs don't get
   discovered once entropy tightens
+- **P4 steep scaffold (Jul-8)**: the credit alone still wasn't discovered (12h, zero
+  self-placed steep pieces — steep prefixes appeared only at their ~7% pool share via short
+  Phase-2-era seeds). The warm pool is now steep-aware: `LoopRecord.steep_drop_z` (derived
+  property, no schema migration), P4 pool criteria = the gate itself (`min_len=40,
+  min_steep_z=8`, any-steep fallback tier so the scaffold never turns off), plus
+  `build_loop_library.py --p4` seeding 40-44 piece verified steep loops
+  (`generate_p4_candidates`; 24 seeded live Jul-8). RULE: a rare gate skill needs
+  scaffold-side practice (reverse curriculum), not just reward-side visibility
 - Phase 5: Quality Optimization (80-120 pieces) - ramp+band quality bonus (every increment
   toward E8/I5.5 pays), no step cost, P5 exploration floor while median excitement < 4
 

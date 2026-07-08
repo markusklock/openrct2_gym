@@ -10,6 +10,7 @@ pre-close head states across real closures -- never trust paper-derived sequence
 Run once per map with a free instance (no training on the port):
     python build_loop_library.py --port 8080            # flat loops (Phase 1)
     python build_loop_library.py --port 8080 --hill     # chain-hill loops (Phase 2 pool)
+    python build_loop_library.py --port 8080 --p4       # 40+ piece steep loops (Phase 4 pool)
 """
 import argparse
 
@@ -17,7 +18,7 @@ from openrct2_gym.envs.api_controller import APIController
 from openrct2_gym.envs.api_track_builder import APITrackBuilder
 from openrct2_gym.envs.warm_start import (
     LoopLibrary, LoopRecord, generate_candidates, generate_hill_candidates,
-    generate_big_candidates,
+    generate_big_candidates, generate_p4_candidates,
 )
 
 STATION_START = (61, 66, 14)   # must match OpenRCT2Env.reset()
@@ -75,6 +76,9 @@ def main():
                         help="Seed chain-hill loop variants for the Phase-2 pool")
     parser.add_argument("--big", action="store_true",
                         help="Seed big tall/steep loop variants for the Phase-3/4 pool")
+    parser.add_argument("--p4", action="store_true",
+                        help="Seed qualifying-shaped steep 40+ piece loops for the Phase-4 "
+                             "pool (60-degree segment + >=6z chain at the P4 length bar)")
     parser.add_argument("--tail-max", type=int, default=16,
                         help="Max closure-walk straights after a candidate skeleton")
     args = parser.parse_args()
@@ -86,7 +90,9 @@ def main():
     library = LoopLibrary(args.library)
     print(f"📚 Library {args.library}: {len(library)} loops before seeding")
 
-    if args.big:
+    if args.p4:
+        candidates = generate_p4_candidates()
+    elif args.big:
         candidates = generate_big_candidates()
     elif args.hill:
         candidates = generate_hill_candidates()

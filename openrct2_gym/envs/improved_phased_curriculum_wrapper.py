@@ -651,17 +651,21 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
             return WarmStartPlan(prefix=[], k=0, loop_len=0, cold=True)
         self._loop_library.maybe_refresh()   # pick up other workers' harvested loops
         base_env = self._get_base_env()
-        min_chains, min_len, min_drop_z = 1, 0, 0
+        min_chains, min_len, min_drop_z, min_steep_z = 1, 0, 0, 0
         if self.current_phase == 2 and self.phase2_stage >= 3:
             min_chains = 3
         elif self.current_phase == 3:
             min_chains, min_len, min_drop_z = 2, 20, 4
         elif self.current_phase == 4:
-            min_chains, min_len, min_drop_z = 3, 25, 8
+            # Match the P4 gate: qualifying length AND a steep segment. min_len was 25
+            # (the P3 bar) which let non-steep 26-38 piece harvests dominate the pool
+            # while the 60-degree leg went unpracticed (Jul-8 run: 12h, zero own steep).
+            min_chains, min_len, min_drop_z, min_steep_z = 3, 40, 8, 8
         return self._annealer.sample_plan(
             self._loop_library, self.current_phase,
             getattr(base_env, 'max_track_length', 40),
-            min_chains=min_chains, min_len=min_len, min_drop_z=min_drop_z)
+            min_chains=min_chains, min_len=min_len, min_drop_z=min_drop_z,
+            min_steep_z=min_steep_z)
 
     def reset(self, **kwargs):
         """Reset environment and check for phase advancement"""

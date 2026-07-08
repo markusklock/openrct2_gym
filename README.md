@@ -189,6 +189,10 @@ All five phases share the **same reward and the same Φ**; they differ only in t
 Phases 1–4 are scaffolded by the warm-start reverse curriculum (each phase's pool prefers
 loops that can satisfy its own gate); Phase 5 always builds cold. Gate advancement counts
 **cold (unscaffolded) episodes only**, so a scaffolded win can never advance a phase.
+Phase 4's pool criteria match its gate exactly (length ≥40 **and** a steep 27/28 segment,
+with an any-steep fallback tier) and are fed by `build_loop_library.py --p4` seeds — 40+
+piece verified steep loops — because a rare skill that only appears at its pool share
+(~7%) never gets practiced enough to be learned.
 
 Circuit completion is whatever the game engine accepts via `isCircuitComplete` — there are no artificial restrictions on which piece may close the loop. Height, flatness, and heading near the station are handled smoothly by Φ's alignment terms rather than by hard rules.
 
