@@ -917,6 +917,48 @@ def test_callback_logs_quality_and_structure_tags():
     assert list(cb._exc_window) == [pytest.approx(3.2)]
 
 
+def test_callback_logs_p5_quality_economics_tags():
+    """The Jul-9 P5 redesign's causal chain must be observable: gate/milestones/caps
+    bonuses, the static excitement features, the measured cap stats, and the
+    self-imitation ratchet bar all stream to TB."""
+    from types import SimpleNamespace
+    cb = T.ParallelCurriculumMaskableCallback(n_envs=1)
+    cb.model = SimpleNamespace(target_kl=None, ent_coef=0.01, get_env=lambda: None)
+    store = {}
+    cb.model.logger = SimpleNamespace(
+        name_to_value={}, record=lambda k, v, *a, **kw: store.__setitem__(k, v))
+    cb.locals = {
+        'dones': [True],
+        'infos': [{'loop_completed': True, 'cold_start': True, 'learning_phase': 5,
+                   'ride_rating': {'excitement': 4.5, 'intensity': 4.0, 'nausea': 1.5},
+                   'track_length': 44, 'current_distance': 0.0, 'collision_count': 0,
+                   'p5_pool_exc_bar': 2.0, 'library_best_excitement': 2.5,
+                   'episode_metrics': {
+                       'track_length': 44, 'min_distance': 0.0, 'test_ok': True,
+                       'exc_milestone_bonus': 200.0, 'caps_bonus': 125.0,
+                       'exc_feat_potential': 3.1, 'single_drop_z': 12.0,
+                       'drop_runs': 2.0, 'banked_turns': 3.0, 'turn_count': 7.0,
+                       'meas_num_drops': 3.0, 'meas_highest_drop': 14.0,
+                       'meas_max_speed': 24.0, 'meas_ride_length': 380.0,
+                       'meas_air_time': 1.1, 'meas_neg_g': -0.1,
+                       'meas_available': 1.0}}],
+    }
+    cb._on_step()
+    assert store['rewards/exc_milestone_bonus'] == pytest.approx(200.0)
+    assert store['rewards/caps_bonus'] == pytest.approx(125.0)
+    assert store['rewards/exc_feat_potential'] == pytest.approx(3.1)
+    assert store['structure/single_drop_z'] == pytest.approx(12.0)
+    assert store['structure/drop_runs'] == pytest.approx(2.0)
+    assert store['structure/banked_turns'] == pytest.approx(3.0)
+    assert store['structure/turn_count'] == pytest.approx(7.0)
+    assert store['structure/meas_highest_drop'] == pytest.approx(14.0)
+    assert store['structure/meas_ride_length'] == pytest.approx(380.0)
+    assert store['structure/meas_neg_g'] == pytest.approx(-0.1)
+    assert store['quality/measured_available'] == pytest.approx(1.0)
+    assert store['curriculum/p5_pool_exc_bar'] == pytest.approx(2.0)
+    assert store['curriculum/library_best_excitement'] == pytest.approx(2.5)
+
+
 def test_quality_tags_ignored_before_phase4():
     """Phases 1-3 skip ride testing; their all-zero ride_rating sentinels must not pollute
     the test-success or excitement windows."""

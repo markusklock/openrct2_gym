@@ -108,3 +108,19 @@ def test_set_game_speed_request_shape():
     resp = ctrl.set_game_speed(8)
     assert resp["success"] is True
     assert sent[0] == {"endpoint": "setGameSpeed", "params": {"speed": 8}}
+
+
+def test_get_ride_measurements_request_shape():
+    import json as _json
+    ok = _json.dumps({"success": True, "payload": {"numDrops": 3}}) + "\n"
+    ctrl = _controller([[ok]])
+    ctrl.ride_id = 7
+    sent = []
+    ctrl.sock.sendall = lambda data: sent.append(_json.loads(data.decode()))
+    resp = ctrl.get_ride_measurements()
+    assert resp["success"] is True
+    assert sent[0] == {"endpoint": "getRideMeasurements", "params": {"rideId": 7}}
+    # no ride yet -> honest failure, no request
+    ctrl2 = _controller([[ok]])
+    ctrl2.ride_id = None
+    assert ctrl2.get_ride_measurements()["success"] is False

@@ -366,3 +366,20 @@ class APIController:
             }
         }
         return self.send_request(req)
+
+    def get_ride_measurements(self):
+        """Test-run measurements (speeds, drops, G's, air time, measured length) via the
+        plugin's getRideMeasurements endpoint. Best-effort: an older plugin answers
+        'Unknown endpoint' (success False) and callers must treat that as unavailable --
+        the measured-caps bonus then degrades to 0 while everything else runs on
+        getRideStats alone."""
+        if self.ride_id is None:
+            return {"success": False, "error": "No ride created"}
+
+        req = {
+            "endpoint": "getRideMeasurements",
+            "params": {
+                "rideId": self.ride_id
+            }
+        }
+        return self.send_request(req)

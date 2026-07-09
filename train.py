@@ -571,6 +571,9 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
                     'warm_frontier_rate',
                     'warm_prefix_len',
                     'loop_library_size',
+                    # P5 self-imitation ratchet diagnostics
+                    'p5_pool_exc_bar',
+                    'library_best_excitement',
                 ):
                     if key in _info:
                         self.logger.record(f'curriculum/{key}', _info[key])
@@ -599,6 +602,26 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
                             self.logger.record('rewards/completion_gate', info_metrics['completion_gate'])
                         if 'qualify_bonus' in info_metrics:
                             self.logger.record('rewards/qualify_bonus', info_metrics['qualify_bonus'])
+                        # P5 quality-economics diagnostics: the excitement gate/milestones/
+                        # caps paying is the causal chain out of the E=1.15 plateau
+                        for _mk, _tag in (
+                            ('exc_milestone_bonus', 'rewards/exc_milestone_bonus'),
+                            ('caps_bonus', 'rewards/caps_bonus'),
+                            ('exc_feat_potential', 'rewards/exc_feat_potential'),
+                            ('single_drop_z', 'structure/single_drop_z'),
+                            ('drop_runs', 'structure/drop_runs'),
+                            ('banked_turns', 'structure/banked_turns'),
+                            ('turn_count', 'structure/turn_count'),
+                            ('meas_num_drops', 'structure/meas_num_drops'),
+                            ('meas_highest_drop', 'structure/meas_highest_drop'),
+                            ('meas_max_speed', 'structure/meas_max_speed'),
+                            ('meas_ride_length', 'structure/meas_ride_length'),
+                            ('meas_air_time', 'structure/meas_air_time'),
+                            ('meas_neg_g', 'structure/meas_neg_g'),
+                            ('meas_available', 'quality/measured_available'),
+                        ):
+                            if _mk in info_metrics:
+                                self.logger.record(_tag, info_metrics[_mk])
                         if 'max_gain' in info_metrics:
                             self.logger.record('height/max_gain', info_metrics['max_gain'])
                         if 'roundtrip' in info_metrics:

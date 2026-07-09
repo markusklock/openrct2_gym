@@ -141,21 +141,28 @@ reward = F + sparse terms,    where   F = γ·Φ(s′) − Φ(s)
 
 ### Sparse objectives (the real goals)
 
-- **Circuit completion: +1000, gated** — the dominant signal. Completion always strictly outweighs all accumulated shaping, so the agent is *completion-first*. In the hill phases a flat loop earns only a fraction (the hill gate), and in P3/P4 a **length gate** multiplies in on top (floor 0.25, ramping to full pay at the phase's length target). The length gate must be multiplicative: an additive per-piece credit (~+2/piece) loses to γ-discounting the completion payout (~−10/piece), which is exactly how a Jul-5 run converged onto an 18-piece mini-loop and pinned Phase 3's qualified rate at 0.
-- **Structural bonus (phases 2-4): 0–250, completion-conditioned** — graded credit for chain
+- **Circuit completion: +1000, gated** — the dominant signal. Completion always strictly outweighs all accumulated shaping, so the agent is *completion-first*. In the hill phases a flat loop earns only a fraction (the hill gate), in P3/P4 a **length gate** multiplies in on top (floor 0.25, ramping to full pay at the phase's length target), and in P5 an **excitement gate** (floor 0.4 paid at close; the remainder ramps with the MEASURED rating toward E=6, paid post-test in the same terminal step — arithmetically identical to a multiplicative gate). Gates must be multiplicative: an additive per-piece credit (~+2/piece) loses to γ-discounting the completion payout (~−10/piece), which is exactly how a Jul-5 run converged onto an 18-piece mini-loop and pinned Phase 3's qualified rate at 0.
+- **Structural bonus (phases 2-5): 0–250, completion-conditioned** — graded credit for chain
   count/height, total drop-z, steep-dropped z (P4: the 60° family, one 8z segment for full
-  credit), and completed length toward per-phase targets. All components are ramps (partial
-  progress pays); chain credit is elevation-scaled so chain-stub decoration on a flat loop
-  cannot pay as a lift hill. Every leg of a phase's qualified gate must appear here as a
-  ramp — a leg visible only inside the qualification conjunction has no gradient and is
-  never discovered once entropy tightens (the P4 steep-drop leg went 9h without a single
-  60° piece until it was graded in).
+  credit), and completed length toward per-phase targets. P5 re-aims it at the game's
+  wooden-RC **rating caps** (highest single drop ≥12z, ≥2 drop runs, length, banked turns).
+  All components are ramps (partial progress pays); chain credit is elevation-scaled so
+  chain-stub decoration on a flat loop cannot pay as a lift hill. Every leg of a phase's
+  qualified gate must appear here as a ramp — a leg visible only inside the qualification
+  conjunction has no gradient and is never discovered once entropy tightens (the P4
+  steep-drop leg went 9h without a single 60° piece until it was graded in).
 - **Verified viability (phase 4+): +150, completion-conditioned** — paid only when the ride
   test returns real stats, i.e. the train demonstrably made it all the way around.
 - **Qualification bonus (phases 3-4): +200, completion-conditioned** — paid when the episode
   meets the phase's full qualified-gate predicate (P3: struct targets + energy proxy; P4:
   + steep segment + verified test). The advancement gate itself is a paid event, so
   reward-max and curriculum progress point the same way.
+- **Excitement milestones (phase 5): +100 per bar at E ≥ 2.5 / 4.0 / 5.5** — discrete paid
+  events on the way to the E7–9 band (the phase-2 staging pattern applied to quality), and
+  a **measured-caps bonus (0–250)** graded on the real test-run measurements
+  (`getRideMeasurements` plugin endpoint: highest drop, drop count, max speed, negative-G
+  airtime, measured length — the exact quantities whose caps each halve the game's
+  ratings). Degrades to 0 gracefully on an old plugin.
 - **Ride quality (phase 5): 0–500** — ramp+band per stat: half the credit ramps monotonically
   toward the target (every increment pays), half peaks at it (Excitement ≈ 8, Intensity ≈ 5.5,
   low Nausea). Applied only on a completed, ride-tested circuit, so a finished ride is never punished.
@@ -184,15 +191,20 @@ All five phases share the **same reward and the same Φ**; they differ only in t
 | 2 | Lift Hill Building | 40 | staged chain-lift bridge | 2.1 one-chain roundtrip, 2.2 one-chain completion, 2.3 three-chain completion |
 | 3 | Real Drops & Scale | 60 | chain height ≥4z, drops ≥4z, length ≥25, energy-viable | 35% qualified |
 | 4 | Big & Verified | 80 | height ≥6z, drops ≥8z incl. a 60° segment, length ≥40, **ride-test verified** | 30% qualified |
-| 5 | Quality Optimization | 80–120 | quality bonus only (no step cost) | progressive length |
+| 5 | Quality Optimization | 80–120 | excitement-gated completion, cap-aligned struct credit, milestone bars, measured-caps bonus, excitement-feature Φ (no step cost) | progressive length |
 
-Phases 1–4 are scaffolded by the warm-start reverse curriculum (each phase's pool prefers
-loops that can satisfy its own gate); Phase 5 always builds cold. Gate advancement counts
-**cold (unscaffolded) episodes only**, so a scaffolded win can never advance a phase.
+Phases 1–**5** are scaffolded by the warm-start reverse curriculum (each phase's pool prefers
+loops that can satisfy its own gate). Gate advancement counts **cold (unscaffolded)
+episodes only**, so a scaffolded win can never advance a phase.
 Phase 4's pool criteria match its gate exactly (length ≥40 **and** a steep 27/28 segment,
 with an any-steep fallback tier) and are fed by `build_loop_library.py --p4` seeds — 40+
 piece verified steep loops — because a rare skill that only appears at its pool share
 (~7%) never gets practiced enough to be learned.
+Phase 5 scaffolds from **excitement-tagged exemplars** (harvests run post-ride-test and
+carry the measured excitement; a re-completion rated strictly higher upgrades its record):
+the pool bar self-ratchets at 0.8 × the best tagged excitement fitting the budget, with an
+any-excited fallback tier — the agent's own best builds become tomorrow's scaffolds, so
+quality climbs the same reverse-curriculum ladder that solved loops, hills, and steepness.
 
 Circuit completion is whatever the game engine accepts via `isCircuitComplete` — there are no artificial restrictions on which piece may close the loop. Height, flatness, and heading near the station are handled smoothly by Φ's alignment terms rather than by hard rules.
 
@@ -255,6 +267,14 @@ The training scripts provide extensive metrics in Tensorboard:
   steep-drop leg (9h in-phase without one 60° piece placed) is graded into the structure
   credit. Diagnosed via `rewards/completion_gate`, `rewards/qualify_bonus`,
   `structure/steep_drop_z` in TensorBoard
+- **Phase-5 quality unlock (Jul-9)**: the E=1.15 plateau traced to the game's five wooden-RC
+  rating caps (verified in the OpenRCT2 source — each missed cap halves all ratings; the
+  24-piece mini-loop missed 4–5). The completion payout is now excitement-gated (floor 0.4,
+  remainder ramps with the measured rating), struct credit ramps the caps themselves,
+  discrete milestone bars pay every excitement increment, a `getRideMeasurements` plugin
+  endpoint (v0.3) feeds a graded bonus on the real measured stats, a dense excitement-feature
+  Φ term gives per-piece gradient, and Phase 5 joins the reverse curriculum via
+  excitement-tagged self-imitation scaffolds. Calibration: `probe_measurements.py`
 - **Quality ramp**: the Phase-5 excitement/intensity bonus pays partial progress instead of
   being a dead band (two runs plateaued at the identical nausea-only score before this)
 - **Progress-conditional exploration**: entropy floors hold exploration up exactly while a

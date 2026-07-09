@@ -95,8 +95,30 @@ This is a Gymnasium environment for training RL agents to build roller coasters 
   `build_loop_library.py --p4` seeding 40-44 piece verified steep loops
   (`generate_p4_candidates`; 24 seeded live Jul-8). RULE: a rare gate skill needs
   scaffold-side practice (reverse curriculum), not just reward-side visibility
+- **P5 quality unlock (Jul-9)**: P4 solved, then P5 plateaued at E=1.15 on a 24-piece loop
+  (ungated completion, third occurrence of the trap). Root cause verified in the game
+  source: FIVE wooden-RC rating caps each HALVE all ratings when missed (single drop >=12z,
+  >=2 drops, speed >=~22mph, a negative-G moment, ~370m measured length) — the mini-loop
+  missed 4-5 (÷16-32 ≈ the observed 1.15). Redesign, all diagnosed in TB:
+  (a) completion quality gate: `completion_quality_floor=0.4` paid at close, remainder
+  ramps with MEASURED excitement to `exc_gate_target=6` (paid post-test, same terminal
+  step ⇒ exactly multiplicative); (b) P5 struct credit re-aimed at the caps
+  (`struct_w_single_drop/.30@12z, drop_runs/.20@2, drop/.15@16, length/.20@60, banked/.15@4`);
+  (c) `R_exc_milestone=100 @ (2.5,4.0,5.5)` bars + kept `R_viable=150`;
+  (d) `R_caps_max=250` graded on REAL measurements via the plugin's new
+  `getRideMeasurements` (v0.3; degrades to 0 on an old plugin); (e) `w_exc_feat=6` dense
+  per-piece Phi over static excitement features (turns/banked/drop-runs/single-drop/length);
+  (f) **P5 warm-start scaffolding** with excitement-tagged records (harvest moved
+  POST-test; `LoopRecord.excitement`; upgrade-append dedup keeps the best-rated variant)
+  and a self-ratcheting pool bar (`0.8 × best_excitement(budget)`, any-excited fallback
+  tier). Harvest cap now follows the phase budget (fixes the silent P4 >40-piece harvest
+  hole). Calibrate/validate with `probe_measurements.py` (m/piece + per-cap verdicts;
+  the mini-loop should reproduce E≈1.15 with 4-5 caps failing)
 - Phase 5: Quality Optimization (80-120 pieces) - ramp+band quality bonus (every increment
-  toward E8/I5.5 pays), no step cost, P5 exploration floor while median excitement < 4
+  toward E8/I5.5 pays), no step cost, P5 exploration floor while median excitement < 4;
+  since Jul-9 also: excitement-gated completion, cap-aligned struct credit, milestone bars,
+  measured-caps bonus, excitement-feature Phi, and self-imitation scaffolding (see the
+  P5 quality unlock bullet below)
 
 **openrct2_gym/envs/api_track_builder.py**: Manages track construction logic
 - Translates discrete actions to API calls

@@ -182,6 +182,149 @@ def test_generate_p4_candidates_are_qualifying_shaped():
         assert chain_peak >= 6                             # P4 height target reachable
 
 
+# ---------------------------------------- excitement-tagged records (P5 self-imitation)
+# P5 plateaued at E=1.15: quality was invisible to the scaffold because records carry no
+# measured rating and the harvest ran BEFORE the ride test. Records now carry excitement,
+# harvests run post-test, and a duplicate sequence with a strictly higher measured E
+# upgrades the stored record (append + last-line-wins on load).
+
+def test_loop_record_excitement_roundtrips_and_defaults_legacy(tmp_path):
+    lib = LoopLibrary(str(tmp_path / "lib.jsonl"))
+    assert lib.add(LoopRecord.from_actions(FLAT, source="harvest", excitement=3.4))
+    reloaded = LoopLibrary(lib.path)
+    assert reloaded._records[tuple(FLAT)].excitement == pytest.approx(3.4)
+    with open(lib.path, "a") as f:                      # legacy line: no excitement key
+        f.write(json.dumps({"actions": FLAT_L, "source": "harvest", "max_gain": 0.0}) + "\n")
+    reloaded2 = LoopLibrary(lib.path)
+    assert reloaded2._records[tuple(FLAT_L)].excitement == 0.0
+
+
+# climb to +13 via chains, one continuous 12z drop (12,27,28,6,14), padded past the P5
+# pool's min_len=40 -- a "qualifying-shaped, excitement-taggable" P5 exemplar skeleton
+BIG_EXCITING = [4, 4, 10, 9, 9, 9, 9, 9, 9, 13] + [12, 27, 28, 6, 14] + [0] * 23 + [4, 4, 0]
+
+
+def test_pool_prefers_excited_records_with_fallback(tmp_path):
+    lib = _lib(tmp_path)
+    lib.add(LoopRecord.from_actions(BIG_EXCITING, "harvest", excitement=5.0))
+    lib.add(LoopRecord.from_actions(BIG_STEEP, "harvest"))              # untagged
+    lib.add(LoopRecord.from_actions(STEEP_SMALL, "harvest", excitement=4.5))
+    best = lib.pool(phase=5, max_len=80, min_chains=1, min_len=40, min_drop_z=12,
+                    min_single_drop_z=12, min_excitement=4.0)
+    assert [r.actions for r in best] == [tuple(BIG_EXCITING)]
+    # no full-criteria record -> ANY excitement-tagged loop, never the untagged big one
+    lib2 = _lib(tmp_path.joinpath("l2"), [BIG_STEEP])
+    lib2.add(LoopRecord.from_actions(STEEP_SMALL, "harvest", excitement=4.5))
+    tier2 = lib2.pool(phase=5, max_len=80, min_chains=1, min_len=40, min_drop_z=12,
+                      min_single_drop_z=12, min_excitement=4.0)
+    assert [r.actions for r in tier2] == [tuple(STEEP_SMALL)]
+    # nothing excited anywhere -> chained fallback keeps the scaffold alive
+    lib3 = _lib(tmp_path.joinpath("l3"), [BIG_STEEP])
+    tier3 = lib3.pool(phase=5, max_len=80, min_chains=1, min_len=40, min_drop_z=12,
+                      min_single_drop_z=12, min_excitement=4.0)
+    assert [r.actions for r in tier3] == [tuple(BIG_STEEP)]
+
+
+def test_best_excitement_respects_budget(tmp_path):
+    lib = _lib(tmp_path)
+    assert lib.best_excitement(80) == 0.0                               # empty -> 0
+    lib.add(LoopRecord.from_actions(STEEP_SMALL, "harvest", excitement=2.0))    # len 16
+    lib.add(LoopRecord.from_actions(BIG_EXCITING, "harvest", excitement=5.0))   # len 43
+    assert lib.best_excitement(80) == pytest.approx(5.0)
+    assert lib.best_excitement(40) == pytest.approx(2.0)                # big one over budget
+    untagged = _lib(tmp_path.joinpath("u"), [FLAT])
+    assert untagged.best_excitement(80) == 0.0
+
+
+def test_p5_substage_advance_reanneals(monkeypatch, tmp_path):
+    """Each P5 length rung changes the pool (bigger budget) -- the annealer restarts
+    like on any phase change (the _advance_phase2_stage precedent)."""
+    wrapper, _ = _wrapped(monkeypatch, tmp_path, p_cold=0.0)
+    wrapper.current_phase = 5
+    wrapper._update_phase_settings()
+    wrapper._track_stats = True
+    wrapper.phase_episode_count = 60
+    wrapper.episode_results.extend([True] * 50)
+    wrapper._annealer.k_max = 11
+    wrapper._annealer.frontier.append(True)
+    assert wrapper.phase5_current_length < wrapper.phase5_target_length
+    assert wrapper._check_phase_advancement() is True                   # rung 80 -> 90
+    assert wrapper._annealer.k_max == wrapper._annealer.k_init
+    assert len(wrapper._annealer.frontier) == 0
+
+
+def test_loop_record_max_single_drop_property():
+    """Derived from the action list (like steep_drop_z), so legacy entries get it too:
+    a consecutive drop-family run sums; anything else breaks the run."""
+    rec = LoopRecord.from_actions([4, 4, 10, 9, 12, 27, 28, 14, 5, 6, 0], "scripted")
+    assert rec.max_single_drop_z == pytest.approx(10.0)      # 12,27,28,14 -> 1+4+4+1
+    assert LoopRecord.from_actions([0, 3, 3], "scripted").max_single_drop_z == 0.0
+
+
+def test_library_add_upgrades_excitement_on_dup(tmp_path):
+    lib = _lib(tmp_path)
+    assert lib.add(LoopRecord.from_actions(FLAT, "harvest", excitement=0.0)) is True
+    assert lib.add(LoopRecord.from_actions(FLAT, "harvest", excitement=2.0)) is True
+    assert lib.add(LoopRecord.from_actions(FLAT, "harvest", excitement=1.0)) is False
+    assert lib.add(LoopRecord.from_actions(FLAT, "harvest", excitement=2.0)) is False
+    assert LoopLibrary(lib.path)._records[tuple(FLAT)].excitement == pytest.approx(2.0)
+
+
+def test_harvest_carries_measured_excitement_and_runs_post_test(monkeypatch):
+    """The harvested record carries the MEASURED excitement (CompletingAPI serves 8.0),
+    and the harvest call happens after the ride-test verdict is settled."""
+    monkeypatch.setattr(oe_mod, "APIController", CompletingAPI)
+    seen = {}
+    orig = OpenRCT2Env._harvest_completed_loop
+
+    def spy(self, excitement=0.0):
+        seen['test_ok_at_harvest'] = self._last_test_ok
+        seen['excitement'] = excitement
+        return orig(self, excitement=excitement)
+
+    monkeypatch.setattr(OpenRCT2Env, "_harvest_completed_loop", spy)
+    env = OpenRCT2Env(verbose=0)
+    env.skip_ride_testing = False
+    env.reset()
+    for _ in range(12):
+        _, _, terminated, truncated, _ = env.step(0)
+        if terminated or truncated:
+            break
+    assert terminated
+    assert seen['test_ok_at_harvest'] is True
+    assert seen['excitement'] == pytest.approx(8.0)
+    lib = LoopLibrary(OpenRCT2Env._LOOP_LIBRARY_PATH)
+    recs = list(lib._records.values())
+    assert len(recs) == 1 and recs[0].excitement == pytest.approx(8.0)
+
+
+def test_harvest_untested_completion_tags_zero(monkeypatch):
+    monkeypatch.setattr(oe_mod, "APIController", CompletingAPI)
+    env = OpenRCT2Env(verbose=0)
+    env.skip_ride_testing = True
+    env.reset()
+    for _ in range(12):
+        _, _, terminated, truncated, _ = env.step(0)
+        if terminated or truncated:
+            break
+    assert terminated
+    recs = list(LoopLibrary(OpenRCT2Env._LOOP_LIBRARY_PATH)._records.values())
+    assert len(recs) == 1 and recs[0].excitement == 0.0
+
+
+def test_harvest_cap_follows_phase_budget(monkeypatch):
+    monkeypatch.setattr(oe_mod, "APIController", FakeAPI)
+    base = OpenRCT2Env(verbose=0)
+    wrapper = ImprovedPhasedCurriculumWrapper(base, verbose=0)
+    for phase, expect in ((1, 40), (2, 40), (3, 60), (4, 80)):
+        wrapper.current_phase = phase
+        wrapper._update_phase_settings()
+        assert base.harvest_max_len == expect, f"phase {phase}"
+    wrapper.current_phase = 5
+    wrapper._update_phase_settings()
+    assert base.harvest_max_len == wrapper.phase5_current_length
+
+
 def test_library_maybe_refresh_picks_up_other_workers_appends(tmp_path):
     lib = _lib(tmp_path, [FLAT])
     other = LoopLibrary(lib.path)                               # simulates another worker
@@ -752,9 +895,11 @@ def test_wrapper_evaluation_mode_forces_cold(monkeypatch, tmp_path):
     assert wrapper._current_plan.cold is False                      # training resumes scaffolded
 
 
-def test_wrapper_warm_starts_through_phase4_cold_in_phase5(monkeypatch, tmp_path):
-    """Scale-up redesign: the scaffold now covers every discovery cliff (phases 1-4);
-    phase 5 (quality) builds cold. P3/P4 request their gate-matching pool criteria."""
+def test_wrapper_warm_starts_all_phases_with_p5_exc_ratchet(monkeypatch, tmp_path):
+    """The scaffold covers every discovery cliff, now INCLUDING phase 5 (Jul-9: the
+    quality plateau was a discovery problem too). P3/P4 request their gate-matching
+    criteria; P5 requests exemplar-shaped loops with a self-ratcheting excitement bar
+    (0.8 x the best tagged excitement fitting the budget; 0 on a legacy-only pool)."""
     wrapper, base = _wrapped(monkeypatch, tmp_path, p_cold=0.0)
     seen = []
     orig = wrapper._annealer.sample_plan
@@ -769,18 +914,33 @@ def test_wrapper_warm_starts_through_phase4_cold_in_phase5(monkeypatch, tmp_path
     wrapper.reset()
     assert wrapper._current_plan.cold is False                      # P3 scaffolds now
     assert seen[-1] == (3, {'min_chains': 2, 'min_len': 20, 'min_drop_z': 4,
-                            'min_steep_z': 0})
+                            'min_steep_z': 0, 'min_single_drop_z': 0,
+                            'min_excitement': 0.0})
     wrapper.current_phase = 4
     wrapper._update_phase_settings()
     wrapper.reset()
     # Jul-8: P4 criteria raised to the gate itself (len 40, steep 8) so scaffold
     # prefixes are qualifying-shaped instead of recycled P3 material.
     assert seen[-1] == (4, {'min_chains': 3, 'min_len': 40, 'min_drop_z': 8,
-                            'min_steep_z': 8})
+                            'min_steep_z': 8, 'min_single_drop_z': 0,
+                            'min_excitement': 0.0})
     wrapper.current_phase = 5
     wrapper._update_phase_settings()
     wrapper.reset()
-    assert wrapper._current_plan.cold is True                       # quality phase builds cold
+    assert wrapper._current_plan.cold is False                      # P5 scaffolds now
+    phase, kw = seen[-1]
+    assert phase == 5
+    assert (kw['min_chains'], kw['min_len'], kw['min_drop_z'],
+            kw['min_single_drop_z']) == (1, 40, 12, 12)
+    assert kw['min_excitement'] == 0.0                              # legacy-only pool -> bar 0
+    # the ratchet: a tagged exemplar raises the bar to 0.8 x best-within-budget
+    wrapper._loop_library.add(
+        LoopRecord.from_actions(BIG_EXCITING, "harvest", excitement=5.0))
+    wrapper.reset()
+    assert seen[-1][1]['min_excitement'] == pytest.approx(4.0)
+    # phases past the curriculum build cold (guard only -- phase 6 has no full machinery)
+    wrapper.current_phase = 6
+    assert wrapper._sample_warm_start().cold is True
 
 
 def test_phase_gate_counts_only_cold_episodes(monkeypatch, tmp_path):

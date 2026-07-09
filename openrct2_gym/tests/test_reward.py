@@ -601,6 +601,10 @@ class CompletingAPI(FakeAPI):
         return {"success": True, "payload": {
             "excitement": self.excitement, "intensity": self.intensity, "nausea": self.nausea}}
 
+    def get_ride_measurements(self):
+        # models an OLD plugin (endpoint not deployed); MeasuredAPI overrides with data
+        return {"success": False, "error": "Unknown endpoint: getRideMeasurements"}
+
 
 def _drive_to_terminal(env, max_steps=12):
     phi_prev_before, reward, info = None, None, {}
@@ -685,7 +689,9 @@ def test_phase_reward_params_structural_per_phase():
     assert (p4.R_struct_max, p4.struct_w_chain, p4.struct_w_height, p4.struct_w_drop,
             p4.struct_w_length) == (250.0, 0.0, 0.3, 0.3, 0.2)
     p5 = W._phase_reward_params(5)
-    assert p5.R_struct_max == 0.0 and p5.R_quality_max == 500.0   # struct off, quality on
+    # Jul-9: P5 struct credit is back ON, re-aimed at the wooden-RC rating caps (see
+    # test_p5_params_pay_the_quality_gate for the full P5 economics spec).
+    assert p5.R_struct_max == 250.0 and p5.R_quality_max == 500.0
     # discovery potential: ON only in the hill-building phases 2-4; OFF in the
     # pure-completion phase 1 and the quality phase 5 (an always-on climb pull derails
     # Phase-1 completion learning). w_h=3 (not 6): a 1M-step run showed the deeper
@@ -728,10 +734,13 @@ def test_discovery_potential_off_in_phase1_and_5_on_in_phase2():
     phi_p2 = env._potential(W._phase_reward_params(2))   # discovery ON
     phi_p5 = env._potential(W._phase_reward_params(5))   # discovery OFF
     assert phi_p2 > phi_p1 + 1.0                         # P2 gains the banked-elevation term
-    # P5 has no discovery pull either; it differs from P1 only by the route term (on in the
-    # completion phases 1-4, off in phase 5).
+    # P5 has no discovery pull either; it differs from P1 by the route term (on in the
+    # completion phases 1-4, off in phase 5) and -- since the Jul-9 quality redesign --
+    # by the excitement-feature term (P5's own dense gradient).
+    p5 = W._phase_reward_params(5)
     route = W._phase_reward_params(1).w_route * env._route_progress()
-    assert phi_p5 == pytest.approx(phi_p1 - route)
+    exc_feat = p5.w_exc_feat * env._exc_feature_quality(p5)
+    assert phi_p5 == pytest.approx(phi_p1 - route + exc_feat)
 
 
 # ---- structural bonus
@@ -1651,7 +1660,9 @@ def test_p2_qualified_stage_predicates():
     assert w._is_qualified(base([9, 9, 9]), True) is True      # P2.3: >=3 chains
     assert w._is_qualified(base([9, 9]), True) is False
     w.current_phase = 5
-    assert w._is_qualified(base([9, 9, 6]), True) is None     # P5: no structural gate
+    # P5 (Jul-9): now a quality diagnostic -- this fake base env is untested, so False
+    # (the full P5 truth table lives in test_p5_qualified_is_tested_excitement_diagnostic)
+    assert w._is_qualified(base([9, 9, 6]), True) is False
 
 
 def test_phase2_summit_signal_tracks_chain_climb():
@@ -1758,8 +1769,11 @@ def test_no_terminal_double_count_through_wrapper(monkeypatch):
     quality = base_env._quality_bonus(rr['excitement'], rr['intensity'], rr['nausea'], p)
     assert quality > 0
     # completion + quality counted EXACTLY once (env owns both; wrapper adds nothing).
-    # phase 5 also applies the small step_cost on the completing step.
-    assert reward == pytest.approx(p.R_complete - phi_prev_before + quality + p.step_cost)
+    # Jul-9 P5 economics: E=8 fully releases the quality gate (full R_complete), and the
+    # terminal step also pays R_viable, all three milestone bars, and the struct credit.
+    assert reward == pytest.approx(
+        p.R_complete - phi_prev_before + quality + p.step_cost
+        + p.R_viable + 3 * p.R_exc_milestone + base_env._last_struct_bonus)
 
 
 # ----------------------------------------------------- gamma single source (test 9)
@@ -2534,6 +2548,323 @@ def test_p4_extending_to_target_beats_min_loop():
     extend = (P4.gamma ** 10) * _completion_payout(P4, length=40, chain_peak=25,
                                                    steep=True, test_ok=True)
     assert extend > stay + 100.0
+
+
+# --------------------------- P5 economics: quality-gated completion + milestones
+# P5 converged onto a 24-piece E=1.15 loop: completion paid 1000 ungated while the five
+# wooden-RC rating caps (single drop >=12z, >=2 drops, speed, airtime, ~370m) were
+# reward-invisible. The gate splits completion pay: a floor at close, the remainder
+# ramping with MEASURED excitement (paid post-test in the same terminal step); struct
+# credit gains cap-aligned components; discrete milestone bars pay E crossings.
+
+class ExcitedAPI(CompletingAPI):
+    excitement = 3.0
+    intensity = 2.0
+    nausea = 1.0
+
+
+class MildlyExcitedAPI(CompletingAPI):
+    excitement = 4.5
+    intensity = 3.0
+    nausea = 1.0
+
+
+def test_p5_economics_fields_default_inert():
+    p = RewardParams()
+    assert p.completion_quality_floor == 1.0
+    assert p.exc_gate_target == 6.0
+    assert (p.struct_w_single_drop, p.struct_single_drop_target) == (0.0, 12.0)
+    assert (p.struct_w_drop_runs, p.struct_drop_runs_target) == (0.0, 2.0)
+    assert (p.struct_w_banked, p.struct_banked_target) == (0.0, 4.0)
+    assert p.R_exc_milestone == 0.0 and p.exc_milestone_bars == ()
+
+
+def test_quality_gated_completion_splits_floor_and_ramp(monkeypatch):
+    """floor*R_complete at close; the remainder releases with measured excitement:
+    full at E>=exc_gate_target, proportional below, nothing when untested."""
+    params = replace(RewardParams(), completion_quality_floor=0.4, exc_gate_target=6.0,
+                     roundtrip_gain=0.0)
+
+    def run(api, skip):
+        monkeypatch.setattr(oe_mod, "APIController", api)
+        env = OpenRCT2Env(verbose=0)
+        env.skip_ride_testing = skip
+        env.reward_params = params
+        env.reset()
+        return env, _drive_to_terminal(env)
+
+    env, (phi0, reward, terminated, _, info) = run(CompletingAPI, skip=False)   # E=8 -> full
+    assert terminated
+    quality = env._quality_bonus(8.0, 5.5, 1.0, params)
+    assert reward == pytest.approx(params.R_complete - phi0 + quality)
+    assert info['episode_metrics']['completion_gate'] == pytest.approx(1.0)
+
+    env, (phi0, reward, terminated, _, info) = run(ExcitedAPI, skip=False)      # E=3 -> half ramp
+    assert terminated
+    quality = env._quality_bonus(3.0, 2.0, 1.0, params)
+    gate = 0.4 + 0.6 * (3.0 / 6.0)
+    assert reward == pytest.approx(params.R_complete * gate - phi0 + quality)
+    assert info['episode_metrics']['completion_gate'] == pytest.approx(gate)
+
+    env, (phi0, reward, terminated, _, info) = run(CompletingAPI, skip=True)    # untested -> floor
+    assert terminated
+    assert reward == pytest.approx(0.4 * params.R_complete - phi0)
+    assert info['episode_metrics']['completion_gate'] == pytest.approx(0.4)
+
+
+def test_exc_milestones_pay_staged_bars(monkeypatch):
+    params = replace(RewardParams(), R_exc_milestone=100.0,
+                     exc_milestone_bars=(2.5, 4.0, 5.5), roundtrip_gain=0.0)
+
+    def run(api, skip=False):
+        monkeypatch.setattr(oe_mod, "APIController", api)
+        env = OpenRCT2Env(verbose=0)
+        env.skip_ride_testing = skip
+        env.reward_params = params
+        env.reset()
+        phi0, reward, terminated, _, info = _drive_to_terminal(env)
+        assert terminated
+        return env, phi0, reward, info
+
+    env, phi0, reward, info = run(MildlyExcitedAPI)                 # E=4.5 -> bars 2.5, 4.0
+    quality = env._quality_bonus(4.5, 3.0, 1.0, params)
+    assert reward == pytest.approx(params.R_complete - phi0 + quality + 200.0)
+    assert info['episode_metrics']['exc_milestone_bonus'] == pytest.approx(200.0)
+    env, phi0, reward, info = run(CompletingAPI)                    # E=8 -> all three
+    quality = env._quality_bonus(8.0, 5.5, 1.0, params)
+    assert reward == pytest.approx(params.R_complete - phi0 + quality + 300.0)
+    _, phi0, reward, info = run(CompletingAPI, skip=True)           # untested -> none
+    assert reward == pytest.approx(params.R_complete - phi0)
+    assert info['episode_metrics']['exc_milestone_bonus'] == 0.0
+
+
+def test_hill_quality_pays_cap_aligned_components():
+    params = replace(RewardParams(), R_struct_max=250.0, struct_w_chain=0.0,
+                     struct_w_drop=0.0, struct_height_target=0.0,
+                     struct_w_single_drop=0.5, struct_single_drop_target=12.0,
+                     struct_w_drop_runs=0.25, struct_drop_runs_target=2.0,
+                     struct_w_banked=0.25, struct_banked_target=4.0)
+    rows = [(10, 14, 15), (9, 15, 17), (9, 17, 19), (13, 19, 20),   # chain to +6
+            (12, 20, 19), (6, 19, 17), (6, 17, 15), (14, 15, 14),   # one 6z run
+            (21, 14, 14), (24, 14, 14)]                             # two banked turns
+    env = _bare_env(history=_env_hist(rows))
+    # single drop 6/12 = .5, runs 1/2 = .5, banked 2/4 = .5 -> weighted sum = 0.5
+    assert env._hill_quality(params) == pytest.approx(0.5)
+
+
+def test_validate_completion_first_folds_quality_floor():
+    W = ImprovedPhasedCurriculumWrapper
+    bad = replace(RewardParams(), completion_hill_floor=0.5,
+                  completion_quality_floor=0.2, R_roundtrip=150.0)
+    with pytest.raises(AssertionError):
+        W._validate_completion_first(bad, "test")                   # 150 >= .5*.2*1000
+    ok = replace(bad, R_roundtrip=50.0)
+    W._validate_completion_first(ok, "test")
+
+
+def test_p5_params_pay_the_quality_gate():
+    p5 = ImprovedPhasedCurriculumWrapper._phase_reward_params(5)
+    assert (p5.completion_quality_floor, p5.exc_gate_target) == (0.4, 6.0)
+    assert p5.R_struct_max == 250.0 and p5.struct_w_chain == 0.0
+    assert (p5.struct_w_single_drop, p5.struct_single_drop_target) == (0.30, 12.0)
+    assert (p5.struct_w_drop_runs, p5.struct_drop_runs_target) == (0.20, 2.0)
+    assert (p5.struct_w_drop, p5.struct_drop_target) == (0.15, 16.0)
+    assert (p5.struct_w_length, p5.struct_length_target) == (0.20, 60.0)
+    assert (p5.struct_w_banked, p5.struct_banked_target) == (0.15, 4.0)
+    assert p5.struct_w_single_drop + p5.struct_w_drop_runs + p5.struct_w_drop \
+        + p5.struct_w_length + p5.struct_w_banked == pytest.approx(1.0)
+    assert p5.R_viable == 150.0
+    assert (p5.R_exc_milestone, p5.exc_milestone_bars) == (100.0, (2.5, 4.0, 5.5))
+    assert p5.R_caps_max == 250.0
+    assert p5.R_quality_max == 500.0 and p5.step_cost == 0.0 and p5.w_h == 0.0
+    # untested/flat completion still dominates Phi_max (completion-first)
+    assert p5.completion_quality_floor * p5.R_complete > 100.0
+
+
+# -------------------- measured-caps bonus (getRideMeasurements; graceful degradation)
+# The five wooden-RC rating caps are MEASURED quantities (test-run stats). With the new
+# plugin endpoint the env pays a graded ramp on the real measurements; an old plugin
+# (unknown endpoint) degrades to 0 bonus with everything else intact.
+
+MEASUREMENTS_FIXTURE = {
+    "excitement": 8.0, "intensity": 5.5, "nausea": 1.0,
+    "maxSpeed": 30.0, "averageSpeed": 12.0, "rideTime": 40, "rideLength": 400.0,
+    "maxPositiveVerticalGs": 2.5, "maxNegativeVerticalGs": -0.2, "maxLateralGs": 1.1,
+    "totalAirTime": 1.2, "numDrops": 3, "highestDropHeight": 14.0,
+}
+
+
+class MeasuredAPI(CompletingAPI):
+    measurement_calls = 0
+
+    def get_ride_measurements(self):
+        type(self).measurement_calls += 1
+        return {"success": True, "payload": dict(MEASUREMENTS_FIXTURE)}
+
+
+def test_caps_quality_ramp_math():
+    env = _bare_env()
+    full = {"highestDropHeight": 12, "numDrops": 2, "maxSpeed": 23,
+            "maxNegativeVerticalGs": 0.10, "rideLength": 370}
+    assert env._caps_quality(full) == pytest.approx(1.0)
+    zero = {"highestDropHeight": 0, "numDrops": 0, "maxSpeed": 0,
+            "maxNegativeVerticalGs": 0.5, "rideLength": 0}
+    assert env._caps_quality(zero) == 0.0
+    half = {"highestDropHeight": 6, "numDrops": 1, "maxSpeed": 11.5,
+            "maxNegativeVerticalGs": 0.3, "rideLength": 185}
+    assert env._caps_quality(half) == pytest.approx(0.5)
+    assert env._caps_quality(None) == 0.0
+
+
+def test_caps_bonus_paid_from_measurements(monkeypatch):
+    monkeypatch.setattr(oe_mod, "APIController", MeasuredAPI)
+    MeasuredAPI.measurement_calls = 0
+    env = OpenRCT2Env(verbose=0)
+    env.skip_ride_testing = False
+    env.reward_params = replace(RewardParams(), R_caps_max=250.0, roundtrip_gain=0.0)
+    env.reset()
+    phi0, reward, terminated, _, info = _drive_to_terminal(env)
+    assert terminated
+    quality = env._quality_bonus(8.0, 5.5, 1.0, env.reward_params)
+    # the fixture clears every cap ramp -> full 250
+    assert reward == pytest.approx(env.reward_params.R_complete - phi0 + quality + 250.0)
+    m = info['episode_metrics']
+    assert m['caps_bonus'] == pytest.approx(250.0)
+    assert m['meas_available'] == 1.0
+    assert {'meas_num_drops', 'meas_highest_drop', 'meas_max_speed',
+            'meas_ride_length', 'meas_air_time', 'meas_neg_g'}.issubset(m)
+    assert info['ride_measurements'] == MEASUREMENTS_FIXTURE
+    assert MeasuredAPI.measurement_calls == 1        # fetched once, on the tested terminal
+
+
+def test_caps_bonus_degrades_without_endpoint(monkeypatch):
+    """CompletingAPI models an old plugin (unknown endpoint): no bonus, no exception,
+    everything else pays normally."""
+    monkeypatch.setattr(oe_mod, "APIController", CompletingAPI)
+    env = OpenRCT2Env(verbose=0)
+    env.skip_ride_testing = False
+    env.reward_params = replace(RewardParams(), R_caps_max=250.0, roundtrip_gain=0.0)
+    env.reset()
+    phi0, reward, terminated, _, info = _drive_to_terminal(env)
+    assert terminated
+    quality = env._quality_bonus(8.0, 5.5, 1.0, env.reward_params)
+    assert reward == pytest.approx(env.reward_params.R_complete - phi0 + quality)
+    assert info['episode_metrics']['caps_bonus'] == 0.0
+    assert info['episode_metrics']['meas_available'] == 0.0
+
+
+def test_measurements_not_fetched_when_untested(monkeypatch):
+    monkeypatch.setattr(oe_mod, "APIController", MeasuredAPI)
+    MeasuredAPI.measurement_calls = 0
+    env = OpenRCT2Env(verbose=0)
+    env.skip_ride_testing = True                     # untested -> no stats, no fetch
+    env.reward_params = replace(RewardParams(), R_caps_max=250.0, roundtrip_gain=0.0)
+    env.reset()
+    phi0, reward, terminated, _, info = _drive_to_terminal(env)
+    assert terminated
+    assert MeasuredAPI.measurement_calls == 0
+    assert reward == pytest.approx(env.reward_params.R_complete - phi0)
+
+
+def test_exc_feature_potential_monotone_and_phase_gated():
+    """The dense per-piece quality gradient: the feature quality rises with pieces the
+    rating pays (banked turns, deeper single drops) and telescopes on removal; Phi's
+    exc component is exactly w_exc_feat * quality (so weight-0 phases pay nothing).
+    Compared as a Phi DIFFERENCE because Phi's energy term also reads the history."""
+    rows = [(10, 14, 15), (9, 15, 17), (13, 17, 18),
+            (12, 18, 17), (6, 17, 15), (14, 15, 14)]
+    p5 = ImprovedPhasedCurriculumWrapper._phase_reward_params(5)
+    assert p5.w_exc_feat == 6.0
+    env = _bare_env(history=_env_hist(rows))
+    q0 = env._exc_feature_quality(p5)
+    env.track_builder.history.extend(_env_hist([(21, 14, 14)]))     # banked turn
+    q_banked = env._exc_feature_quality(p5)
+    assert q_banked > q0
+    env.track_builder.history.pop()                                 # telescopes back
+    assert env._exc_feature_quality(p5) == pytest.approx(q0)
+    env.track_builder.history.extend(_env_hist([(6, 14, 12), (6, 12, 10)]))  # deeper drop
+    assert env._exc_feature_quality(p5) > q0
+    # Phi wiring: the exc component is exactly w * quality (0 when the weight is 0)
+    delta = env._potential(p5) - env._potential(replace(p5, w_exc_feat=0.0))
+    assert delta == pytest.approx(p5.w_exc_feat * env._exc_feature_quality(p5))
+
+
+def test_p5_qualified_is_tested_excitement_diagnostic():
+    """P5 'qualified' (diagnostics only; the length ladder still gates on raw cold
+    success): a completed, TESTED ride rating E >= 4."""
+    W = ImprovedPhasedCurriculumWrapper
+    w = W.__new__(W)
+    w.current_phase = 5
+    good = SimpleNamespace(_last_test_ok=True, last_ride_excitement=4.5)
+    assert w._is_qualified(good, True) is True
+    assert w._is_qualified(good, False) is False
+    low = SimpleNamespace(_last_test_ok=True, last_ride_excitement=3.0)
+    assert w._is_qualified(low, True) is False
+    untested = SimpleNamespace(_last_test_ok=False, last_ride_excitement=4.5)
+    assert w._is_qualified(untested, True) is False
+
+
+def _p5_payout(params, length, chain_peak, steep, excitement, intensity, nausea):
+    """Terminal payout mirroring step()'s terminal branch under a quality-gated params:
+    _calculate_reward + exc-gated remainder + viable + milestones + quality bonus."""
+    env = _bare_env(history=_env_hist(_big_hill(chain_peak=chain_peak, steep=steep,
+                                                length=length)))
+    env.loop_completed = True
+    env._phi_prev = 0.0
+    env.reward_params = params
+    env._calculate_energy_margin = lambda: 10.0
+    env._last_test_ok = excitement > 0
+    r = env._calculate_reward(True, 0)
+    E = excitement if env._last_test_ok else 0.0
+    if params.completion_quality_floor < 1.0 and params.exc_gate_target > 0:
+        ramp = min(max(E, 0.0) / params.exc_gate_target, 1.0)
+        r += (params.R_complete * env._last_gate_prequality
+              * (1.0 - params.completion_quality_floor) * ramp)
+    if env._last_test_ok and params.R_viable > 0.0:
+        r += params.R_viable
+    r += params.R_exc_milestone * sum(1 for b in params.exc_milestone_bars if E >= b)
+    if env._last_test_ok:
+        r += env._quality_bonus(E, intensity, nausea, params)
+    return r
+
+
+def test_p5_extending_to_caps_beats_mini_loop():
+    """THE P5 regression: banking the 24-piece E=1.15 mini-loop now must lose decisively
+    to building out a 40-piece caps-shaped loop that rates E~4."""
+    P5 = ImprovedPhasedCurriculumWrapper._phase_reward_params(5)
+    stay = _p5_payout(P5, length=24, chain_peak=19, steep=False,
+                      excitement=1.15, intensity=1.33, nausea=0.79)
+    extend = (P5.gamma ** 16) * _p5_payout(P5, length=40, chain_peak=25, steep=True,
+                                           excitement=4.0, intensity=5.0, nausea=2.5)
+    assert extend > stay + 200.0
+
+
+# ------------------------------ static excitement-feature helpers (P5 substrate)
+# The game's wooden-RC rating caps key on the HIGHEST SINGLE drop (>=12z), the number
+# of drops (>=2), and turn variety. These helpers make those legs visible to struct
+# credit and the excitement PBRS term, statically from the removal-safe history.
+
+def test_max_single_drop_and_run_count():
+    rows = [(10, 14, 15), (9, 15, 17), (9, 17, 19), (9, 19, 21), (9, 21, 23),
+            (9, 23, 25), (13, 25, 26),                       # chain climb to +12
+            (12, 26, 25), (27, 25, 21), (28, 21, 17),
+            (6, 17, 15), (6, 15, 13), (14, 13, 12),          # one continuous 14z drop run
+            (5, 12, 14),                                     # climb breaks the run
+            (6, 14, 12),                                     # second drop run: 2z
+            (0, 12, 12)]
+    env = _bare_env(history=_env_hist(rows))
+    assert env._max_single_drop_z() == pytest.approx(14.0)
+    assert env._drop_run_count() == 2
+    env.track_builder.history.pop()                          # flat tail: unchanged
+    env.track_builder.history.pop()                          # second run gone
+    assert env._drop_run_count() == 1                        # removal-safe recompute
+
+
+def test_turn_and_banked_counters():
+    rows = [(3, 14, 14), (21, 14, 14), (24, 14, 14), (29, 14, 14), (6, 14, 12)]
+    env = _bare_env(history=_env_hist(rows))
+    assert env._banked_turn_count() == 2                     # 21, 24
+    assert env._turn_count() == 4                            # 3, 21, 24, 29; drop is not a turn
 
 
 # --------------------------------- P4 steep-drop credit (the last reward-invisible leg)

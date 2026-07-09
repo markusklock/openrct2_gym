@@ -62,6 +62,12 @@ class RewardParams:
     # pure function of position -> PBRS-clean; its maximum sits where the w_xy cone + w_close
     # funnel already dominate, so it cannot create a new parking optimum. 0 disables (P5 default).
     w_route: float = 0.0
+    # --- Excitement-feature potential (P5; the quality analogue of w_h) ---
+    # Dense per-piece Phi over static layout features the wooden-RC rating pays (turns,
+    # banked turns, drop runs, single-drop depth, length). Bounded by the weight; pure
+    # state function of the removal-safe history -> PBRS-clean. 0 disables (phases 1-4:
+    # their own discovery/structure terms already own those gradients).
+    w_exc_feat: float = 0.0
     # --- Sparse real objectives ---
     R_complete: float = 1000.0     # fixed completion bonus across all phases
     R_quality_max: float = 0.0     # 0 disables quality (phases 1-4); 500 in phase 5
@@ -87,6 +93,12 @@ class RewardParams:
     # Verified-viability bonus (P4+): paid on completion ONLY when the ride test returned
     # nonzero stats -- "the train physically made it around" as a paid, verified event.
     R_viable: float = 0.0
+    # Measured-caps bonus (P5): graded ramp over the five wooden-RC rating caps computed
+    # from the plugin's getRideMeasurements payload (real test-run stats). Each missed cap
+    # halves ALL of the game's ratings, so these ramps aim the policy at the exact
+    # quantities the rating gates on. 0 disables; degrades to 0 when the endpoint is
+    # absent (old plugin) -- everything else runs on getRideStats alone.
+    R_caps_max: float = 0.0
     # Fraction of R_complete a HILL-LESS completion earns. 1.0 = no gating (P1/P5); 0.25 in
     # the hill phases means a flat loop pays only 250 while a full hill pays the rest -- a
     # flat-completer can no longer ignore the lift hill (it leaves 75% of R_complete on the
@@ -108,6 +120,27 @@ class RewardParams:
     qualify_requires_energy: bool = False      # P3: cheap viability proxy (ride testing is off)
     qualify_requires_steep_drop: bool = False  # P4: a 60-degree descent segment is required
     qualify_requires_test: bool = False        # P4: the ride test must return real stats
+    # --- P5 quality economics (all default-inert) ---
+    # Quality gate on completion: pay floor*R_complete at close via _calculate_reward, and
+    # the remainder scaled by MEASURED excitement post-test (same terminal step, so it is
+    # exactly a multiplicative gate). 1.0 = no gating (phases 1-4). The Jul-9 P5 plateau
+    # (24-piece loop, E frozen at 1.15) was the ungated-completion trap a third time.
+    completion_quality_floor: float = 1.0
+    exc_gate_target: float = 6.0       # excitement at which the remainder fully releases
+    # Cap-aligned struct components (wooden-RC rating caps, verified from game source):
+    # highest SINGLE drop >= 12z and >= 2 distinct drops each halve ALL ratings when
+    # missed; banked turns feed the turns sub-rating and control lateral-G penalties.
+    struct_w_single_drop: float = 0.0
+    struct_single_drop_target: float = 12.0    # the game's RequirementDropHeight threshold
+    struct_w_drop_runs: float = 0.0
+    struct_drop_runs_target: float = 2.0       # the game's RequirementNumDrops threshold
+    struct_w_banked: float = 0.0
+    struct_banked_target: float = 4.0
+    # Discrete excitement milestones: R_exc_milestone paid per bar cleared by the measured
+    # excitement (post-test). Staged bars make each increment a paid event on the way to
+    # the E7-9 band -- the phase2-stage pattern applied to quality.
+    R_exc_milestone: float = 0.0
+    exc_milestone_bars: tuple = ()
     # Round-trip milestone: a one-time-per-episode bonus for climbing >= roundtrip_gain above
     # the station AND returning to ~station height, INDEPENDENT of closing the loop. Teaches
     # the climb-and-return sub-skill decoupled from completion (a hill is then a reachable
@@ -181,6 +214,7 @@ class OpenRCT2Env(gym.Env):
         self.api_controller = APIController(host, port, verbose)
         self.track_builder = APITrackBuilder(self.api_controller, verbose=verbose)
         self.skip_ride_testing = False  # Can be set by wrappers to skip entrance/exit and testing
+        self.harvest_max_len = self.HARVEST_MAX_LEN  # per-phase; wrapper raises it with the track budget
 
         # Unified potential-based reward config (wrappers override per phase).
         self.reward_params = RewardParams()
@@ -343,8 +377,8 @@ class OpenRCT2Env(gym.Env):
                 print(f"Loop has been completed, great success!")
             # Learn the closing geometry from the first completion (applied next reset).
             self._maybe_capture_closing_geometry()
-            # Harvest the loop into the warm-start library (dedup'd; scaffolded repeats no-op).
-            self._harvest_completed_loop()
+            # NOTE: the library harvest happens LATER in this step, after the ride test,
+            # so the record can carry the measured excitement (P5 self-imitation ratchet).
         terminated = self.loop_completed
 
         # Now calculate reward (with correct loop_completed status)
@@ -456,6 +490,40 @@ class OpenRCT2Env(gym.Env):
             if self.reward_params.R_qualify > 0.0 and self._qualifies(self.reward_params):
                 reward += self.reward_params.R_qualify
                 self._last_qualify_bonus = self.reward_params.R_qualify
+            # Quality-gate remainder + excitement milestones: keyed on the MEASURED
+            # excitement, so they live here with the other post-test terms. Untested
+            # completions keep only the floor share paid in _calculate_reward.
+            _E = float(rr.get('excitement', 0.0)) if self._last_test_ok else 0.0
+            params_q = self.reward_params
+            if params_q.completion_quality_floor < 1.0 and params_q.exc_gate_target > 0:
+                exc_ramp = min(max(_E, 0.0) / params_q.exc_gate_target, 1.0)
+                reward += (params_q.R_complete * self._last_gate_prequality
+                           * (1.0 - params_q.completion_quality_floor) * exc_ramp)
+                # episode_metrics' completion_gate reports the composed effective gate
+                self._last_completion_gate = self._last_gate_prequality * (
+                    params_q.completion_quality_floor
+                    + (1.0 - params_q.completion_quality_floor) * exc_ramp)
+            if params_q.R_exc_milestone > 0.0:
+                bars_cleared = sum(1 for bar in params_q.exc_milestone_bars if _E >= bar)
+                if bars_cleared:
+                    self._last_exc_milestone_bonus = params_q.R_exc_milestone * bars_cleared
+                    reward += self._last_exc_milestone_bonus
+            # Measured-caps bonus: fetch the test-run measurements once per tested
+            # completion (best-effort; an old plugin without the endpoint or an exotic
+            # controller stub degrades to no bonus) and pay the graded cap ramps.
+            if self._last_test_ok:
+                _fetch = getattr(self.api_controller, "get_ride_measurements", None)
+                _resp = _fetch() if callable(_fetch) else None
+                if isinstance(_resp, dict) and _resp.get("success"):
+                    self._last_measurements = _resp.get("payload") or None
+            info['ride_measurements'] = self._last_measurements
+            if params_q.R_caps_max > 0.0 and self._last_measurements:
+                self._last_caps_bonus = params_q.R_caps_max * self._caps_quality(
+                    self._last_measurements)
+                reward += self._last_caps_bonus
+            # Harvest into the warm-start library HERE (not at completion detection) so the
+            # record carries the measured excitement; untested completions tag 0.0.
+            self._harvest_completed_loop(excitement=_E)
         # Truncation gets no partial-credit bonus: PBRS already pays approach progress
         # as-you-go (a non-potential terminal bonus would be farmable and break invariance).
 
@@ -481,6 +549,9 @@ class OpenRCT2Env(gym.Env):
                 'summit': float(getattr(self, '_summit_awarded', False)),
                 'return_potential': float(self._return_potential(self.reward_params)),
                 'route_potential': float(self.reward_params.w_route * self._route_progress()),
+                'exc_feat_potential': float(
+                    self.reward_params.w_exc_feat
+                    * self._exc_feature_quality(self.reward_params)),
                 'max_gain': max((h['next_position'][2] - self.STATION_HEIGHT
                                  for h in self.track_builder.history), default=0.0),
                 'track_length': self.track_length,
@@ -497,7 +568,25 @@ class OpenRCT2Env(gym.Env):
                 # and whether the phase-gate qualification bonus fired
                 'completion_gate': float(getattr(self, '_last_completion_gate', 0.0)),
                 'qualify_bonus': float(getattr(self, '_last_qualify_bonus', 0.0)),
+                # P5 quality-economics diagnostics
+                'exc_milestone_bonus': float(getattr(self, '_last_exc_milestone_bonus', 0.0)),
+                'single_drop_z': float(self._max_single_drop_z()),
+                'drop_runs': float(self._drop_run_count()),
+                'banked_turns': float(self._banked_turn_count()),
+                'turn_count': float(self._turn_count()),
+                'caps_bonus': float(getattr(self, '_last_caps_bonus', 0.0)),
+                'meas_available': float(bool(getattr(self, '_last_measurements', None))),
             }
+            meas = getattr(self, '_last_measurements', None)
+            if meas:
+                info['episode_metrics'].update({
+                    'meas_num_drops': float(meas.get('numDrops', 0.0)),
+                    'meas_highest_drop': float(meas.get('highestDropHeight', 0.0)),
+                    'meas_max_speed': float(meas.get('maxSpeed', 0.0)),
+                    'meas_ride_length': float(meas.get('rideLength', 0.0)),
+                    'meas_air_time': float(meas.get('totalAirTime', 0.0)),
+                    'meas_neg_g': float(meas.get('maxNegativeVerticalGs', 0.0)),
+                })
 
         return observation, reward, terminated, truncated, info
 
@@ -576,6 +665,10 @@ class OpenRCT2Env(gym.Env):
         self._last_test_ok = False
         self._last_qualify_bonus = 0.0
         self._last_completion_gate = 0.0
+        self._last_gate_prequality = 0.0
+        self._last_exc_milestone_bonus = 0.0
+        self._last_measurements = None
+        self._last_caps_bonus = 0.0
         self.previous_distance = None
         self.position_history = deque(maxlen=self.POSITION_HISTORY_MAXLEN)
         self.chain_lift_positions = set()
@@ -724,17 +817,22 @@ class OpenRCT2Env(gym.Env):
             self._warm_step_cap = self.WARM_STEP_FACTOR * (int(suffix_k) + self.WARM_TRACK_SLACK)
         return self._warm_prefix_len
 
-    def _harvest_completed_loop(self):
+    def _harvest_completed_loop(self, excitement=0.0):
         """Persist this completion's action sequence into the warm-start loop library
-        (dedup makes scaffolded repeats no-ops; cold discoveries are new material).
+        (dedup makes scaffolded repeats no-ops; cold discoveries are new material; a
+        re-completion measured at a strictly higher excitement upgrades its record).
         Best-effort: library I/O must never break training."""
         try:
-            if len(self.track_builder.history) > self.HARVEST_MAX_LEN:
+            # Per-phase budget (the wrapper sets harvest_max_len to the phase's track
+            # limit); the class-constant fallback covers unwrapped/bare envs.
+            if len(self.track_builder.history) > getattr(
+                    self, "harvest_max_len", self.HARVEST_MAX_LEN):
                 return
             if self._loop_library is None or self._loop_library.path != self._LOOP_LIBRARY_PATH:
                 self._loop_library = LoopLibrary(self._LOOP_LIBRARY_PATH)
             self._loop_library.add(
-                LoopLibrary.record_from_history(self.track_builder.history))
+                LoopLibrary.record_from_history(self.track_builder.history,
+                                                excitement=excitement))
         except Exception:
             pass
 
@@ -751,6 +849,7 @@ class OpenRCT2Env(gym.Env):
         params = self.reward_params
         self._last_struct_bonus = 0.0          # reset each step (covers the failure early-return)
         self._last_completion_gate = 0.0
+        self._last_gate_prequality = 0.0
         if not success:
             return float(params.fail_penalty)
 
@@ -771,6 +870,12 @@ class OpenRCT2Env(gym.Env):
                 length_frac = min(self.track_length / params.struct_length_target, 1.0)
                 gate *= (params.completion_length_floor
                          + (1.0 - params.completion_length_floor) * length_frac)
+            # Quality gate split (P5): only the floor share is paid here -- the remainder
+            # is added post-test in step() scaled by measured excitement (same terminal
+            # step, so together they form one multiplicative gate). Pre-quality gate is
+            # stashed so the post-test leg can scale off the hill*length composition.
+            self._last_gate_prequality = gate
+            gate *= params.completion_quality_floor
             self._last_completion_gate = gate
             reward += params.R_complete * gate
             # Structural bonus, computed once and stored so episode_metrics reports exactly
@@ -1037,6 +1142,12 @@ class OpenRCT2Env(gym.Env):
         # (max recomputes lower on remove, so it telescopes; descent doesn't lower the banked peak).
         chain_gain = min(self._chain_max_gain(), params.h_scale)
         phi += params.w_h * (chain_gain / params.h_scale)
+        # Excitement-feature term (P5): dense per-piece gradient over the static layout
+        # features the game's rating actually pays (turn variety, banked turns, drop
+        # count/depth, length) -- the quality analogue of the w_h discovery term. Pure
+        # function of the removal-safe history + track_length -> telescopes.
+        if params.w_exc_feat > 0.0:
+            phi += params.w_exc_feat * self._exc_feature_quality(params)
         # Descent/return shaping: 0 at/above the summit (no double-pay), rising on the way home.
         phi += self._return_potential(params)
         # Steep, local near-closure FUNNEL: ramps to w_close only in the final close_range tiles at
@@ -1168,6 +1279,100 @@ class OpenRCT2Env(gym.Env):
         return float(sum(max(0.0, h["position"][2] - h["next_position"][2])
                          for h in hist if h.get("action") in (8, 27, 28)))
 
+    # Wooden-RC rating-cap thresholds, verified against the game source (RideRatings.cpp
+    # + rtd/coaster/WoodenRollerCoaster.h): each missed cap halves excitement/intensity/
+    # nausea. Units are the scripting API's: highestDropHeight in z-steps (== env z),
+    # maxSpeed in display mph (raw cap 0xA0000 -> 22.5, so >=23 clears it), rideLength in
+    # metres, G's in g. The length threshold is calibratable via probe_measurements.py.
+    WOODEN_CAP_DROP_Z = 12.0
+    WOODEN_CAP_NUM_DROPS = 2.0
+    WOODEN_CAP_SPEED_MPH = 23.0
+    WOODEN_CAP_NEG_G_PASS = 0.10       # a real airtime moment: max negative vertical G <= +0.10g
+    WOODEN_CAP_NEG_G_ZERO = 0.50       # ramp start: no credit at >= +0.50g (never airborne)
+    WOODEN_CAP_LENGTH_M = 370.0
+
+    def _caps_quality(self, measurements):
+        """Mean of five bounded ramps over the MEASURED rating-cap quantities; 0.0 when
+        measurements are unavailable (old plugin / untested)."""
+        if not measurements:
+            return 0.0
+        m = measurements
+        neg_g = float(m.get("maxNegativeVerticalGs", self.WOODEN_CAP_NEG_G_ZERO))
+        neg_g_ramp = min(max((self.WOODEN_CAP_NEG_G_ZERO - neg_g)
+                             / (self.WOODEN_CAP_NEG_G_ZERO - self.WOODEN_CAP_NEG_G_PASS), 0.0), 1.0)
+        comps = [
+            min(float(m.get("highestDropHeight", 0.0)) / self.WOODEN_CAP_DROP_Z, 1.0),
+            min(float(m.get("numDrops", 0.0)) / self.WOODEN_CAP_NUM_DROPS, 1.0),
+            min(float(m.get("maxSpeed", 0.0)) / self.WOODEN_CAP_SPEED_MPH, 1.0),
+            neg_g_ramp,
+            min(float(m.get("rideLength", 0.0)) / self.WOODEN_CAP_LENGTH_M, 1.0),
+        ]
+        return sum(comps) / len(comps)
+
+    def _exc_feature_quality(self, params):
+        """Mean of bounded ramps over the static excitement features (see w_exc_feat).
+        Targets are shared with the P5 struct components so the dense gradient and the
+        completion-conditioned credit point at the same layout."""
+        comps = [
+            min(self._turn_count() / 8.0, 1.0),
+            (min(self._banked_turn_count() / params.struct_banked_target, 1.0)
+             if params.struct_banked_target > 0 else 0.0),
+            (min(self._drop_run_count() / params.struct_drop_runs_target, 1.0)
+             if params.struct_drop_runs_target > 0 else 0.0),
+            (min(self._max_single_drop_z() / params.struct_single_drop_target, 1.0)
+             if params.struct_single_drop_target > 0 else 0.0),
+            (min(self.track_length / params.struct_length_target, 1.0)
+             if params.struct_length_target > 0 else 0.0),
+        ]
+        return sum(comps) / len(comps)
+
+    def _max_single_drop_z(self):
+        """Max z lost over ONE maximal run of consecutive descending entries. Static
+        proxy for the game's `highestDropHeight` (the wooden-RC cap needs >= 12z on a
+        single continuous drop; total drop-z spread over shallow dips does not count)."""
+        hist = getattr(self.track_builder, "history", None) or []
+        best = run = 0.0
+        for h in hist:
+            p, n = h.get("position"), h.get("next_position")
+            d = float(p[2] - n[2]) if (p is not None and n is not None) else 0.0
+            if d > 0:
+                run += d
+                best = max(best, run)
+            else:
+                run = 0.0
+        return best
+
+    def _drop_run_count(self, min_z=2.0):
+        """Number of maximal consecutive-descent runs losing >= min_z. Static proxy for
+        the game's `numDrops` (the wooden-RC cap needs >= 2 distinct drops)."""
+        hist = getattr(self.track_builder, "history", None) or []
+        count, run = 0, 0.0
+        for h in hist:
+            p, n = h.get("position"), h.get("next_position")
+            d = float(p[2] - n[2]) if (p is not None and n is not None) else 0.0
+            if d > 0:
+                run += d
+            else:
+                if run >= min_z:
+                    count += 1
+                run = 0.0
+        if run >= min_z:
+            count += 1
+        return count
+
+    def _banked_turn_count(self):
+        """Banked-turn pieces (actions 21-24): the highest-paying turn family in the
+        rating's turns sub-rating, and the lateral-G control for fast layouts."""
+        hist = getattr(self.track_builder, "history", None) or []
+        return sum(1 for h in hist if h.get("action") in (21, 22, 23, 24))
+
+    def _turn_count(self):
+        """All turn-family pieces (plain/banked turns + S-bends): direction changes
+        feed the rating's turns sub-rating."""
+        hist = getattr(self.track_builder, "history", None) or []
+        return sum(1 for h in hist
+                   if h.get("action") in (1, 2, 3, 4, 21, 22, 23, 24, 29, 30))
+
     def _chain_max_gain(self):
         """Highest elevation (z above station) reached via CHAIN-LIFT pieces (actions 9/10) in
         the removal-safe history; 0.0 if none. Single source of truth for every chain-elevation
@@ -1199,11 +1404,23 @@ class OpenRCT2Env(gym.Env):
                     if params.struct_length_target > 0 else 0.0)
         steep_q = (min(self._steep_drop_z() / params.struct_steep_target, 1.0)
                    if params.struct_steep_target > 0 else 0.0)
+        # Cap-aligned components (P5): the game's wooden-RC rating halves ALL ratings for
+        # a missing >=12z single drop and again for < 2 drops; banked turns pay in the
+        # turns sub-rating and keep lateral-G penalties off fast layouts.
+        single_drop_q = (min(self._max_single_drop_z() / params.struct_single_drop_target, 1.0)
+                         if params.struct_single_drop_target > 0 else 0.0)
+        drop_runs_q = (min(self._drop_run_count() / params.struct_drop_runs_target, 1.0)
+                       if params.struct_drop_runs_target > 0 else 0.0)
+        banked_q = (min(self._banked_turn_count() / params.struct_banked_target, 1.0)
+                    if params.struct_banked_target > 0 else 0.0)
         return min(params.struct_w_chain * chain_q
                    + params.struct_w_drop * drop_q
                    + params.struct_w_height * height_q
                    + params.struct_w_length * length_q
-                   + params.struct_w_steep * steep_q, 1.0)
+                   + params.struct_w_steep * steep_q
+                   + params.struct_w_single_drop * single_drop_q
+                   + params.struct_w_drop_runs * drop_runs_q
+                   + params.struct_w_banked * banked_q, 1.0)
 
     def _structural_bonus(self, params):
         """Completion-conditioned bonus for building the lift-hill / drop structure each

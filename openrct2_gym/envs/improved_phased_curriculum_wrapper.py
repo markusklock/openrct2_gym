@@ -149,9 +149,9 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
             f"{label}: climb milestones {milestones} >= R_complete {params.R_complete} "
             f"-- not closing the loop can out-pay even a perfect completion")
         if params.completion_hill_floor > 0.0:
-            # Worst-case completion pay compounds BOTH gates (hill floor x length floor).
+            # Worst-case completion pay compounds ALL gates (hill x length x quality floors).
             flat = (params.completion_hill_floor * params.completion_length_floor
-                    * params.R_complete)
+                    * params.completion_quality_floor * params.R_complete)
             assert milestones < flat, (
                 f"{label}: climb milestones {milestones} >= flat-completion floor {flat} "
                 f"({params.completion_hill_floor}*{params.completion_length_floor}"
@@ -177,9 +177,37 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
 
         Curriculum logic: master completion FIRST (phase 1, no climb distraction), THEN bridge
         into hills gradually (P2.1/P2.2/P2.3), THEN add drops and integration."""
-        if phase >= 5:  # quality only; discovery off. step_cost 0: the -0.01 punished length
-            # in the one phase that wants it (quality scales with size).
-            return RewardParams(R_quality_max=500.0, step_cost=0.0, w_h=0.0)
+        if phase >= 5:  # quality; discovery off (w_h=0), step_cost 0 (quality scales with
+            # size). Jul-9 redesign: the old params zeroed every gate/struct term and the
+            # policy promptly shrank to a 24-piece E=1.15 loop. The reward now points at
+            # the game's actual rating math: the completion gate ramps with MEASURED
+            # excitement, struct credit ramps the wooden-RC rating caps (single drop
+            # >=12z, >=2 drops, length; banked turns for the turns sub-rating), and
+            # discrete milestone bars pay every excitement increment on the way to E7-9.
+            return RewardParams(
+                R_quality_max=500.0,
+                step_cost=0.0,
+                w_h=0.0,
+                completion_quality_floor=0.4,
+                exc_gate_target=6.0,
+                R_struct_max=250.0,
+                struct_w_chain=0.0,
+                struct_w_single_drop=0.30,
+                struct_single_drop_target=12.0,   # the game's RequirementDropHeight cap
+                struct_w_drop_runs=0.20,
+                struct_drop_runs_target=2.0,      # the game's RequirementNumDrops cap
+                struct_w_drop=0.15,
+                struct_drop_target=16.0,
+                struct_w_length=0.20,
+                struct_length_target=60.0,        # toward the ~370m measured-length cap
+                struct_w_banked=0.15,
+                struct_banked_target=4.0,
+                R_viable=150.0,                   # keep P4's verified-run bonus
+                R_caps_max=250.0,                 # measured rating-cap ramps (getRideMeasurements)
+                R_exc_milestone=100.0,
+                exc_milestone_bars=(2.5, 4.0, 5.5),
+                w_exc_feat=6.0,                   # dense per-piece excitement gradient
+            )
         if phase == 2:
             if phase2_stage == 1:  # 2.1 climb-and-return: find the chain hill, no completion gate
                 # Closure-first: a RESTORED completion floor (0.2) keeps closing a loop always
@@ -424,6 +452,13 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                         and self._history_has_steep_drop(base_env)
                         and getattr(base_env, 'track_length', 0) >= P.struct_length_target
                         and getattr(base_env, '_last_test_ok', False))
+        if self.current_phase >= 5:
+            # Quality diagnostic (does NOT gate the P5 length ladder, which stays on raw
+            # cold success): completed, TESTED, and rated at least the middle milestone
+            # bar. Gives curriculum/qualified_rate meaning in P5.
+            return bool(success
+                        and getattr(base_env, '_last_test_ok', False)
+                        and float(getattr(base_env, 'last_ride_excitement', 0.0)) >= 4.0)
         return None
 
     def _update_phase_settings(self):
@@ -450,6 +485,9 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
         base_env.max_track_length = max_length
         base_env.reward_params = self._phase_reward_params(self.current_phase, self.phase2_stage)
         base_env.skip_ride_testing = skip_testing
+        # Harvest budget follows the phase's track budget (a P4/P5 loop longer than the
+        # old fixed 40 cap is exactly the material the later pools need).
+        base_env.harvest_max_len = max_length
 
         if self.verbose >= 1:
             phase_names = {
@@ -534,6 +572,10 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                 )
                 self.phase5_stage += 1
                 self._update_phase_settings()
+                # Each length rung changes the scaffold pool (bigger budget admits bigger
+                # exemplars) -- restart the anneal like any phase change (the
+                # _advance_phase2_stage precedent). Moot before Jul-9 when P5 was cold.
+                self._annealer.on_phase_change(self.current_phase)
 
                 self._clear_phase_windows()
                 self.phase_episode_count = 0
@@ -644,14 +686,16 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
 
     def _sample_warm_start(self):
         """This episode's warm-start plan. Cold when disabled, during evaluation (eval must
-        measure the true task), or past the scaffolded phases (1-4). Each phase prefers
+        measure the true task), or past the scaffolded phases (1-5). Each phase prefers
         loops that can actually satisfy its gate (with graceful pool fallback)."""
         if (not self.warm_start_enabled or not self._track_stats
-                or self.current_phase > 4):
+                or self.current_phase > 5):
             return WarmStartPlan(prefix=[], k=0, loop_len=0, cold=True)
         self._loop_library.maybe_refresh()   # pick up other workers' harvested loops
         base_env = self._get_base_env()
+        budget = getattr(base_env, 'max_track_length', 40)
         min_chains, min_len, min_drop_z, min_steep_z = 1, 0, 0, 0
+        min_single_drop_z, min_excitement = 0, 0.0
         if self.current_phase == 2 and self.phase2_stage >= 3:
             min_chains = 3
         elif self.current_phase == 3:
@@ -661,11 +705,19 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
             # (the P3 bar) which let non-steep 26-38 piece harvests dominate the pool
             # while the 60-degree leg went unpracticed (Jul-8 run: 12h, zero own steep).
             min_chains, min_len, min_drop_z, min_steep_z = 3, 40, 8, 8
+        elif self.current_phase >= 5:
+            # P5 (Jul-9): scaffold from excitement exemplars. Shape criteria mirror the
+            # rating caps (>=12z single drop on a >=40 piece loop); the excitement bar
+            # SELF-RATCHETS at 0.8 x the best tagged loop fitting the budget -- 0 on a
+            # legacy-only pool (everything qualifies), then rising behind every better
+            # exemplar the harvest tags. No persistent state; recomputed per episode.
+            min_chains, min_len, min_drop_z, min_single_drop_z = 1, 40, 12, 12
+            min_excitement = 0.8 * self._loop_library.best_excitement(budget)
         return self._annealer.sample_plan(
-            self._loop_library, self.current_phase,
-            getattr(base_env, 'max_track_length', 40),
+            self._loop_library, self.current_phase, budget,
             min_chains=min_chains, min_len=min_len, min_drop_z=min_drop_z,
-            min_steep_z=min_steep_z)
+            min_steep_z=min_steep_z, min_single_drop_z=min_single_drop_z,
+            min_excitement=min_excitement)
 
     def reset(self, **kwargs):
         """Reset environment and check for phase advancement"""
@@ -697,6 +749,11 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
         if self.current_phase == 5:
             info['phase5_stage'] = self.phase5_stage
             info['max_track_length'] = self.phase5_current_length
+            # Self-imitation ratchet diagnostics: the pool's excitement bar and the best
+            # tagged exemplar it trails (watch the bar climb behind better harvests).
+            best_exc = self._loop_library.best_excitement(self.phase5_current_length)
+            info['library_best_excitement'] = best_exc
+            info['p5_pool_exc_bar'] = 0.8 * best_exc
         else:
             info['max_track_length'] = getattr(self, f'phase{self.current_phase}_max_length')
 

@@ -36,10 +36,11 @@ class LoopRecord:
     chain_count: int
     max_gain: float              # peak z above the start height (0 for flat loops)
     drop_z: float                # total z dropped over descent pieces (static per-action geometry)
-    source: str                  # "scripted" | "harvest"
+    source: str                  # "scripted" | "harvest" | "mined" | "imported"
+    excitement: float = 0.0     # MEASURED ride excitement (0.0 = untested/legacy; P5 ratchet key)
 
     @staticmethod
-    def from_actions(actions, source, max_gain=0.0):
+    def from_actions(actions, source, max_gain=0.0, excitement=0.0):
         acts = tuple(int(a) for a in actions)     # coerce numpy ints -> json-serializable
         return LoopRecord(
             actions=acts,
@@ -48,6 +49,7 @@ class LoopRecord:
             max_gain=float(max_gain),
             drop_z=float(sum(ACTION_DROP_Z.get(a, 0) for a in acts)),
             source=str(source),
+            excitement=float(excitement),
         )
 
     @property
@@ -56,6 +58,21 @@ class LoopRecord:
         so every legacy JSONL entry gets it on load without a schema migration."""
         return float(sum(ACTION_DROP_Z.get(a, 0) for a in self.actions
                          if a in STEEP_ACTIONS))
+
+    @property
+    def max_single_drop_z(self):
+        """Max z lost over one run of consecutive drop-family actions — the static
+        mirror of env._max_single_drop_z (the wooden-RC highest-drop cap needs >= 12z
+        on a single continuous descent). Derived, so legacy entries get it on load."""
+        best = run = 0.0
+        for a in self.actions:
+            d = ACTION_DROP_Z.get(a, 0)
+            if d > 0:
+                run += d
+                best = max(best, run)
+            else:
+                run = 0.0
+        return float(best)
 
 
 class LoopLibrary:
@@ -95,7 +112,8 @@ class LoopLibrary:
                     try:
                         d = json.loads(line)
                         rec = LoopRecord.from_actions(
-                            d["actions"], d.get("source", "harvest"), d.get("max_gain", 0.0))
+                            d["actions"], d.get("source", "harvest"), d.get("max_gain", 0.0),
+                            excitement=d.get("excitement", 0.0))
                     except (ValueError, KeyError, TypeError):
                         continue           # corrupt/partial line -> skip
                     if rec.length > 0:
@@ -122,9 +140,17 @@ class LoopLibrary:
         The cap bounds the HARVEST flood only: curated scripted seeds are finite by
         construction and are the pool's backbone -- a cap-saturated library must never
         refuse them (nor do they consume the harvest budget)."""
-        if record is None or record.length == 0 or record.actions in self._records:
+        if record is None or record.length == 0:
             return False
-        if record.source != "scripted":
+        existing = self._records.get(record.actions)
+        if existing is not None:
+            # Upgrade-append: a known sequence re-enters ONLY with a strictly higher
+            # measured excitement (a re-completion that finally got tested/rated).
+            # load() is last-line-wins, so appending the upgrade keeps file and memory
+            # consistent; replacement never counts against the class cap.
+            if record.excitement <= existing.excitement:
+                return False
+        elif record.source != "scripted":
             key = self._class_key(record)
             n_class = sum(1 for r in self._records.values()
                           if r.source != "scripted" and self._class_key(r) == key)
@@ -139,6 +165,7 @@ class LoopLibrary:
                 "actions": list(record.actions), "length": record.length,
                 "chain_count": record.chain_count, "max_gain": record.max_gain,
                 "drop_z": record.drop_z, "source": record.source,
+                "excitement": record.excitement,
             }) + "\n"
             with open(self.path, "a") as f:
                 f.write(line)
@@ -146,22 +173,31 @@ class LoopLibrary:
             pass                           # in-memory record kept; persistence is best-effort
         return True
 
-    def pool(self, phase, max_len, min_chains=1, min_len=0, min_drop_z=0, min_steep_z=0):
+    def pool(self, phase, max_len, min_chains=1, min_len=0, min_drop_z=0, min_steep_z=0,
+             min_single_drop_z=0, min_excitement=0.0):
         """Loops usable this episode: must fit the track budget with margin for the suffix
         search. Phase >= 2 prefers loops matching ALL the phase's structure criteria
-        (chains, length, drop height, steep-dropped height), degrading tier by tier
-        (all-criteria -> any-steep -> enough chains -> any hill -> everything) so the
-        scaffold never silently turns off. The any-steep tier exists because steepness is
-        the rarest skill in the pool: without it, steep prefixes appear only at their
-        pool share (~7% observed) and the 60-degree leg never gets practiced."""
+        (chains, length, drop height, steep-dropped height, single-drop depth, measured
+        excitement), degrading tier by tier (all-criteria -> any-excited -> any-steep ->
+        enough chains -> any hill -> everything) so the scaffold never silently turns off.
+        The any-steep tier exists because steepness is the rarest structural skill in the
+        pool; the any-excited tier is its P5 analogue -- excitement-TAGGED loops are the
+        exemplars the quality ratchet climbs, so they dominate the moment any exist."""
         fits = [r for r in self._records.values() if r.length <= max_len - 2]
         if phase >= 2:
             best = [r for r in fits if (r.chain_count >= min_chains
                                         and r.length >= min_len
                                         and r.drop_z >= min_drop_z
-                                        and r.steep_drop_z >= min_steep_z)]
+                                        and r.steep_drop_z >= min_steep_z
+                                        and r.max_single_drop_z >= min_single_drop_z
+                                        and r.excitement >= min_excitement)]
             if best:
                 return best
+            if min_excitement > 0:
+                excited = [r for r in fits if (r.excitement >= min_excitement
+                                               and r.chain_count >= 1)]
+                if excited:
+                    return excited
             if min_steep_z > 0:
                 steep = [r for r in fits if (r.steep_drop_z >= min_steep_z
                                              and r.chain_count >= 1)]
@@ -175,8 +211,15 @@ class LoopLibrary:
                 return hills
         return fits
 
+    def best_excitement(self, max_len):
+        """Highest measured excitement among records fitting the track budget (0.0 for a
+        legacy/untagged pool). Drives the P5 self-imitation ratchet: the scaffold bar is
+        a fraction of this, so every better exemplar drags the whole pool up behind it."""
+        fits = [r.excitement for r in self._records.values() if r.length <= max_len - 2]
+        return max(fits, default=0.0)
+
     @staticmethod
-    def record_from_history(history, source="harvest"):
+    def record_from_history(history, source="harvest", excitement=0.0):
         """A LoopRecord from a COMPLETED track_builder.history, else None.
 
         max_gain is measured against the first entry's start height (== station height,
@@ -190,7 +233,8 @@ class LoopLibrary:
             max_gain = max(float(h["next_position"][2] - base_z) for h in history)
         except (KeyError, IndexError, TypeError, ValueError):
             return None
-        return LoopRecord.from_actions(actions, source, max_gain=max(max_gain, 0.0))
+        return LoopRecord.from_actions(actions, source, max_gain=max(max_gain, 0.0),
+                                       excitement=excitement)
 
 
 @dataclass
@@ -249,12 +293,14 @@ class WarmStartAnnealer:
         return WarmStartPlan(prefix=[], k=0, loop_len=0, cold=True)
 
     def sample_plan(self, library, phase, max_track_length, min_chains=1, min_len=0,
-                    min_drop_z=0, min_steep_z=0):
+                    min_drop_z=0, min_steep_z=0, min_single_drop_z=0, min_excitement=0.0):
         """The episode's warm-start plan. Cold when the die says so, the pool is empty,
         or the sampled k has annealed past the loop length (natural end of the scaffold)."""
         pool = (library.pool(phase, max_track_length, min_chains=min_chains,
                              min_len=min_len, min_drop_z=min_drop_z,
-                             min_steep_z=min_steep_z)
+                             min_steep_z=min_steep_z,
+                             min_single_drop_z=min_single_drop_z,
+                             min_excitement=min_excitement)
                 if library is not None else [])
         if not pool or self._rng.random() < self.p_cold:
             return self._cold_plan()
