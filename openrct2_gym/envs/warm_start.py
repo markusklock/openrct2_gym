@@ -152,10 +152,19 @@ class LoopLibrary:
                 return False
         elif record.source != "scripted":
             key = self._class_key(record)
-            n_class = sum(1 for r in self._records.values()
-                          if r.source != "scripted" and self._class_key(r) == key)
-            if n_class >= self.MAX_RECORDS_PER_CLASS:
-                return False
+            class_records = [r for r in self._records.values()
+                             if r.source != "scripted" and self._class_key(r) == key]
+            if len(class_records) >= self.MAX_RECORDS_PER_CLASS:
+                # Evict-worst instead of refuse (Jul-10): cross-run loads left classes
+                # saturated, so novel excitement-TAGGED harvests were refused and the P5
+                # ratchet starved. A newcomer strictly better than the class's worst
+                # displaces it (in memory; the file is append-only and load() keeps the
+                # newest line per sequence). Untagged newcomers (E=0.0 <= worst) into a
+                # full class are still refused -- the flood guard stands.
+                worst = min(class_records, key=lambda r: r.excitement)
+                if record.excitement <= worst.excitement:
+                    return False
+                del self._records[worst.actions]
         self._records[record.actions] = record
         try:
             directory = os.path.dirname(self.path)

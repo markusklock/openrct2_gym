@@ -236,6 +236,28 @@ def test_best_excitement_respects_budget(tmp_path):
     assert untagged.best_excitement(80) == 0.0
 
 
+def test_library_cap_evicts_worst_excitement_for_tagged_newcomers(monkeypatch, tmp_path):
+    """Jul-10 live finding: weeks of cross-run harvests left classes OVER the cap (load()
+    admits everything), so every novel tagged P4/P5 build was refused and the ratchet
+    starved. A newcomer with strictly higher excitement than the class's worst now evicts
+    that worst record; untagged newcomers into a full class stay refused (flood guard)."""
+    monkeypatch.setattr(LoopLibrary, "MAX_RECORDS_PER_CLASS", 2)
+    lib = _lib(tmp_path)
+    assert lib.add(LoopRecord.from_actions(FLAT, "harvest")) is True
+    assert lib.add(LoopRecord.from_actions(FLAT_L, "harvest")) is True
+    third = [4, 4, 0, 0, 0, 0, 0, 0, 0, 4, 4, 5]     # novel variant, still chain-less class
+    assert lib.add(LoopRecord.from_actions(third, "harvest")) is False        # flood guard
+    tagged = LoopRecord.from_actions(third, "harvest", excitement=1.5)
+    assert lib.add(tagged) is True                                  # evicts a worst (E=0.0)
+    in_class = [r for r in lib._records.values() if r.source != "scripted"]
+    assert len(in_class) == 2
+    assert max(r.excitement for r in in_class) == pytest.approx(1.5)
+    fourth = [3, 3, 0, 0, 0, 0, 0, 0, 0, 3, 3, 5]
+    assert lib.add(LoopRecord.from_actions(fourth, "harvest", excitement=0.5)) is True
+    # class is now {1.5, 0.5}: a 0.4 newcomer cannot displace anything
+    assert lib.add(LoopRecord.from_actions(FLAT, "harvest", excitement=0.4)) is False
+
+
 def test_p5_ratchet_keys_ride_the_step_done_info(monkeypatch, tmp_path):
     """The TB callback only reads STEP done-infos -- reset infos are never logged. The
     Jul-10 live run showed exc_bar 'na' for hours because the ratchet keys were emitted
