@@ -199,7 +199,8 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                 struct_w_drop=0.15,
                 struct_drop_target=16.0,
                 struct_w_length=0.20,
-                struct_length_target=60.0,        # toward the ~370m measured-length cap
+                struct_length_target=70.0,        # ~370m cap at the MEASURED 5.5 m/piece
+                                                  # (probe_measurements, Jul-10)
                 struct_w_banked=0.15,
                 struct_banked_target=4.0,
                 R_viable=150.0,                   # keep P4's verified-run bonus

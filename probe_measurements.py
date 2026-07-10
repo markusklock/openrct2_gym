@@ -38,11 +38,14 @@ def poll_stats(api, max_wait=60.0):
 
 
 def pick_candidates(library, targets=(24, 32, 40, 44)):
-    """One record per target length (nearest by |length - target|), dedup'd."""
+    """One record per target length (nearest by |length - target|), dedup'd. Prefers
+    CHAINED loops: a flat chain-less loop stalls the test train on friction and never
+    rates (the Jul-10 probe run timed out on exactly those picks)."""
     records = list(library._records.values())
+    chained = [r for r in records if r.chain_count >= 1] or records
     picked, seen = [], set()
     for t in targets:
-        best = min(records, key=lambda r: abs(r.length - t), default=None)
+        best = min(chained, key=lambda r: abs(r.length - t), default=None)
         if best is not None and best.actions not in seen:
             seen.add(best.actions)
             picked.append(best)

@@ -2669,7 +2669,10 @@ def test_p5_params_pay_the_quality_gate():
     assert (p5.struct_w_single_drop, p5.struct_single_drop_target) == (0.30, 12.0)
     assert (p5.struct_w_drop_runs, p5.struct_drop_runs_target) == (0.20, 2.0)
     assert (p5.struct_w_drop, p5.struct_drop_target) == (0.15, 16.0)
-    assert (p5.struct_w_length, p5.struct_length_target) == (0.20, 60.0)
+    # length target 70, not 60: probe_measurements measured 5.5 m/piece live (Jul-10),
+    # so the game's ~370m length cap sits near ~67 pieces -- the static ramp must not
+    # saturate a hundred metres short of the cap it proxies.
+    assert (p5.struct_w_length, p5.struct_length_target) == (0.20, 70.0)
     assert (p5.struct_w_banked, p5.struct_banked_target) == (0.15, 4.0)
     assert p5.struct_w_single_drop + p5.struct_w_drop_runs + p5.struct_w_drop \
         + p5.struct_w_length + p5.struct_w_banked == pytest.approx(1.0)

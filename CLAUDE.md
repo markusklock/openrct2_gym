@@ -103,7 +103,10 @@ This is a Gymnasium environment for training RL agents to build roller coasters 
   (a) completion quality gate: `completion_quality_floor=0.4` paid at close, remainder
   ramps with MEASURED excitement to `exc_gate_target=6` (paid post-test, same terminal
   step ⇒ exactly multiplicative); (b) P5 struct credit re-aimed at the caps
-  (`struct_w_single_drop/.30@12z, drop_runs/.20@2, drop/.15@16, length/.20@60, banked/.15@4`);
+  (`struct_w_single_drop/.30@12z, drop_runs/.20@2, drop/.15@16, length/.20@70, banked/.15@4`
+  — length target CALIBRATED Jul-10: probe_measurements measured 5.5 m/piece live, so the
+  ~370m cap sits near ~67 pieces; the probe also confirmed the cap model, a 4-caps-failing
+  44-piece loop rating E 0.30 ≈ base/16);
   (c) `R_exc_milestone=100 @ (2.5,4.0,5.5)` bars + kept `R_viable=150`;
   (d) `R_caps_max=250` graded on REAL measurements via the plugin's new
   `getRideMeasurements` (v0.3; degrades to 0 on an old plugin); (e) `w_exc_feat=6` dense
