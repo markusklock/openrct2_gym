@@ -236,6 +236,20 @@ def test_best_excitement_respects_budget(tmp_path):
     assert untagged.best_excitement(80) == 0.0
 
 
+def test_p5_ratchet_keys_ride_the_step_done_info(monkeypatch, tmp_path):
+    """The TB callback only reads STEP done-infos -- reset infos are never logged. The
+    Jul-10 live run showed exc_bar 'na' for hours because the ratchet keys were emitted
+    on the reset path only."""
+    wrapper, _ = _wrapped(monkeypatch, tmp_path, api_cls=CompletingAPI, p_cold=0.0)
+    wrapper.current_phase = 5
+    wrapper._update_phase_settings()
+    wrapper._loop_library.add(
+        LoopRecord.from_actions(BIG_EXCITING, "harvest", excitement=5.0))
+    info = _run_episode(wrapper)
+    assert info['library_best_excitement'] == pytest.approx(5.0)
+    assert info['p5_pool_exc_bar'] == pytest.approx(4.0)
+
+
 def test_p5_substage_advance_reanneals(monkeypatch, tmp_path):
     """Each P5 length rung changes the pool (bigger budget) -- the annealer restarts
     like on any phase change (the _advance_phase2_stage precedent)."""

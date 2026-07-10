@@ -885,6 +885,12 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
             frontier_rate = self._annealer.frontier_rate
             if frontier_rate is not None:
                 info['warm_frontier_rate'] = frontier_rate
+            if self.current_phase >= 5:
+                # Ratchet diagnostics must ride the STEP done-info (the TB callback never
+                # sees reset infos -- the reset()-side copy exists for humans/debuggers).
+                best_exc = self._loop_library.best_excitement(self.phase5_current_length)
+                info['library_best_excitement'] = best_exc
+                info['p5_pool_exc_bar'] = 0.8 * best_exc
 
             # Periodic logging
             if self.phase_episode_count % 10 == 0 and self.verbose >= 1:
