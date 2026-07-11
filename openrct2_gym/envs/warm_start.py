@@ -425,6 +425,58 @@ def generate_p4_candidates():
     return out
 
 
+def generate_p5_candidates():
+    """Quality-exemplar skeletons for the Phase-5 pool: max-footprint loops carrying
+    every reachable rating-cap leg plus turn-variety credit.
+
+    Jul-11 plateau finding: with 4/5 caps passing, live E pinned at ~2.4 and the last
+    cap (~370m measured length) is geometrically unreachable on this map (west wall at
+    x~38 caps the racetrack at ~48 tiles ~ 270m), so these maximize everything else:
+    a >=12z chain crest into a steep 14z drop, a SECOND hump (num-drops cap), BANKED
+    3-tile U-turns (turns sub-rating + lateral-G control), optional S-bend pairs on the
+    approach (direction changes), at the deepest verified approach (p 14-16). Seeded
+    with a live ride test (seed_p5_exemplars.py) so records enter excitement-TAGGED and
+    snap the self-imitation ratchet upward.
+
+    Families (net-z 0; east leg = 7+p tiles, blocks consume 20 or 22):
+      * hump2-4z: climb 8pc(+14) drop 6pc(-14), re-climb [11,5,13](+4), drop2 [12,6,14](-4)
+      * hump2-6z: same main hill, re-climb [11,5,5,13](+6), drop2 [12,6,6,14](-6)
+    """
+    out = []
+    climb = [10, 9, 9, 9, 9, 9, 9, 13]                    # +14z, chain crest 13z
+    main_drop = [12, 27, 28, 6, 6, 14]                    # -14z single run, steep 8z
+    humps = (
+        ([11, 5, 13], [12, 6, 14]),                       # +4 / -4
+        ([11, 5, 5, 13], [12, 6, 6, 14]),                 # +6 / -6
+    )
+    # Banked turns MUST be wrapped in bank transitions (flat->bank 15/16, bank->flat
+    # 19/20): the placement API tolerates a straight->banked-turn jump but the game
+    # refuses to run a train over it (ridesetstatus error 65535; live-diagnosed Jul-11).
+    # Live A/B also showed the banked-turn rating credit is ~nil at this footprint
+    # (E 2.46 vs 2.45 plain), so plain U-turns remain a first-class family.
+    for t_pair in ((4, 4), (16, 24, 24, 20), (15, 23, 23, 19)):
+        for reclimb, drop2 in humps:
+            block = len(climb) + len(main_drop) + len(reclimb) + len(drop2)
+            for p in (14, 15, 16):
+                east = 7 + p
+                for s_pairs in (0, 1):
+                    # approach consumes p forward tiles; an S-pair spends 4 of them
+                    approach_straights = p - 4 * s_pairs
+                    if approach_straights < 2:
+                        continue
+                    approach = ([0, 0] + [29, 30] * s_pairs
+                                + [0] * (approach_straights - 2))
+                    for mid in sorted({0, east - block}):
+                        rest = east - block - mid
+                        if rest < 0 or mid < 0:
+                            continue
+                        out.append(approach + list(t_pair)
+                                   + climb + [0] * mid + main_drop
+                                   + reclimb + drop2 + [0] * rest
+                                   + list(t_pair))
+    return out
+
+
 def generate_hill_candidates():
     """Racetrack skeletons with a balanced chain climb on the east leg for the Phase-2 pool.
 

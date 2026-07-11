@@ -25,6 +25,7 @@ from openrct2_gym.envs.warm_start import (
     generate_candidates,
     generate_hill_candidates,
     generate_p4_candidates,
+    generate_p5_candidates,
 )
 from openrct2_gym.tests.test_env_smoke import FakeAPI
 from openrct2_gym.tests.test_reward import CompletingAPI
@@ -287,6 +288,45 @@ def test_p5_substage_advance_reanneals(monkeypatch, tmp_path):
     assert wrapper._check_phase_advancement() is True                   # rung 80 -> 90
     assert wrapper._annealer.k_max == wrapper._annealer.k_init
     assert len(wrapper._annealer.frontier) == 0
+
+
+def test_generate_p5_candidates_are_exemplar_shaped():
+    """P5 exemplar skeletons for the length-cap plateau (Jul-11, live E pinned at 2.42
+    with 4/5 caps passing): as long as the racetrack geometry allows (S-bend pairs +
+    a second hump stretch the east leg), net-z balanced, carrying a >=12z single drop,
+    a SECOND >=2z drop run, a steep segment, and banked turns for the turns sub-rating."""
+    cands = generate_p5_candidates()
+    assert len(cands) >= 12
+    from openrct2_gym.envs.warm_start import ACTION_DROP_Z as DZ, ACTION_CLIMB_Z as CZ
+    for c in cands:
+        assert 36 <= len(c) <= 76    # skeletons; closed loops land >=40 after the ~3-piece tail
+        assert 27 in c and 28 in c                       # steep segment
+        banked = [a for a in c if a in (23, 24)]
+        if banked:                                       # banked family: legally wrapped
+            assert len(banked) >= 4
+            assert (16 in c or 15 in c) and (20 in c or 19 in c)   # bank transitions
+        assert sum(1 for a in c if a in (29, 30)) % 2 == 0       # S-bends in L/R pairs
+        z, chain_peak = 0, 0
+        best = run = 0.0
+        runs = []
+        for a in c:
+            z += CZ.get(a, 0) - DZ.get(a, 0)
+            if a in CHAIN_ACTIONS:
+                chain_peak = max(chain_peak, z)
+            d = DZ.get(a, 0)
+            if d > 0:
+                run += d
+                best = max(best, run)
+            else:
+                if run >= 2:
+                    runs.append(run)
+                run = 0.0
+        if run >= 2:
+            runs.append(run)
+        assert z == 0                                    # returns to station height
+        assert chain_peak >= 12                          # crest feeds a >=12z drop
+        assert best >= 12.0                              # the single-drop cap leg
+        assert len(runs) >= 2                            # the num-drops cap leg
 
 
 def test_loop_record_max_single_drop_property():
