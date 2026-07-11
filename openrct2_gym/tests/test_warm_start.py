@@ -291,15 +291,15 @@ def test_p5_substage_advance_reanneals(monkeypatch, tmp_path):
 
 
 def test_generate_p5_candidates_are_exemplar_shaped():
-    """P5 exemplar skeletons for the length-cap plateau (Jul-11, live E pinned at 2.42
-    with 4/5 caps passing): as long as the racetrack geometry allows (S-bend pairs +
-    a second hump stretch the east leg), net-z balanced, carrying a >=12z single drop,
-    a SECOND >=2z drop run, a steep segment, and banked turns for the turns sub-rating."""
+    """P5 exemplar skeletons (Jul-11 rev 2: the map-wall claim was wrong -- probed 54
+    tiles west, effectively unbounded): LONG rectangles (p 28-32, ~385-410m measured)
+    that CROSS the game's ~370m length cap, net-z balanced, carrying a >=12z single
+    drop, a SECOND >=2z drop run, and a steep segment."""
     cands = generate_p5_candidates()
     assert len(cands) >= 12
     from openrct2_gym.envs.warm_start import ACTION_DROP_Z as DZ, ACTION_CLIMB_Z as CZ
     for c in cands:
-        assert 36 <= len(c) <= 76    # skeletons; closed loops land >=40 after the ~3-piece tail
+        assert 60 <= len(c) <= 78    # length-cap crossers that still fit the 80 budget
         assert 27 in c and 28 in c                       # steep segment
         banked = [a for a in c if a in (23, 24)]
         if banked:                                       # banked family: legally wrapped
