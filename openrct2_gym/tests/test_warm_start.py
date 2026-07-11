@@ -299,7 +299,7 @@ def test_generate_p5_candidates_are_exemplar_shaped():
     assert len(cands) >= 12
     from openrct2_gym.envs.warm_start import ACTION_DROP_Z as DZ, ACTION_CLIMB_Z as CZ
     for c in cands:
-        assert 60 <= len(c) <= 78    # length-cap crossers that still fit the 80 budget
+        assert 60 <= len(c) <= 116   # cap-crossers + bunny-hop bigs + max-length family
         assert 27 in c and 28 in c                       # steep segment
         banked = [a for a in c if a in (23, 24)]
         if banked:                                       # banked family: legally wrapped
@@ -327,6 +327,20 @@ def test_generate_p5_candidates_are_exemplar_shaped():
         assert chain_peak >= 12                          # crest feeds a >=12z drop
         assert best >= 12.0                              # the single-drop cap leg
         assert len(runs) >= 2                            # the num-drops cap leg
+    # round 3 (Jul-11): a big family with a bunny-hop field must exist -- drop COUNT is
+    # the next rating term (flat credit per drop up to 9) and 2-hump exemplars won't
+    # teach it; verify some candidate carries >=4 drop runs at >=85 pieces
+    def drop_runs(c):
+        from openrct2_gym.envs.warm_start import ACTION_DROP_Z as DZ
+        n, run = 0, 0.0
+        for a in c:
+            d = DZ.get(a, 0)
+            if d > 0:
+                run += d
+            else:
+                n, run = n + (1 if run >= 2 else 0), 0.0
+        return n + (1 if run >= 2 else 0)
+    assert any(len(c) >= 85 and drop_runs(c) >= 4 for c in cands)
 
 
 def test_loop_record_max_single_drop_property():

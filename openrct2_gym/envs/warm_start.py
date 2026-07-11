@@ -453,11 +453,25 @@ def generate_p5_candidates():
     # refuses to run a train over it (ridesetstatus error 65535; live-diagnosed Jul-11).
     # Live A/B showed the banked-turn rating credit is ~nil (E 2.46 vs 2.45 plain), so
     # plain U-turns are the primary family; one banked variant kept for diversity.
-    for t_pair, ps in (((4, 4), (28, 30, 32)), ((16, 24, 24, 20), (28,))):
+    # Bunny-hop unit (round 3): +4z plain climb, 4z drop -- each hop is one more COUNTED
+    # drop (flat rating credit per drop up to 9) and an airtime crest taken at post-main-
+    # drop speed. Placed immediately after the main drop, before the second hump.
+    hop = [11, 5, 13, 12, 6, 14]
+    # (p, hops): cap-crossers for the 80 budget, bunny-hop bigs for the 120 ladder
+    layouts = ((28, 0), (30, 0), (32, 0), (36, 2), (36, 3), (40, 3), (40, 4),
+               # round 4: max-length family (west run allows p~50) -- length credit is
+               # nearly intensity-free, the remaining headroom to E7 with I at the band edge
+               (48, 2), (48, 3), (50, 2), (50, 3))
+    for t_pair, plain_only in (((4, 4), False), ((16, 24, 24, 20), True)):
         for reclimb, drop2 in humps:
-            block = len(climb) + len(main_drop) + len(reclimb) + len(drop2)
-            for p in ps:
+            for p, hops in layouts:
+                if plain_only and (hops or p != 28):
+                    continue                       # one banked variant for diversity
                 east = 7 + p
+                block = (len(climb) + len(main_drop) + len(hop) * hops
+                         + len(reclimb) + len(drop2))
+                if block > east:
+                    continue
                 approach = [0] * p
                 for mid in sorted({0, (east - block) // 2, east - block}):
                     rest = east - block - mid
@@ -465,6 +479,7 @@ def generate_p5_candidates():
                         continue
                     out.append(approach + list(t_pair)
                                + climb + [0] * mid + main_drop
+                               + hop * hops
                                + reclimb + drop2 + [0] * rest
                                + list(t_pair))
     return out

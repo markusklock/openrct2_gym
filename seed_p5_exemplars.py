@@ -27,6 +27,9 @@ def main():
     parser.add_argument("--min-excitement", type=float, default=3.0,
                         help="Only record exemplars rating at least this (must beat the "
                              "plateau to move the ratchet)")
+    parser.add_argument("--only-longer-than", type=int, default=0,
+                        help="Skip skeletons at or under this length (re-runs test only "
+                             "the new bigger families)")
     args = parser.parse_args()
 
     api = APIController("localhost", args.port, verbose=0)
@@ -41,6 +44,8 @@ def main():
     tested = added = 0
     best_seen = 0.0
     for skeleton in generate_p5_candidates():
+        if len(skeleton) <= args.only_longer_than:
+            continue
         placed, closed, gain = replay(api, skeleton, tail_max=args.tail_max)
         if not closed:
             continue
