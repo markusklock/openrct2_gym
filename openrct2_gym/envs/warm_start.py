@@ -330,16 +330,20 @@ class WarmStartAnnealer:
             return
         rate = sum(self.frontier) / len(self.frontier)
         if rate >= self.promote_rate:
-            self.k_max += 2
+            self.k_max += getattr(self, "k_step", 2)
             self.frontier.clear()
         elif rate <= self.demote_rate:
             self.k_max = max(self.k_floor, self.k_max - 1)
             self.frontier.clear()
 
     def on_phase_change(self, new_phase):
-        """New phase == new target skill (e.g. hill loops in P2): restart the anneal."""
+        """New phase == new target skill (e.g. hill loops in P2): restart the anneal.
+        P5 walks the frontier at +4 (Jul-12: exemplar loops are ~90 pieces; the proven
+        +2 pace measured k 3->17 in ~15h -- a multi-day horizon to cold internalization).
+        Demotion stays -1 everywhere, so an overreach still corrects gently."""
         self.k_max = self.k_init
         self.frontier.clear()
+        self.k_step = 4 if new_phase >= 5 else 2
 
 
 # --------------------------------------------------------------- candidate templates
@@ -444,6 +448,11 @@ def generate_p5_candidates():
     out = []
     climb = [10, 9, 9, 9, 9, 9, 9, 13]                    # +14z, chain crest 13z
     main_drop = [12, 27, 28, 6, 6, 14]                    # -14z single run, steep 8z
+    # Taller-hill family (Jul-12): +18z crest into an 18z single drop -- more speed and
+    # a bigger airtime moment, the remaining intensity-tolerant excitement terms after
+    # length credit saturated empirically at ~E 5.8 (I rises with G; game penalty >10).
+    tall_climb = [10, 9, 9, 9, 9, 9, 9, 9, 9, 13]         # +18z, chain crest 17z
+    tall_drop = [12, 27, 28, 6, 6, 6, 6, 14]              # -18z single run, steep 8z
     humps = (
         ([11, 5, 13], [12, 6, 14]),                       # +4 / -4
         ([11, 5, 5, 13], [12, 6, 6, 14]),                 # +6 / -6
@@ -462,13 +471,18 @@ def generate_p5_candidates():
                # round 4: max-length family (west run allows p~50) -- length credit is
                # nearly intensity-free, the remaining headroom to E7 with I at the band edge
                (48, 2), (48, 3), (50, 2), (50, 3))
-    for t_pair, plain_only in (((4, 4), False), ((16, 24, 24, 20), True)):
+    tall_layouts = ((40, 2), (40, 3), (48, 2), (50, 3))   # round 5: taller hill
+    for t_pair, plain_only, hill, lay in (
+            ((4, 4), False, (climb, main_drop), layouts),
+            ((16, 24, 24, 20), True, (climb, main_drop), layouts),
+            ((4, 4), False, (tall_climb, tall_drop), tall_layouts)):
+        f_climb, f_drop = hill
         for reclimb, drop2 in humps:
-            for p, hops in layouts:
+            for p, hops in lay:
                 if plain_only and (hops or p != 28):
                     continue                       # one banked variant for diversity
                 east = 7 + p
-                block = (len(climb) + len(main_drop) + len(hop) * hops
+                block = (len(f_climb) + len(f_drop) + len(hop) * hops
                          + len(reclimb) + len(drop2))
                 if block > east:
                     continue
@@ -478,7 +492,7 @@ def generate_p5_candidates():
                     if rest < 0 or mid < 0:
                         continue
                     out.append(approach + list(t_pair)
-                               + climb + [0] * mid + main_drop
+                               + f_climb + [0] * mid + f_drop
                                + hop * hops
                                + reclimb + drop2 + [0] * rest
                                + list(t_pair))

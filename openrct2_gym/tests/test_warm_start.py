@@ -273,6 +273,22 @@ def test_p5_ratchet_keys_ride_the_step_done_info(monkeypatch, tmp_path):
     assert info['p5_pool_exc_bar'] == pytest.approx(4.0)
 
 
+def test_annealer_p5_promotes_with_larger_step():
+    """Jul-12: cold internalization of ~90-piece exemplars at +2/promotion is a
+    multi-day grind (measured k 3->17 in ~15h). P5 promotes +4; earlier phases keep
+    the proven +2; demotion unchanged."""
+    ann = WarmStartAnnealer(k_init=3, promote_n=20, promote_rate=0.6, rng=random.Random(0))
+    ann.on_phase_change(5)
+    plan = WarmStartPlan(prefix=[0] * 70, k=3, loop_len=73, cold=False)
+    for _ in range(20):
+        ann.record_outcome(plan, success=True)
+    assert ann.k_max == 7                                   # +4 in P5
+    ann.on_phase_change(2)
+    for _ in range(20):
+        ann.record_outcome(WarmStartPlan([0] * 9, ann.k_max - 1, 12, False), success=True)
+    assert ann.k_max == 5                                   # back to +2 elsewhere
+
+
 def test_p5_substage_advance_reanneals(monkeypatch, tmp_path):
     """Each P5 length rung changes the pool (bigger budget) -- the annealer restarts
     like on any phase change (the _advance_phase2_stage precedent)."""

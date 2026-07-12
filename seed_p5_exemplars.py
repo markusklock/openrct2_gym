@@ -30,6 +30,9 @@ def main():
     parser.add_argument("--only-longer-than", type=int, default=0,
                         help="Skip skeletons at or under this length (re-runs test only "
                              "the new bigger families)")
+    parser.add_argument("--min-single-drop", type=float, default=0.0,
+                        help="Skip skeletons whose static max single drop is below this "
+                             "(isolates a new hill family on incremental rounds)")
     args = parser.parse_args()
 
     api = APIController("localhost", args.port, verbose=0)
@@ -45,6 +48,8 @@ def main():
     best_seen = 0.0
     for skeleton in generate_p5_candidates():
         if len(skeleton) <= args.only_longer_than:
+            continue
+        if LoopRecord.from_actions(skeleton, "probe").max_single_drop_z < args.min_single_drop:
             continue
         placed, closed, gain = replay(api, skeleton, tail_max=args.tail_max)
         if not closed:
