@@ -938,6 +938,7 @@ def test_callback_logs_p5_quality_economics_tags():
                        'exc_milestone_bonus': 200.0, 'caps_bonus': 125.0,
                        'exc_feat_potential': 3.1, 'single_drop_z': 12.0,
                        'drop_runs': 2.0, 'banked_turns': 3.0, 'turn_count': 7.0,
+                       'sbend_count': 2.0, 'turn_balance': 3.0,
                        'meas_num_drops': 3.0, 'meas_highest_drop': 14.0,
                        'meas_max_speed': 24.0, 'meas_ride_length': 380.0,
                        'meas_air_time': 1.1, 'meas_neg_g': -0.1,
@@ -951,6 +952,8 @@ def test_callback_logs_p5_quality_economics_tags():
     assert store['structure/drop_runs'] == pytest.approx(2.0)
     assert store['structure/banked_turns'] == pytest.approx(3.0)
     assert store['structure/turn_count'] == pytest.approx(7.0)
+    assert store['structure/sbend_count'] == pytest.approx(2.0)
+    assert store['structure/turn_balance'] == pytest.approx(3.0)
     assert store['structure/meas_highest_drop'] == pytest.approx(14.0)
     assert store['structure/meas_ride_length'] == pytest.approx(380.0)
     assert store['structure/meas_neg_g'] == pytest.approx(-0.1)

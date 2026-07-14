@@ -191,7 +191,8 @@ All five phases share the **same reward and the same Φ**; they differ only in t
 | 2 | Lift Hill Building | 40 | staged chain-lift bridge | 2.1 one-chain roundtrip, 2.2 one-chain completion, 2.3 three-chain completion |
 | 3 | Real Drops & Scale | 60 | chain height ≥4z, drops ≥4z, length ≥25, energy-viable | 35% qualified |
 | 4 | Big & Verified | 80 | height ≥6z, drops ≥8z incl. a 60° segment, length ≥40, **ride-test verified** | 30% qualified |
-| 5 | Quality Optimization | 80–120 | excitement-gated completion, cap-aligned struct credit, milestone bars, measured-caps bonus, excitement-feature Φ (no step cost) | progressive length |
+| 5 | Quality Optimization | 80–120 | excitement-gated completion, cap-aligned struct credit, milestone bars, measured-caps bonus, excitement-feature Φ (no step cost) | progressive length, then P6 at 30% cold tested-E≥4 |
+| 6 | Style / Variety | 120 | turn-count/S-bend/handedness-balance struct legs; qualified = tested E≥4.5 **and** ≥12 turns **and** balance ≥2; per-shape-bin pool caps keep multiple styles alive | terminal |
 
 Phases 1–**5** are scaffolded by the warm-start reverse curriculum (each phase's pool prefers
 loops that can satisfy its own gate). Gate advancement counts **cold (unscaffolded)
@@ -267,6 +268,11 @@ The training scripts provide extensive metrics in Tensorboard:
   steep-drop leg (9h in-phase without one 60° piece placed) is graded into the structure
   credit. Diagnosed via `rewards/completion_gate`, `rewards/qualify_bonus`,
   `structure/steep_drop_z` in TensorBoard
+- **Phase 6: Style (Jul-14)**: every earlier phase converged on one rectangle motif —
+  variety was never paid for. P6 grades turn count, S-bends, and turn-handedness balance
+  (the leg a rectangle can't fake), holds the P5 quality economics with a tested-E≥4.5
+  qualified floor, and diversifies scaffolds via per-shape-bin pool caps plus winding
+  jog-pair exemplars (`--family p6` seeding)
 - **Phase-5 quality unlock (Jul-9)**: the E=1.15 plateau traced to the game's five wooden-RC
   rating caps (verified in the OpenRCT2 source — each missed cap halves all ratings; the
   24-piece mini-loop missed 4–5). The completion payout is now excitement-gated (floor 0.4,

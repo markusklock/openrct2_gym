@@ -13,7 +13,8 @@ never cross the remaining rating-cap legs together. Run with training STOPPED:
 import argparse
 
 from openrct2_gym.envs.api_controller import APIController
-from openrct2_gym.envs.warm_start import LoopLibrary, LoopRecord, generate_p5_candidates
+from openrct2_gym.envs.warm_start import (
+    LoopLibrary, LoopRecord, generate_p5_candidates, generate_p6_candidates)
 from build_loop_library import replay
 from probe_measurements import poll_stats
 
@@ -30,6 +31,8 @@ def main():
     parser.add_argument("--only-longer-than", type=int, default=0,
                         help="Skip skeletons at or under this length (re-runs test only "
                              "the new bigger families)")
+    parser.add_argument("--family", choices=("p5", "p6"), default="p5",
+                        help="Candidate family: p5 quality rectangles or p6 winding style")
     parser.add_argument("--min-single-drop", type=float, default=0.0,
                         help="Skip skeletons whose static max single drop is below this "
                              "(isolates a new hill family on incremental rounds)")
@@ -46,7 +49,8 @@ def main():
 
     tested = added = 0
     best_seen = 0.0
-    for skeleton in generate_p5_candidates():
+    generator = generate_p6_candidates if args.family == "p6" else generate_p5_candidates
+    for skeleton in generator():
         if len(skeleton) <= args.only_longer_than:
             continue
         if LoopRecord.from_actions(skeleton, "probe").max_single_drop_z < args.min_single_drop:

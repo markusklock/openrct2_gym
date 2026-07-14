@@ -14,13 +14,14 @@ from openrct2_gym.envs.warm_start import LoopLibrary, WarmStartAnnealer, WarmSta
 
 class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
     """
-    Wrapper that implements 5-phase curriculum learning with physics-aware rewards.
+    Wrapper that implements 6-phase curriculum learning with physics-aware rewards.
 
     Phase 1: "Return Practice" (40 pieces) - Focus on navigation
     Phase 2: "Lift Hill Building" (40 pieces) - Learn chain lifts and energy
     Phase 3: "Drop & Turn" (60 pieces) - Learn drops and turnarounds
     Phase 4: "Circuit Mastery" (80 pieces) - Full integration
-    Phase 5: "Quality Optimization" (120 pieces) - Optimize ride ratings
+    Phase 5: "Quality Optimization" (80-120 pieces) - Optimize ride ratings
+    Phase 6: "Style / Variety" (120 pieces) - Winding layouts at held quality
     """
 
     def __init__(self, env,
@@ -39,6 +40,8 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                  phase5_initial_length=80,
                  phase5_target_length=120,
                  phase5_increase_step=10,
+                 phase6_entry_threshold=0.30,   # cold tested-E>=4 rate that opens P6
+                 phase6_max_length=120,
                  # Verbosity
                  verbose=1,
                  # Phase 2 sub-stage thresholds (kept at the end for positional compatibility)
@@ -83,6 +86,8 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
         self.phase5_target_length = phase5_target_length
         self.phase5_current_length = phase5_initial_length
         self.phase5_increase_step = phase5_increase_step
+        self.phase6_entry_threshold = phase6_entry_threshold
+        self.phase6_max_length = phase6_max_length
 
         # Warm-start reverse curriculum: the wrapper owns the per-worker annealer and a
         # read-view of the shared loop library (the env writes harvests to the same file).
@@ -177,6 +182,44 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
 
         Curriculum logic: master completion FIRST (phase 1, no climb distraction), THEN bridge
         into hills gradually (P2.1/P2.2/P2.3), THEN add drops and integration."""
+        if phase >= 6:  # P6 "Style": layout variety without losing the quality won in P5.
+            # Every earlier phase converged onto ONE rectangle motif because nothing paid
+            # for shape. Variety legs: graded turn count, S-bends, and handedness BALANCE
+            # (a rectangle is all-one-direction turns), each mirrored in the qualified
+            # gate with a tested-excitement floor slightly below the measured ceiling.
+            return RewardParams(
+                R_quality_max=500.0,
+                step_cost=0.0,
+                w_h=0.0,
+                completion_quality_floor=0.4,
+                exc_gate_target=6.0,
+                R_struct_max=250.0,
+                struct_w_chain=0.0,
+                struct_w_single_drop=0.20,
+                struct_single_drop_target=12.0,
+                struct_w_drop_runs=0.15,
+                struct_drop_runs_target=2.0,
+                struct_w_length=0.15,
+                struct_length_target=70.0,
+                struct_w_banked=0.10,
+                struct_banked_target=4.0,
+                struct_w_turns=0.25,
+                struct_turns_target=12.0,
+                struct_w_sbend=0.05,
+                struct_sbend_target=4.0,
+                struct_w_turn_balance=0.10,
+                struct_turn_balance_target=2.0,   # weights sum to 1.0
+                R_viable=150.0,
+                R_caps_max=250.0,
+                R_exc_milestone=100.0,
+                exc_milestone_bars=(2.5, 4.0, 5.5),
+                R_qualify=200.0,
+                qualify_min_excitement=4.5,
+                qualify_min_turns=12.0,
+                qualify_min_turn_balance=2.0,
+                qualify_requires_test=True,
+                w_exc_feat=6.0,
+            )
         if phase >= 5:  # quality; discovery off (w_h=0), step_cost 0 (quality scales with
             # size). Jul-9 redesign: the old params zeroed every gate/struct term and the
             # policy promptly shrank to a 24-piece E=1.15 loop. The reward now points at
@@ -360,6 +403,21 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                          if h.get('position') is not None and h.get('next_position') is not None))
 
     @staticmethod
+    def _history_turn_count(base_env):
+        """Turn-family pieces in the history (mirrors env._turn_count)."""
+        history = getattr(base_env.track_builder, 'history', [])
+        return sum(1 for h in history
+                   if h.get('action') in (1, 2, 3, 4, 21, 22, 23, 24, 29, 30))
+
+    @staticmethod
+    def _history_turn_balance(base_env):
+        """min(left, right) turn-family pieces (mirrors env._turn_balance_count)."""
+        history = getattr(base_env.track_builder, 'history', [])
+        left = sum(1 for h in history if h.get('action') in (1, 3, 21, 23, 29))
+        right = sum(1 for h in history if h.get('action') in (2, 4, 22, 24, 30))
+        return min(left, right)
+
+    @staticmethod
     def _history_has_steep_drop(base_env):
         """Whether the history contains a 60-degree descent piece (actions 8/27/28)."""
         history = getattr(base_env.track_builder, 'history', [])
@@ -453,6 +511,17 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                         and self._history_has_steep_drop(base_env)
                         and getattr(base_env, 'track_length', 0) >= P.struct_length_target
                         and getattr(base_env, '_last_test_ok', False))
+        if self.current_phase >= 6:
+            # "Style": completed, tested at the E floor, AND genuinely winding -- turn
+            # count plus handedness balance (the legs the reward ramps pay toward).
+            P = self._phase_reward_params(6)
+            return bool(success
+                        and getattr(base_env, '_last_test_ok', False)
+                        and float(getattr(base_env, 'last_ride_excitement', 0.0))
+                        >= P.qualify_min_excitement
+                        and self._history_turn_count(base_env) >= P.qualify_min_turns
+                        and self._history_turn_balance(base_env)
+                        >= P.qualify_min_turn_balance)
         if self.current_phase >= 5:
             # Quality diagnostic (does NOT gate the P5 length ladder, which stays on raw
             # cold success): completed, TESTED, and rated at least the middle milestone
@@ -476,6 +545,7 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
             3: (self.phase3_max_length, True),
             4: (self.phase4_max_length, False),   # ride test ON: P4 verifies the train runs
             5: (self.phase5_current_length, False),
+            6: (self.phase6_max_length, False),   # style phase: full budget, testing ON
         }
 
         max_length, skip_testing = phase_configs.get(
@@ -496,7 +566,8 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                 2: f"Lift Hill Building {self.phase2_stage_name()}",
                 3: "Drop & Turn",
                 4: "Circuit Mastery",
-                5: "Quality Optimization"
+                5: "Quality Optimization",
+                6: "Style / Variety"
             }
             print(f"📚 Phase {self.current_phase} ({phase_names.get(self.current_phase, '')}) "
                   f"settings applied: max_length={max_length}, skip_testing={skip_testing}")
@@ -590,6 +661,18 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
 
                 return True
 
+            # Ladder topped out: open Phase 6 (Style) once quality HOLDS on cold
+            # episodes -- the P5 qualified diagnostic (tested E >= 4) over the cold
+            # window, same cold-only gating discipline as every phase.
+            if (self.phase5_current_length >= self.phase5_target_length
+                    and len(self.episode_qualified_results) >= 50):
+                qualified_rate = sum(self.episode_qualified_results) / len(
+                    self.episode_qualified_results
+                )
+                if qualified_rate >= self.phase6_entry_threshold:
+                    self._advance_to_phase(6)
+                    return True
+
         return False
 
     def phase2_stage_name(self):
@@ -675,7 +758,8 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                 2: ("Lift Hill Building", "Learning chain lifts and energy management"),
                 3: ("Drop & Turn", "Learning drops and turnarounds"),
                 4: ("Circuit Mastery", "Full integration of all skills"),
-                5: ("Quality Optimization", "Optimizing for ride ratings")
+                5: ("Quality Optimization", "Optimizing for ride ratings"),
+            6: ("Style / Variety", "Winding layouts at held quality")
             }
             name, desc = phase_names.get(new_phase, (f"Phase {new_phase}", ""))
 
@@ -690,13 +774,13 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
         measure the true task), or past the scaffolded phases (1-5). Each phase prefers
         loops that can actually satisfy its gate (with graceful pool fallback)."""
         if (not self.warm_start_enabled or not self._track_stats
-                or self.current_phase > 5):
+                or self.current_phase > 6):
             return WarmStartPlan(prefix=[], k=0, loop_len=0, cold=True)
         self._loop_library.maybe_refresh()   # pick up other workers' harvested loops
         base_env = self._get_base_env()
         budget = getattr(base_env, 'max_track_length', 40)
         min_chains, min_len, min_drop_z, min_steep_z = 1, 0, 0, 0
-        min_single_drop_z, min_excitement = 0, 0.0
+        min_single_drop_z, min_excitement, min_turns = 0, 0.0, 0
         if self.current_phase == 2 and self.phase2_stage >= 3:
             min_chains = 3
         elif self.current_phase == 3:
@@ -706,6 +790,13 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
             # (the P3 bar) which let non-steep 26-38 piece harvests dominate the pool
             # while the 60-degree leg went unpracticed (Jul-8 run: 12h, zero own steep).
             min_chains, min_len, min_drop_z, min_steep_z = 3, 40, 8, 8
+        elif self.current_phase >= 6:
+            # P6 (Style): exemplar-shaped AND turny. min_turns=8 sits under the 12-piece
+            # gate so the excited/steep fallbacks still fire while turny exemplars are
+            # scarce; the pool's per-bin cap keeps multiple styles in every draw.
+            min_chains, min_len, min_drop_z, min_single_drop_z = 1, 40, 12, 12
+            min_turns = 8
+            min_excitement = 0.8 * self._loop_library.best_excitement(budget)
         elif self.current_phase >= 5:
             # P5 (Jul-9): scaffold from excitement exemplars. Shape criteria mirror the
             # rating caps (>=12z single drop on a >=40 piece loop); the excitement bar
@@ -718,7 +809,7 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
             self._loop_library, self.current_phase, budget,
             min_chains=min_chains, min_len=min_len, min_drop_z=min_drop_z,
             min_steep_z=min_steep_z, min_single_drop_z=min_single_drop_z,
-            min_excitement=min_excitement)
+            min_excitement=min_excitement, min_turns=min_turns)
 
     def reset(self, **kwargs):
         """Reset environment and check for phase advancement"""
@@ -741,7 +832,8 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
             2: f"Lift Hill Building {self.phase2_stage_name()}",
             3: "Drop & Turn",
             4: "Circuit Mastery",
-            5: "Quality Optimization"
+            5: "Quality Optimization",
+                6: "Style / Variety"
         }.get(self.current_phase, f"Phase {self.current_phase}")
         if self.current_phase == 2:
             info['phase2_stage'] = self.phase2_stage

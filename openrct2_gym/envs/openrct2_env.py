@@ -120,6 +120,11 @@ class RewardParams:
     qualify_requires_energy: bool = False      # P3: cheap viability proxy (ride testing is off)
     qualify_requires_steep_drop: bool = False  # P4: a 60-degree descent segment is required
     qualify_requires_test: bool = False        # P4: the ride test must return real stats
+    # P6 qualify legs: a measured-excitement floor (trusted only when tested) plus the
+    # variety conjunction -- every leg also has a graded struct ramp (the house rule).
+    qualify_min_excitement: float = 0.0
+    qualify_min_turns: float = 0.0
+    qualify_min_turn_balance: float = 0.0
     # --- P5 quality economics (all default-inert) ---
     # Quality gate on completion: pay floor*R_complete at close via _calculate_reward, and
     # the remainder scaled by MEASURED excitement post-test (same terminal step, so it is
@@ -136,6 +141,16 @@ class RewardParams:
     struct_drop_runs_target: float = 2.0       # the game's RequirementNumDrops threshold
     struct_w_banked: float = 0.0
     struct_banked_target: float = 4.0
+    # --- P6 variety legs (all default-inert): the monoculture fix. Every build was the
+    # same rectangle because no term distinguished shapes; these grade turn-piece count,
+    # S-bends, and handedness BALANCE (a rectangle is all-one-direction turns, so the
+    # balance leg is what forces genuine winding).
+    struct_w_turns: float = 0.0
+    struct_turns_target: float = 12.0
+    struct_w_sbend: float = 0.0
+    struct_sbend_target: float = 4.0
+    struct_w_turn_balance: float = 0.0
+    struct_turn_balance_target: float = 2.0
     # Discrete excitement milestones: R_exc_milestone paid per bar cleared by the measured
     # excitement (post-test). Staged bars make each increment a paid event on the way to
     # the E7-9 band -- the phase2-stage pattern applied to quality.
@@ -574,6 +589,8 @@ class OpenRCT2Env(gym.Env):
                 'drop_runs': float(self._drop_run_count()),
                 'banked_turns': float(self._banked_turn_count()),
                 'turn_count': float(self._turn_count()),
+                'sbend_count': float(self._sbend_count()),
+                'turn_balance': float(self._turn_balance_count()),
                 'caps_bonus': float(getattr(self, '_last_caps_bonus', 0.0)),
                 'meas_available': float(bool(getattr(self, '_last_measurements', None))),
             }
@@ -1373,6 +1390,19 @@ class OpenRCT2Env(gym.Env):
         return sum(1 for h in hist
                    if h.get("action") in (1, 2, 3, 4, 21, 22, 23, 24, 29, 30))
 
+    def _sbend_count(self):
+        """S-bend pieces (29/30): lateral weave without a heading change."""
+        hist = getattr(self.track_builder, "history", None) or []
+        return sum(1 for h in hist if h.get("action") in (29, 30))
+
+    def _turn_balance_count(self):
+        """min(left-family, right-family) turn pieces: 0 for a single-handed rectangle,
+        rising only when the layout genuinely winds both ways (the P6 variety gate leg)."""
+        hist = getattr(self.track_builder, "history", None) or []
+        left = sum(1 for h in hist if h.get("action") in (1, 3, 21, 23, 29))
+        right = sum(1 for h in hist if h.get("action") in (2, 4, 22, 24, 30))
+        return min(left, right)
+
     def _chain_max_gain(self):
         """Highest elevation (z above station) reached via CHAIN-LIFT pieces (actions 9/10) in
         the removal-safe history; 0.0 if none. Single source of truth for every chain-elevation
@@ -1413,6 +1443,12 @@ class OpenRCT2Env(gym.Env):
                        if params.struct_drop_runs_target > 0 else 0.0)
         banked_q = (min(self._banked_turn_count() / params.struct_banked_target, 1.0)
                     if params.struct_banked_target > 0 else 0.0)
+        turns_q = (min(self._turn_count() / params.struct_turns_target, 1.0)
+                   if params.struct_turns_target > 0 else 0.0)
+        sbend_q = (min(self._sbend_count() / params.struct_sbend_target, 1.0)
+                   if params.struct_sbend_target > 0 else 0.0)
+        balance_q = (min(self._turn_balance_count() / params.struct_turn_balance_target, 1.0)
+                     if params.struct_turn_balance_target > 0 else 0.0)
         return min(params.struct_w_chain * chain_q
                    + params.struct_w_drop * drop_q
                    + params.struct_w_height * height_q
@@ -1420,7 +1456,10 @@ class OpenRCT2Env(gym.Env):
                    + params.struct_w_steep * steep_q
                    + params.struct_w_single_drop * single_drop_q
                    + params.struct_w_drop_runs * drop_runs_q
-                   + params.struct_w_banked * banked_q, 1.0)
+                   + params.struct_w_banked * banked_q
+                   + params.struct_w_turns * turns_q
+                   + params.struct_w_sbend * sbend_q
+                   + params.struct_w_turn_balance * balance_q, 1.0)
 
     def _structural_bonus(self, params):
         """Completion-conditioned bonus for building the lift-hill / drop structure each
@@ -1449,6 +1488,17 @@ class OpenRCT2Env(gym.Env):
                 return False
         if params.qualify_requires_test and not getattr(self, "_last_test_ok", False):
             return False
+        if params.qualify_min_turns > 0 and self._turn_count() < params.qualify_min_turns:
+            return False
+        if (params.qualify_min_turn_balance > 0
+                and self._turn_balance_count() < params.qualify_min_turn_balance):
+            return False
+        if params.qualify_min_excitement > 0:
+            if not getattr(self, "_last_test_ok", False):
+                return False
+            if (float(getattr(self, "last_ride_excitement", 0.0))
+                    < params.qualify_min_excitement):
+                return False
         return True
 
     def _calculate_distance_to_start(self):

@@ -2870,6 +2870,139 @@ def test_turn_and_banked_counters():
     assert env._turn_count() == 4                            # 3, 21, 24, 29; drop is not a turn
 
 
+# ------------------------------------- P6 variety legs (the monoculture problem)
+# Every build is the same rectangle because nothing ever paid for shape: exemplars,
+# ratchet, and reward all select one motif. P6 grades turn count, S-bends, and
+# HANDEDNESS BALANCE (rectangles are all-one-direction; balance forces winding).
+
+def test_turn_balance_and_sbend_counters():
+    # left family: 1,3,21,23,29 -- right family: 2,4,22,24,30
+    rows = [(4, 14, 14), (4, 14, 14), (4, 14, 14), (4, 14, 14),   # 4 right (a rectangle)
+            (3, 14, 14), (29, 14, 14), (30, 14, 14)]              # 1 left + S-pair (1L/1R)
+    env = _bare_env(history=_env_hist(rows))
+    assert env._sbend_count() == 2                           # 29, 30
+    assert env._turn_balance_count() == 2                    # min(left=2, right=5)
+    rect = _bare_env(history=_env_hist([(4, 14, 14)] * 4))
+    assert rect._turn_balance_count() == 0                   # single-handed: no balance
+
+
+def test_p6_variety_fields_default_inert():
+    p = RewardParams()
+    assert (p.struct_w_turns, p.struct_turns_target) == (0.0, 12.0)
+    assert (p.struct_w_sbend, p.struct_sbend_target) == (0.0, 4.0)
+    assert (p.struct_w_turn_balance, p.struct_turn_balance_target) == (0.0, 2.0)
+    assert p.qualify_min_excitement == 0.0
+    assert p.qualify_min_turns == 0.0
+    assert p.qualify_min_turn_balance == 0.0
+
+
+def test_hill_quality_pays_variety_components():
+    params = replace(RewardParams(), R_struct_max=250.0, struct_w_chain=0.0,
+                     struct_w_drop=0.0, struct_height_target=0.0,
+                     struct_w_turns=0.5, struct_turns_target=12.0,
+                     struct_w_sbend=0.25, struct_sbend_target=4.0,
+                     struct_w_turn_balance=0.25, struct_turn_balance_target=2.0)
+    rows = ([(4, 14, 14)] * 4 + [(3, 14, 14)] * 2                 # 6 turns, balance 2
+            + [(29, 14, 14), (30, 14, 14)])                       # +2 S (also turns)
+    env = _bare_env(history=_env_hist(rows))
+    # turns 8/12, sbend 2/4, balance min(3,5)=3 -> capped 2/2
+    expected = 0.5 * (8 / 12) + 0.25 * (2 / 4) + 0.25 * 1.0
+    assert env._hill_quality(params) == pytest.approx(expected)
+
+
+def test_qualify_variety_legs():
+    params = replace(RewardParams(), R_qualify=200.0, struct_height_target=0.0,
+                     struct_drop_target=0.0, struct_length_target=0.0,
+                     qualify_min_excitement=4.5, qualify_min_turns=6.0,
+                     qualify_min_turn_balance=2.0, qualify_requires_test=True)
+    rows = [(4, 14, 14)] * 4 + [(3, 14, 14)] * 2
+    env = _bare_env(history=_env_hist(rows))
+    env._last_test_ok = True
+    env.last_ride_excitement = 5.0
+    assert env._qualifies(params) is True
+    env.last_ride_excitement = 4.0                           # below the E floor
+    assert env._qualifies(params) is False
+    env.last_ride_excitement = 5.0
+    env._last_test_ok = False                                # untested -> E not trusted
+    assert env._qualifies(params) is False
+    env._last_test_ok = True
+    rect = _bare_env(history=_env_hist([(4, 14, 14)] * 8))   # turns ok, balance 0
+    rect._last_test_ok = True
+    rect.last_ride_excitement = 5.0
+    assert rect._qualifies(params) is False
+
+
+def test_p6_params_grade_variety():
+    p6 = ImprovedPhasedCurriculumWrapper._phase_reward_params(6)
+    assert (p6.struct_w_turns, p6.struct_turns_target) == (0.25, 12.0)
+    assert (p6.struct_w_sbend, p6.struct_sbend_target) == (0.05, 4.0)
+    assert (p6.struct_w_turn_balance, p6.struct_turn_balance_target) == (0.10, 2.0)
+    assert (p6.struct_w_single_drop, p6.struct_w_drop_runs) == (0.20, 0.15)
+    assert (p6.struct_w_length, p6.struct_w_banked) == (0.15, 0.10)
+    total = (p6.struct_w_single_drop + p6.struct_w_drop_runs + p6.struct_w_length
+             + p6.struct_w_banked + p6.struct_w_turns + p6.struct_w_sbend
+             + p6.struct_w_turn_balance)
+    assert total == pytest.approx(1.0)
+    assert p6.qualify_min_excitement == 4.5
+    assert (p6.qualify_min_turns, p6.qualify_min_turn_balance) == (12.0, 2.0)
+    assert p6.qualify_requires_test is True and p6.R_qualify == 200.0
+    # quality economics carried over from P5 unchanged
+    assert (p6.completion_quality_floor, p6.exc_gate_target) == (0.4, 6.0)
+    assert p6.R_caps_max == 250.0 and p6.R_viable == 150.0
+    # P5 params are untouched by the P6 branch
+    p5 = ImprovedPhasedCurriculumWrapper._phase_reward_params(5)
+    assert p5.struct_w_turns == 0.0 and p5.qualify_min_excitement == 0.0
+
+
+def test_p6_qualified_requires_variety_and_tested_excitement():
+    W = ImprovedPhasedCurriculumWrapper
+    w = W.__new__(W)
+    w.current_phase = 6
+
+    def base(actions, test_ok=True, exc=5.0):
+        hist = [{"action": a, "position": [i, 0, 14], "next_position": [i + 1, 0, 14]}
+                for i, a in enumerate(actions)]
+        return SimpleNamespace(track_builder=SimpleNamespace(history=hist),
+                               _last_test_ok=test_ok, last_ride_excitement=exc)
+
+    winding = [4] * 6 + [3] * 4 + [29, 30]                   # 12 turns, balance 5
+    assert w._is_qualified(base(winding), True) is True
+    assert w._is_qualified(base(winding), False) is False    # must complete
+    assert w._is_qualified(base(winding, exc=4.0), True) is False      # E floor
+    assert w._is_qualified(base(winding, test_ok=False), True) is False
+    rectangle = [4] * 12                                     # turns ok, single-handed
+    assert w._is_qualified(base(rectangle), True) is False
+    few_turns = [4] * 4 + [3] * 4                            # balanced but only 8 turns
+    assert w._is_qualified(base(few_turns), True) is False
+
+
+def test_p5_advances_to_p6_when_ladder_done_and_quality_holds(monkeypatch):
+    monkeypatch.setattr(oe_mod, "APIController", FakeAPI)
+    base = OpenRCT2Env(verbose=0)
+    w = ImprovedPhasedCurriculumWrapper(base, verbose=0)
+    w.current_phase = 5
+    w._update_phase_settings()
+    w._track_stats = True
+    w.phase_episode_count = 60
+    w.phase5_current_length = w.phase5_target_length          # ladder topped out
+    w.episode_results.extend([True] * 50)
+    w.episode_qualified_results.extend([True] * 20 + [False] * 30)   # 40% >= E4 cold
+    assert w._check_phase_advancement() is True
+    assert w.current_phase == 6
+    assert base.max_track_length == w.phase6_max_length == 120
+    assert base.skip_ride_testing is False
+    # below the entry bar: no advancement
+    w2 = ImprovedPhasedCurriculumWrapper(OpenRCT2Env(verbose=0), verbose=0)
+    w2.current_phase = 5
+    w2._track_stats = True
+    w2.phase_episode_count = 60
+    w2.phase5_current_length = w2.phase5_target_length
+    w2.episode_results.extend([True] * 50)
+    w2.episode_qualified_results.extend([True] * 10 + [False] * 40)  # 20%
+    assert w2._check_phase_advancement() is False
+    assert w2.current_phase == 5
+
+
 # --------------------------------- P4 steep-drop credit (the last reward-invisible leg)
 # 9h into the fixed P4 run: tests verified (0.74), height/drop/length legs green or
 # ramping, but qualified_rate pinned at 0 -- the 60-degree steep-drop leg had NO gradient

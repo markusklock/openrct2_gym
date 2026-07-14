@@ -20,6 +20,8 @@ from dataclasses import dataclass
 
 CHAIN_ACTIONS = (9, 10)          # matches openrct2_env / api_track_builder chain-lift actions
 STEEP_ACTIONS = (8, 27, 28)      # 60-degree family (matches env._steep_drop_z / P4's gate leg)
+TURN_ACTIONS = (1, 2, 3, 4, 21, 22, 23, 24, 29, 30)   # matches env._turn_count
+SBEND_ACTIONS = (29, 30)
 
 # Static per-action z geometry (live-verified via the base-z offset probes): descents drop
 # by their span, ascents climb by theirs. Lets the pool grade loops by real drop height and
@@ -73,6 +75,15 @@ class LoopRecord:
             else:
                 run = 0.0
         return float(best)
+
+    @property
+    def turn_count(self):
+        """Turn-family pieces (mirrors env._turn_count); the P6 pool criterion."""
+        return sum(1 for a in self.actions if a in TURN_ACTIONS)
+
+    @property
+    def sbend_count(self):
+        return sum(1 for a in self.actions if a in SBEND_ACTIONS)
 
 
 class LoopLibrary:
@@ -182,8 +193,16 @@ class LoopLibrary:
             pass                           # in-memory record kept; persistence is best-effort
         return True
 
+    # P6 diversity: cap each shape bin's contribution to the best tier so one style
+    # cannot monopolize the scaffold (the rectangle monoculture problem).
+    P6_BIN_CAP = 3
+
+    @staticmethod
+    def _shape_bin(record):
+        return (min(record.turn_count // 6, 2), record.sbend_count > 0)
+
     def pool(self, phase, max_len, min_chains=1, min_len=0, min_drop_z=0, min_steep_z=0,
-             min_single_drop_z=0, min_excitement=0.0):
+             min_single_drop_z=0, min_excitement=0.0, min_turns=0):
         """Loops usable this episode: must fit the track budget with margin for the suffix
         search. Phase >= 2 prefers loops matching ALL the phase's structure criteria
         (chains, length, drop height, steep-dropped height, single-drop depth, measured
@@ -199,8 +218,15 @@ class LoopLibrary:
                                         and r.drop_z >= min_drop_z
                                         and r.steep_drop_z >= min_steep_z
                                         and r.max_single_drop_z >= min_single_drop_z
-                                        and r.excitement >= min_excitement)]
+                                        and r.excitement >= min_excitement
+                                        and r.turn_count >= min_turns)]
             if best:
+                if phase >= 6:
+                    by_bin = {}
+                    for r in sorted(best, key=lambda r: -r.excitement):
+                        by_bin.setdefault(self._shape_bin(r), []).append(r)
+                    return [r for members in by_bin.values()
+                            for r in members[:self.P6_BIN_CAP]]
                 return best
             if min_excitement > 0:
                 excited = [r for r in fits if (r.excitement >= min_excitement
@@ -302,14 +328,16 @@ class WarmStartAnnealer:
         return WarmStartPlan(prefix=[], k=0, loop_len=0, cold=True)
 
     def sample_plan(self, library, phase, max_track_length, min_chains=1, min_len=0,
-                    min_drop_z=0, min_steep_z=0, min_single_drop_z=0, min_excitement=0.0):
+                    min_drop_z=0, min_steep_z=0, min_single_drop_z=0, min_excitement=0.0,
+                    min_turns=0):
         """The episode's warm-start plan. Cold when the die says so, the pool is empty,
         or the sampled k has annealed past the loop length (natural end of the scaffold)."""
         pool = (library.pool(phase, max_track_length, min_chains=min_chains,
                              min_len=min_len, min_drop_z=min_drop_z,
                              min_steep_z=min_steep_z,
                              min_single_drop_z=min_single_drop_z,
-                             min_excitement=min_excitement)
+                             min_excitement=min_excitement,
+                             min_turns=min_turns)
                 if library is not None else [])
         if not pool or self._rng.random() < self.p_cold:
             return self._cold_plan()
@@ -496,6 +524,50 @@ def generate_p5_candidates():
                                + hop * hops
                                + reclimb + drop2 + [0] * rest
                                + list(t_pair))
+    return out
+
+
+def generate_p6_candidates():
+    """Style exemplars for the Phase-6 pool: the P5 cap-passing hill core carried by a
+    WINDING approach -- two canceling jog-pairs ([4,0,3] out, [3,0,4] back: both turn
+    handedness, net-zero lateral, heading preserved) plus optional S-pairs. Rectangles
+    taught a monoculture; these carry the variety gate legs (>=12 turns, balance >=2)
+    without giving up the length/drop caps. Live closure-scan verification (the seeding
+    script) remains the geometry authority, as for every earlier family."""
+    out = []
+    climb = [10, 9, 9, 9, 9, 9, 9, 13]
+    main_drop = [12, 27, 28, 6, 6, 14]
+    reclimb, drop2 = [11, 5, 13], [12, 6, 14]
+    hop = [11, 5, 13, 12, 6, 14]
+    jog_out, jog_back = [4, 0, 3], [3, 0, 4]        # right-out / left-back (canceling)
+    JOG_X = 5                                        # approx x-tiles per jog (live-verified)
+    for p in (34, 38, 42):
+        east = 7 + p
+        for hops in (0, 1, 2):
+            block = (len(climb) + len(main_drop) + len(hop) * hops
+                     + len(reclimb) + len(drop2))
+            if block > east:
+                continue
+            for s_pairs in (0, 1):
+                # TWO full out-back jog pairs: 8 turn pieces, 4 of each handedness --
+                # with the 4 U-turn pieces that's 12+ turns and balance 4 at the gate.
+                straights = p - 4 * JOG_X - 4 * s_pairs
+                if straights < 8:
+                    continue
+                a = straights // 3
+                b = straights - 2 * a - 2
+                approach = ([0, 0] + jog_out + [0] * a + jog_back + [0] * a
+                            + jog_out + [0] * (straights - 3 * a - 2) + jog_back
+                            + [29, 30] * s_pairs + [0] * b)
+                for mid in sorted({0, east - block}):
+                    rest = east - block - mid
+                    if rest < 0 or mid < 0:
+                        continue
+                    out.append(approach + [4, 4]
+                               + climb + [0] * mid + main_drop
+                               + hop * hops
+                               + reclimb + drop2 + [0] * rest
+                               + [4, 4])
     return out
 
 

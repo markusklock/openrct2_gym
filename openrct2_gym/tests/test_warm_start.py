@@ -367,6 +367,92 @@ def test_loop_record_max_single_drop_property():
     assert LoopRecord.from_actions([0, 3, 3], "scripted").max_single_drop_z == 0.0
 
 
+def test_generate_p6_candidates_wind_both_ways():
+    """P6 exemplars must carry the variety gate legs: >=12 turn pieces with handedness
+    balance >=2 (canceling jog-pairs wind out and back), plus every P5 cap leg (z-balance,
+    steep segment, >=12z single drop, >=2 drop runs)."""
+    from openrct2_gym.envs.warm_start import (
+        generate_p6_candidates, ACTION_DROP_Z as DZ, ACTION_CLIMB_Z as CZ)
+    cands = generate_p6_candidates()
+    assert len(cands) >= 8
+    for c in cands:
+        assert 56 <= len(c) <= 116
+        left = sum(1 for a in c if a in (1, 3, 21, 23, 29))
+        right = sum(1 for a in c if a in (2, 4, 22, 24, 30))
+        assert min(left, right) >= 2
+        turns = sum(1 for a in c if a in (1, 2, 3, 4, 21, 22, 23, 24, 29, 30))
+        assert turns >= 12
+        assert 27 in c and 28 in c
+        z = 0
+        best = run = 0.0
+        runs = 0
+        for a in c:
+            z += CZ.get(a, 0) - DZ.get(a, 0)
+            d = DZ.get(a, 0)
+            if d > 0:
+                run += d
+                best = max(best, run)
+            else:
+                runs, run = runs + (1 if run >= 2 else 0), 0.0
+        runs += 1 if run >= 2 else 0
+        assert z == 0
+        assert best >= 12.0
+        assert runs >= 2
+
+
+def test_loop_record_turn_and_sbend_properties():
+    rec = LoopRecord.from_actions([4, 4, 0, 3, 29, 30, 0, 4, 4], "scripted")
+    assert rec.turn_count == 7                               # 4,4,3,29,30,4,4
+    assert rec.sbend_count == 2
+    assert LoopRecord.from_actions([0, 0, 6], "scripted").turn_count == 0
+
+
+def test_pool_p6_min_turns_and_shape_bin_diversity(tmp_path):
+    """P6 pools must sustain MULTIPLE styles: the best tier caps each shape bin so a
+    high-excitement rectangle monoculture cannot crowd out winding newcomers."""
+    lib = _lib(tmp_path)
+    for i in range(5):                                       # rectangle bin, high E
+        seq = ([0] * (28 + i) + [4, 4] + [10, 9, 9, 9, 9, 9, 9, 13]
+               + [12, 27, 28, 6, 6, 14] + [11, 5, 13] + [12, 6, 14]
+               + [0] * (7 + i) + [4, 4])
+        assert lib.add(LoopRecord.from_actions(seq, "scripted", excitement=5.8))
+    winding = ([0] * 10 + [4, 0, 3] + [0] * 4 + [3, 0, 4] + [0] * 8 + [29, 30]
+               + [4, 4] + [10, 9, 9, 9, 9, 9, 9, 13] + [12, 27, 28, 6, 6, 14]
+               + [11, 5, 13] + [12, 6, 14] + [0] * 6 + [4, 4])
+    assert lib.add(LoopRecord.from_actions(winding, "scripted", excitement=4.9))
+    pool = lib.pool(phase=6, max_len=120, min_chains=1, min_len=40, min_drop_z=12,
+                    min_single_drop_z=12, min_excitement=4.5, min_turns=4)
+    actions = [r.actions for r in pool]
+    assert tuple(winding) in actions                         # the winding style survives
+    rect_members = [a for a in actions if a != tuple(winding)]
+    assert len(rect_members) <= 3                            # monoculture bin capped
+    pool_turny = lib.pool(phase=6, max_len=120, min_chains=1, min_len=40, min_drop_z=12,
+                          min_single_drop_z=12, min_excitement=4.5, min_turns=8)
+    assert [r.actions for r in pool_turny] == [tuple(winding)]
+
+
+def test_wrapper_p6_scaffold_requests_turny_pool(monkeypatch, tmp_path):
+    wrapper, base = _wrapped(monkeypatch, tmp_path, p_cold=0.0)
+    seen = []
+    orig = wrapper._annealer.sample_plan
+
+    def spy(library, phase, max_len, **kw):
+        seen.append((phase, kw))
+        return orig(library, phase, max_len, **kw)
+
+    wrapper._annealer.sample_plan = spy
+    wrapper.current_phase = 6
+    wrapper._update_phase_settings()
+    wrapper.reset()
+    phase, kw = seen[-1]
+    assert phase == 6
+    assert (kw['min_chains'], kw['min_len'], kw['min_drop_z'],
+            kw['min_single_drop_z'], kw['min_turns']) == (1, 40, 12, 12, 8)
+    assert kw['min_excitement'] >= 0.0                       # ratchet still applies
+    wrapper.current_phase = 7                                # past-curriculum guard moved
+    assert wrapper._sample_warm_start().cold is True
+
+
 def test_library_add_upgrades_excitement_on_dup(tmp_path):
     lib = _lib(tmp_path)
     assert lib.add(LoopRecord.from_actions(FLAT, "harvest", excitement=0.0)) is True
@@ -1021,7 +1107,7 @@ def test_wrapper_warm_starts_all_phases_with_p5_exc_ratchet(monkeypatch, tmp_pat
     assert wrapper._current_plan.cold is False                      # P3 scaffolds now
     assert seen[-1] == (3, {'min_chains': 2, 'min_len': 20, 'min_drop_z': 4,
                             'min_steep_z': 0, 'min_single_drop_z': 0,
-                            'min_excitement': 0.0})
+                            'min_excitement': 0.0, 'min_turns': 0})
     wrapper.current_phase = 4
     wrapper._update_phase_settings()
     wrapper.reset()
@@ -1029,7 +1115,7 @@ def test_wrapper_warm_starts_all_phases_with_p5_exc_ratchet(monkeypatch, tmp_pat
     # prefixes are qualifying-shaped instead of recycled P3 material.
     assert seen[-1] == (4, {'min_chains': 3, 'min_len': 40, 'min_drop_z': 8,
                             'min_steep_z': 8, 'min_single_drop_z': 0,
-                            'min_excitement': 0.0})
+                            'min_excitement': 0.0, 'min_turns': 0})
     wrapper.current_phase = 5
     wrapper._update_phase_settings()
     wrapper.reset()
@@ -1044,8 +1130,9 @@ def test_wrapper_warm_starts_all_phases_with_p5_exc_ratchet(monkeypatch, tmp_pat
         LoopRecord.from_actions(BIG_EXCITING, "harvest", excitement=5.0))
     wrapper.reset()
     assert seen[-1][1]['min_excitement'] == pytest.approx(4.0)
-    # phases past the curriculum build cold (guard only -- phase 6 has no full machinery)
-    wrapper.current_phase = 6
+    # phases past the curriculum build cold (P6 now scaffolds -- see
+    # test_wrapper_p6_scaffold_requests_turny_pool; the guard sits at > 6)
+    wrapper.current_phase = 7
     assert wrapper._sample_warm_start().cold is True
 
 

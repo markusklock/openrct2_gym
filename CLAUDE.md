@@ -95,6 +95,17 @@ This is a Gymnasium environment for training RL agents to build roller coasters 
   `build_loop_library.py --p4` seeding 40-44 piece verified steep loops
   (`generate_p4_candidates`; 24 seeded live Jul-8). RULE: a rare gate skill needs
   scaffold-side practice (reverse curriculum), not just reward-side visibility
+- Phase 6: Style / Variety (120 pieces) - added Jul-14: the monoculture fix. Every earlier
+  phase converged onto ONE rectangle motif because nothing paid for shape. P6 grades turn
+  count (.25@12), S-bends (.05@4), and handedness BALANCE (.10@2 -- min(left,right) turn
+  pieces; a rectangle is all-one-direction so this leg forces genuine winding), keeps the
+  P5 quality economics (exc gate 0.4->E6, milestones, caps, R_viable), and gates qualified
+  on tested E>=4.5 AND turns>=12 AND balance>=2. Entry from P5: length ladder done + cold
+  tested-E>=4 rate >= 0.30 (phase6_entry_threshold). Scaffolds stay ON in P6 with
+  min_turns=8 pool criterion and a per-shape-bin cap (P6_BIN_CAP=3) so one style cannot
+  monopolize the pool; `generate_p6_candidates` seeds winding exemplars (canceling
+  jog-pairs = both handedness, net-zero lateral; seed with
+  `seed_p5_exemplars.py --family p6`). Watch structure/turn_balance + structure/sbend_count
 - **P5 quality unlock (Jul-9)**: P4 solved, then P5 plateaued at E=1.15 on a 24-piece loop
   (ungated completion, third occurrence of the trap). Root cause verified in the game
   source: FIVE wooden-RC rating caps each HALVE all ratings when missed (single drop >=12z,

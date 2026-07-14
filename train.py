@@ -612,6 +612,8 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
                             ('drop_runs', 'structure/drop_runs'),
                             ('banked_turns', 'structure/banked_turns'),
                             ('turn_count', 'structure/turn_count'),
+                            ('sbend_count', 'structure/sbend_count'),
+                            ('turn_balance', 'structure/turn_balance'),
                             ('meas_num_drops', 'structure/meas_num_drops'),
                             ('meas_highest_drop', 'structure/meas_highest_drop'),
                             ('meas_max_speed', 'structure/meas_max_speed'),
