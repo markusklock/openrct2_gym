@@ -23,7 +23,11 @@ class RewardParams:
     the potential once, at a reset). Sparse-objective fields (R_complete gating, struct,
     milestones, R_quality_max, step_cost) vary per phase.
     """
-    gamma: float = 0.99            # MUST equal the PPO discount for PBRS invariance
+    gamma: float = 0.995           # MUST equal the PPO discount for PBRS invariance.
+                                   # 0.995 (Jul-15): at 0.99 the quick 28-piece loop was
+                                   # GENUINELY optimal from step one (gamma^62 = 0.54 ate
+                                   # the long build's 1.8x payout); 0.995 makes the long
+                                   # exemplar build win decisively from a bare station.
     # --- Phi potential weights (fixed across phases) ---
     w_xy: float = 10.0             # horizontal alignment to the closing tile
     w_z: float = 6.0               # height alignment to station height

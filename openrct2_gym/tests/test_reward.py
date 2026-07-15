@@ -69,7 +69,12 @@ def _bare_env(current_position=(61, 70, 14), current_direction=1,
 
 def test_reward_params_defaults_support_completion_first():
     p = RewardParams()
-    assert p.gamma == 0.99
+    # 0.995, not 0.99 (Jul-15): the cold-opening trap, quantified from step ONE -- at
+    # gamma 0.99 a 90-piece E5.4 build discounts to ~890 vs ~1130 for the 28-piece E2.3
+    # quick loop, so the SHORT loop was genuinely optimal and the policy was right to
+    # refuse the long opening. 0.995 flips it (~1395 vs ~909). Uniform across phases to
+    # keep the PBRS gamma-tie exact (model gamma == reward gamma == this constant).
+    assert p.gamma == 0.995
     assert p.R_complete == 1000.0
     assert p.R_quality_max == 0.0          # quality off by default (phases 1-4)
     assert p.fail_penalty == -0.1
@@ -1769,11 +1774,13 @@ def test_no_terminal_double_count_through_wrapper(monkeypatch):
     quality = base_env._quality_bonus(rr['excitement'], rr['intensity'], rr['nausea'], p)
     assert quality > 0
     # completion + quality counted EXACTLY once (env owns both; wrapper adds nothing).
-    # Jul-9 P5 economics: E=8 fully releases the quality gate (full R_complete), and the
-    # terminal step also pays R_viable, all three milestone bars, and the struct credit.
+    # Jul-15: the P5 length gate is armed, so this tiny CompletingAPI loop pays only the
+    # composed effective gate (hill x length x quality release) -- read it back from the
+    # env's own accounting rather than assuming full R_complete.
     assert reward == pytest.approx(
-        p.R_complete - phi_prev_before + quality + p.step_cost
-        + p.R_viable + 3 * p.R_exc_milestone + base_env._last_struct_bonus)
+        p.R_complete * base_env._last_completion_gate - phi_prev_before + quality
+        + p.step_cost + p.R_viable + 3 * p.R_exc_milestone + base_env._last_struct_bonus)
+    assert base_env._last_completion_gate < 1.0          # the length gate actually bit
 
 
 # ----------------------------------------------------- gamma single source (test 9)
@@ -2930,6 +2937,20 @@ def test_qualify_variety_legs():
     rect._last_test_ok = True
     rect.last_ride_excitement = 5.0
     assert rect._qualifies(params) is False
+
+
+def test_p5_long_build_beats_quick_loop_from_step_one():
+    """THE missing economics test: earlier stay-vs-extend regressions measured MID-build
+    states; the cold policy chooses at step ONE, where 60+ extra steps of discounting
+    crushed the long build at gamma 0.99 (live-probed Jul-15: deterministic cold builds
+    turn at piece 1 into a 28-piece banked loop). From a bare station, the discounted
+    value of the long exemplar build must now decisively beat the quick loop."""
+    P5 = ImprovedPhasedCurriculumWrapper._phase_reward_params(5)
+    quick = (P5.gamma ** 27) * _p5_payout(P5, length=28, chain_peak=27, steep=True,
+                                          excitement=2.34, intensity=2.6, nausea=1.4)
+    long_build = (P5.gamma ** 89) * _p5_payout(P5, length=90, chain_peak=27, steep=True,
+                                               excitement=5.4, intensity=6.2, nausea=2.2)
+    assert long_build > quick * 1.15
 
 
 def test_p6_params_grade_variety():

@@ -192,6 +192,9 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                 step_cost=0.0,
                 w_h=0.0,
                 completion_quality_floor=0.4,
+                completion_length_floor=0.5,     # quick-loop trap (Jul-15): the 28pc
+                                                  # attractor must leave length money
+                                                  # on the table from step one
                 exc_gate_target=6.0,
                 R_struct_max=250.0,
                 struct_w_chain=0.0,
@@ -232,6 +235,9 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                 step_cost=0.0,
                 w_h=0.0,
                 completion_quality_floor=0.4,
+                completion_length_floor=0.5,     # quick-loop trap (Jul-15): the 28pc
+                                                  # attractor must leave length money
+                                                  # on the table from step one
                 exc_gate_target=6.0,
                 R_struct_max=250.0,
                 struct_w_chain=0.0,
@@ -644,10 +650,9 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                 )
                 self.phase5_stage += 1
                 self._update_phase_settings()
-                # Each length rung changes the scaffold pool (bigger budget admits bigger
-                # exemplars) -- restart the anneal like any phase change (the
-                # _advance_phase2_stage precedent). Moot before Jul-9 when P5 was cold.
-                self._annealer.on_phase_change(self.current_phase)
+                # Jul-15 (reversing Jul-12): rung advances KEEP the anneal frontier.
+                # Resetting per rung discarded k progress ~4x per run segment while the
+                # pool only ever grows -- closure skill transfers across budgets.
 
                 self._clear_phase_windows()
                 self.phase_episode_count = 0

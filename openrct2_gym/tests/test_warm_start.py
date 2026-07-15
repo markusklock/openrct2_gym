@@ -289,9 +289,10 @@ def test_annealer_p5_promotes_with_larger_step():
     assert ann.k_max == 5                                   # back to +2 elsewhere
 
 
-def test_p5_substage_advance_reanneals(monkeypatch, tmp_path):
-    """Each P5 length rung changes the pool (bigger budget) -- the annealer restarts
-    like on any phase change (the _advance_phase2_stage precedent)."""
+def test_p5_substage_advance_keeps_frontier(monkeypatch, tmp_path):
+    """Jul-15 (reversing Jul-12): each ladder rung RESETTING the anneal discarded
+    frontier progress ~4x per run segment while the pool only ever grows -- closure
+    skill transfers across budgets, so rung advances now KEEP k."""
     wrapper, _ = _wrapped(monkeypatch, tmp_path, p_cold=0.0)
     wrapper.current_phase = 5
     wrapper._update_phase_settings()
@@ -299,11 +300,9 @@ def test_p5_substage_advance_reanneals(monkeypatch, tmp_path):
     wrapper.phase_episode_count = 60
     wrapper.episode_results.extend([True] * 50)
     wrapper._annealer.k_max = 11
-    wrapper._annealer.frontier.append(True)
     assert wrapper.phase5_current_length < wrapper.phase5_target_length
     assert wrapper._check_phase_advancement() is True                   # rung 80 -> 90
-    assert wrapper._annealer.k_max == wrapper._annealer.k_init
-    assert len(wrapper._annealer.frontier) == 0
+    assert wrapper._annealer.k_max == 11                                # progress kept
 
 
 def test_generate_p5_candidates_are_exemplar_shaped():

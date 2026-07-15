@@ -962,7 +962,9 @@ def train(
     # Create or load model
     if model_path and os.path.exists(model_path):
         print(f"Loading MaskablePPO model from {model_path}")
-        model = MaskablePPO.load(model_path, env=env)
+        # custom_objects: a resumed checkpoint carries its OLD gamma; the PBRS tie
+        # (model gamma == RewardParams.gamma == GAMMA) must hold after the Jul-15 bump.
+        model = MaskablePPO.load(model_path, env=env, custom_objects={"gamma": GAMMA})
     else:
         print(f"Creating new MaskablePPO model for {n_envs} parallel environments")
         policy_kwargs = dict(

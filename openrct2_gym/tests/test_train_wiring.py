@@ -685,7 +685,7 @@ def test_fresh_run_resets_tb_run_dir_resume_does_not(monkeypatch, tmp_path):
             self.gamma = T.GAMMA
 
         @classmethod
-        def load(cls, path, env=None):
+        def load(cls, path, env=None, custom_objects=None):
             return cls()
 
         def learn(self, total_timesteps, callback=None, reset_num_timesteps=None):
@@ -747,7 +747,7 @@ def test_final_model_saved_even_when_env_close_raises(monkeypatch, tmp_path):
             self._last_obs = object()
 
         @classmethod
-        def load(cls, path, env=None):
+        def load(cls, path, env=None, custom_objects=None):
             return cls()
 
         def learn(self, total_timesteps, callback=None, reset_num_timesteps=None):
@@ -785,7 +785,7 @@ def test_eval_auto_disabled_for_multi_env(monkeypatch, tmp_path):
             self._last_obs = object()
 
         @classmethod
-        def load(cls, path, env=None):
+        def load(cls, path, env=None, custom_objects=None):
             return cls()
 
         def learn(self, total_timesteps, callback=None, reset_num_timesteps=None):
@@ -823,7 +823,7 @@ def test_single_env_eval_resets_last_obs(monkeypatch, tmp_path):
             self._last_obs = object()
 
         @classmethod
-        def load(cls, path, env=None):
+        def load(cls, path, env=None, custom_objects=None):
             return cls()
 
         def learn(self, total_timesteps, callback=None, reset_num_timesteps=None):
