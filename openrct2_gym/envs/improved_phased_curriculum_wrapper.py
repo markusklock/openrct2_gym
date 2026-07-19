@@ -53,7 +53,12 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                  warm_start_enabled=True,
                  loop_library_path=None,
                  p_cold=0.25,
-                 warm_k_init=3):
+                 warm_k_init=3,
+                 # Jul-19: a deep-P5/P6 policy cannot re-walk Phase 1 (its committed
+                 # 90+ piece builds truncate inside the 40-piece budget -- live stall:
+                 # cold completion 0.00 and active unlearning). Start the curriculum
+                 # where the policy actually is.
+                 initial_phase=1):
         """
         Args:
             env: Base OpenRCT2 environment
@@ -126,6 +131,14 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
 
         # Verbosity
         self.verbose = verbose
+
+        # Deep start (resume a mature policy without the phase-1 re-walk): mark the
+        # earlier ladders complete and put the annealer in its late-phase mode.
+        if initial_phase > 1:
+            self.current_phase = initial_phase
+            if initial_phase >= 5:
+                self.phase5_current_length = self.phase5_target_length
+            self._annealer.on_phase_change(initial_phase)
 
         # Update environment settings for current phase. The reward is now a single
         # parametrized function owned by the env; the curriculum only sets parameters.

@@ -430,6 +430,22 @@ def test_pool_p6_min_turns_and_shape_bin_diversity(tmp_path):
     assert [r.actions for r in pool_turny] == [tuple(winding)]
 
 
+def test_wrapper_initial_phase_starts_deep(monkeypatch, tmp_path):
+    """Jul-19: a deep-P6 policy CANNOT re-walk Phase 1 (its committed 90+ piece builds
+    truncate inside the 40-piece budget; live: cold completion 0.00, active unlearning).
+    initial_phase starts the curriculum where the policy actually is: settings applied,
+    P5 ladder marked complete, and the annealer in its P5+ (+4) mode."""
+    wrapper, base = _wrapped(monkeypatch, tmp_path, initial_phase=6)
+    assert wrapper.current_phase == 6
+    assert base.max_track_length == wrapper.phase6_max_length == 120
+    assert base.skip_ride_testing is False
+    assert wrapper.phase5_current_length == wrapper.phase5_target_length
+    assert getattr(wrapper._annealer, "k_step", 2) == 4
+    # default stays a cold start at phase 1
+    w1, _ = _wrapped(monkeypatch, tmp_path.joinpath("d"), p_cold=0.0)
+    assert w1.current_phase == 1
+
+
 def test_wrapper_p6_scaffold_requests_turny_pool(monkeypatch, tmp_path):
     wrapper, base = _wrapped(monkeypatch, tmp_path, p_cold=0.0)
     seen = []

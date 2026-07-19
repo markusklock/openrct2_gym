@@ -774,7 +774,8 @@ def create_curriculum_masked_env(port: int, verbose: int = 0,
                                  warm_start_enabled: bool = True,
                                  loop_library_path: Optional[str] = None,
                                  p_cold: float = 0.25,
-                                 game_speed: int = 8) -> gym.Env:
+                                 game_speed: int = 8,
+                                 start_phase: int = 1) -> gym.Env:
     """Create an improved-curriculum environment with action masking for a port."""
     # A custom library path must redirect BOTH sides: the wrapper's read pool AND the
     # env's harvest destination (class attr; this runs inside each SubprocVecEnv worker).
@@ -818,6 +819,7 @@ def create_curriculum_masked_env(port: int, verbose: int = 0,
         phase5_increase_step=10,
         verbose=verbose,
         warm_start_enabled=warm_start_enabled,
+        initial_phase=start_phase,
         loop_library_path=loop_library_path,
         p_cold=p_cold,
     )
@@ -835,12 +837,13 @@ def make_env_factory(port: int, verbose: int = 0,
                      warm_start_enabled: bool = True,
                      loop_library_path: Optional[str] = None,
                      p_cold: float = 0.25,
-                     game_speed: int = 8) -> Callable[[], gym.Env]:
+                     game_speed: int = 8,
+                     start_phase: int = 1) -> Callable[[], gym.Env]:
     """Create a factory function for an environment on a specific port"""
     def _init() -> gym.Env:
         try:
             env = create_curriculum_masked_env(port, verbose, warm_start_enabled,
-                                               loop_library_path, p_cold, game_speed)
+                                               loop_library_path, p_cold, game_speed, start_phase)
             print(f"✅ Successfully connected to OpenRCT2 on port {port}")
             return env
         except Exception as e:
@@ -876,6 +879,7 @@ def train(
     loop_library_path: Optional[str] = None,
     p_cold: float = 0.25,
     game_speed: int = 8,
+    start_phase: int = 1,
 ):
     """Train agent with curriculum learning AND action masking on multiple parallel environments"""
 
@@ -930,7 +934,7 @@ def train(
 
     # Create environment factories for each port
     env_factories = [make_env_factory(port, verbose, warm_start_enabled,
-                                      loop_library_path, p_cold, game_speed) for port in ports]
+                                      loop_library_path, p_cold, game_speed, start_phase) for port in ports]
 
     # Create vectorized environments
     print(f"\n🔌 Connecting to {n_envs} OpenRCT2 instances...")
@@ -1213,6 +1217,9 @@ def main():
                        help="Requested OpenRCT2 game speed (needs the plugin's setGameSpeed "
                             "endpoint). Ride ratings take ~35s of sim time; speed 8 makes "
                             "P4/P5 ride tests ~4-5s. Set 1 to leave the game untouched.")
+    parser.add_argument("--start-phase", type=int, default=1,
+                        help="Start the curriculum at this phase (deep resume: a mature "
+                             "P5/P6 policy cannot re-walk Phase 1's 40-piece budget)")
     args = parser.parse_args()
     
     # Parse ports
@@ -1298,6 +1305,7 @@ def main():
         loop_library_path=args.loop_library,
         p_cold=args.p_cold,
         game_speed=args.game_speed,
+        start_phase=args.start_phase,
     )
     # Training function already evaluates between chunks and closes env.
     # No additional evaluation here to avoid interfering with API ports.
