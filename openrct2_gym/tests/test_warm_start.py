@@ -375,7 +375,7 @@ def test_generate_p6_candidates_wind_both_ways():
     cands = generate_p6_candidates()
     assert len(cands) >= 8
     for c in cands:
-        assert 56 <= len(c) <= 116
+        assert 56 <= len(c) <= 118    # incl. Jul-19 long winders for the topped frontier
         left = sum(1 for a in c if a in (1, 3, 21, 23, 29))
         right = sum(1 for a in c if a in (2, 4, 22, 24, 30))
         assert min(left, right) >= 2

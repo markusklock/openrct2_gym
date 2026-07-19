@@ -541,7 +541,10 @@ def generate_p6_candidates():
     hop = [11, 5, 13, 12, 6, 14]
     jog_out, jog_back = [4, 0, 3], [3, 0, 4]        # right-out / left-back (canceling)
     JOG_X = 5                                        # approx x-tiles per jog (live-verified)
-    for p in (34, 38, 42):
+    # p 46-52 added Jul-19: the fleet's anneal frontier (k 87-95) outgrew the 69-87 piece
+    # winders and winding scaffolds collapsed (turn-balanced episodes 19/30 -> 3/20) --
+    # the ladder needs winding rungs at 95-112 pieces.
+    for p in (34, 38, 42, 46, 50, 52):
         east = 7 + p
         for hops in (0, 1, 2):
             block = (len(climb) + len(main_drop) + len(hop) * hops
