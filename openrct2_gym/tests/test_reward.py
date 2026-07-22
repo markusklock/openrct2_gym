@@ -2799,6 +2799,18 @@ def test_exc_feature_potential_monotone_and_phase_gated():
     assert delta == pytest.approx(p5.w_exc_feat * env._exc_feature_quality(p5))
 
 
+def test_exc_feature_quality_pays_turn_balance_densely():
+    """Jul-22 deadlock fix: cold builds never sample the winding opening because the
+    jog only pays after a risky completion. Turn BALANCE joins the dense Phi features,
+    so the out-and-back motif earns shaped credit the moment it is placed."""
+    p6 = ImprovedPhasedCurriculumWrapper._phase_reward_params(6)
+    # SAME turn count (6 pieces), different handedness mix: only balance distinguishes
+    rect6 = _bare_env(history=_env_hist([(4, 14, 14)] * 6))
+    jogged = _bare_env(history=_env_hist([(4, 14, 14)] * 4 + [(3, 14, 14)] * 2))
+    assert (jogged._exc_feature_quality(p6)
+            - rect6._exc_feature_quality(p6)) == pytest.approx(1 / 6, abs=0.01)
+
+
 def test_p5_qualified_is_tested_excitement_diagnostic():
     """P5 'qualified' (diagnostics only; the length ladder still gates on raw cold
     success): a completed, TESTED ride rating E >= 4."""

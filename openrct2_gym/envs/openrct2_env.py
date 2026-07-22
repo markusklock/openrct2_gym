@@ -1344,6 +1344,11 @@ class OpenRCT2Env(gym.Env):
              if params.struct_single_drop_target > 0 else 0.0),
             (min(self.track_length / params.struct_length_target, 1.0)
              if params.struct_length_target > 0 else 0.0),
+            # balance joined Jul-22: the winding opening must pay AT PLACEMENT (dense,
+            # pre-completion) or cold builds never sample it -- the reliability deadlock:
+            # jogging is EV-negative until cold winding is practiced, which needs jogs.
+            (min(self._turn_balance_count() / params.struct_turn_balance_target, 1.0)
+             if params.struct_turn_balance_target > 0 else 0.0),
         ]
         return sum(comps) / len(comps)
 
