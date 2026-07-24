@@ -600,6 +600,8 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
                         # qualification bonus start to flow in P3/P4
                         if 'completion_gate' in info_metrics:
                             self.logger.record('rewards/completion_gate', info_metrics['completion_gate'])
+                        if 'style_gate' in info_metrics:
+                            self.logger.record('rewards/style_gate', info_metrics['style_gate'])
                         if 'qualify_bonus' in info_metrics:
                             self.logger.record('rewards/qualify_bonus', info_metrics['qualify_bonus'])
                         # P5 quality-economics diagnostics: the excitement gate/milestones/

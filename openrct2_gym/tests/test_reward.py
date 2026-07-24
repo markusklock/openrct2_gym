@@ -3167,3 +3167,155 @@ def test_quality_bonus_gates_out_sentinel_stats():
     p = RewardParams(R_quality_max=500.0)
     assert env._quality_bonus(-0.01, 0.0, 0.0, p) == 0.0   # unrated sentinel -> no freebie
     assert env._quality_bonus(1.5, 1.0, 0.5, p) > 0.0      # real (low) ratings still score
+
+
+# ----------------------------------- P6 style gate (the winding-frequency war, Jul-24)
+# With every style term ADDITIVE (R_qualify 200 + variety struct legs ~100), the live run
+# kept completing 4-turn drop-rectangles: k_max annealed 59->83 while balance density
+# thinned 11/20 -> 5/20 -- the annealer promotes on COMPLETION, so only the reward can
+# make the cold policy CHOOSE winding, and a ~+16% payout edge demonstrably lost the
+# frequency war to the plain shape's reliability. Fix: the thrice-proven multiplicative
+# floor, now on shape -- a P6 completion is style-gated by a composite turns+balance
+# ramp mirroring the qualified gate's two variety legs.
+
+def test_style_floor_defaults_inert():
+    p = RewardParams()
+    assert p.completion_style_floor == 1.0
+    for phase in (1, 2, 3, 4, 5):
+        assert ImprovedPhasedCurriculumWrapper._phase_reward_params(
+            phase).completion_style_floor == 1.0
+
+
+def _styled_loop(n_right=0, n_left=0, pad_to=12):
+    """Flat closed-loop rows with the given turn mix (right=4, left=3), padded straight."""
+    rows = [(4, 14, 14)] * n_right + [(3, 14, 14)] * n_left
+    rows += [(0, 14, 14)] * max(pad_to - len(rows), 0)
+    return rows
+
+
+def test_completion_style_gate_scales_r_complete():
+    """A completed loop below the variety targets earns only the style-gated fraction of
+    R_complete; the composite ramp averages the turns and balance legs so a single-handed
+    zigzag (turns maxed, balance zero) still leaves half the remainder on the table."""
+    params = replace(RewardParams(), completion_style_floor=0.6,
+                     struct_turns_target=12.0, struct_turn_balance_target=2.0)
+
+    def payout(rows):
+        env = _bare_env(history=_env_hist(rows))
+        env.loop_completed = True
+        env._phi_prev = 0.0
+        env.reward_params = params
+        return env._calculate_reward(True, 0)
+
+    assert payout(_styled_loop()) == pytest.approx(0.6 * params.R_complete)
+    gate_rect = 0.6 + 0.4 * (0.5 * (4 / 12) + 0.5 * 0.0)          # 4 same-hand turns
+    assert payout(_styled_loop(n_right=4)) == pytest.approx(params.R_complete * gate_rect)
+    gate_zigzag = 0.6 + 0.4 * (0.5 * 1.0 + 0.5 * 0.0)             # 12 turns, one-handed
+    assert payout(_styled_loop(n_right=12)) == pytest.approx(params.R_complete * gate_zigzag)
+    assert payout(_styled_loop(n_right=10, n_left=2)) == pytest.approx(params.R_complete)
+
+
+def test_style_gate_scales_quality_remainder():
+    """The style factor must fold into _last_gate_prequality so the post-test excitement
+    remainder scales with it too (style and quality form ONE multiplicative gate)."""
+    params = replace(RewardParams(), completion_style_floor=0.6,
+                     completion_quality_floor=0.4,
+                     struct_turns_target=12.0, struct_turn_balance_target=2.0)
+    env = _bare_env(history=_env_hist(_styled_loop(n_right=4)))
+    env.loop_completed = True
+    env._phi_prev = 0.0
+    env.reward_params = params
+    style = 0.6 + 0.4 * (0.5 * (4 / 12))
+    assert env._calculate_reward(True, 0) == pytest.approx(
+        params.R_complete * style * 0.4)
+    assert env._last_gate_prequality == pytest.approx(style)
+
+
+def test_validate_completion_first_folds_style_floor():
+    W = ImprovedPhasedCurriculumWrapper
+    bad = replace(RewardParams(), completion_hill_floor=0.5,
+                  completion_quality_floor=0.4, completion_style_floor=0.4,
+                  R_roundtrip=100.0)
+    with pytest.raises(AssertionError):
+        W._validate_completion_first(bad, "test")      # 100 >= .5*.4*.4*1000 = 80
+    ok = replace(bad, completion_style_floor=1.0)      # 100 < .5*.4*1000 = 200
+    W._validate_completion_first(ok, "test")
+
+
+def test_p6_params_arm_style_gate():
+    p6 = ImprovedPhasedCurriculumWrapper._phase_reward_params(6)
+    assert p6.completion_style_floor == 0.5
+    # ramp targets the gate reads are the same variety legs the qualified gate checks
+    assert (p6.struct_turns_target, p6.struct_turn_balance_target) == (12.0, 2.0)
+
+
+def _p6_payout(params, rows, excitement, intensity=6.0, nausea=2.5):
+    """Terminal payout mirroring step()'s P6 terminal branch: _calculate_reward +
+    exc-gated remainder + viable + milestones + quality bonus + qualify."""
+    env = _bare_env(history=_env_hist(rows))
+    env.loop_completed = True
+    env._phi_prev = 0.0
+    env.reward_params = params
+    env._calculate_energy_margin = lambda: 10.0
+    env._last_test_ok = excitement > 0
+    env.last_ride_excitement = excitement
+    r = env._calculate_reward(True, 0)
+    E = excitement if env._last_test_ok else 0.0
+    if params.completion_quality_floor < 1.0 and params.exc_gate_target > 0:
+        ramp = min(max(E, 0.0) / params.exc_gate_target, 1.0)
+        r += (params.R_complete * env._last_gate_prequality
+              * (1.0 - params.completion_quality_floor) * ramp)
+    if env._last_test_ok and params.R_viable > 0.0:
+        r += params.R_viable
+    r += params.R_exc_milestone * sum(1 for b in params.exc_milestone_bars if E >= b)
+    if env._last_test_ok:
+        r += env._quality_bonus(E, intensity, nausea, params)
+    if params.R_qualify > 0.0 and env._qualifies(params):
+        r += params.R_qualify
+    return r
+
+
+def _p6_shape(chain_peak, length, n_right, n_left):
+    """A P6-scale build: _big_hill's chain/drop skeleton with trailing flat pads
+    converted into the given turn mix (turn pieces are flat at base z here)."""
+    rows = _big_hill(chain_peak=chain_peak, steep=True, length=length)
+    turns = [4] * n_right + [3] * n_left
+    for i in range(len(rows) - 1, -1, -1):
+        if not turns:
+            break
+        if rows[i] == (0, 14, 14):
+            rows[i] = (turns.pop(), 14, 14)
+    assert not turns, "not enough flat pads to convert"
+    return rows
+
+
+def test_p6_winding_beats_rectangle_from_step_one():
+    """THE Jul-24 regression: at step one the discounted value of the winding build must
+    beat the 4-turn drop-rectangle DECISIVELY (>= 1.25x). Pre-fix the additive carrots
+    gave winding only a ~1.03x edge at equal measured excitement -- an edge the live
+    run proved far too thin to beat the plain shape's reliability advantage (balance
+    density thinned while k_max climbed). Equal E isolates the SHAPE economics; the
+    shape-blind quality payments (milestones/viable/quality) dilute the gate, hence
+    1.25x, still >8x the pre-fix edge -- and live, winding also RAISES E."""
+    P6 = ImprovedPhasedCurriculumWrapper._phase_reward_params(6)
+    rect = (P6.gamma ** 39) * _p6_payout(
+        P6, _p6_shape(chain_peak=27, length=40, n_right=4, n_left=0), excitement=5.6)
+    winder = (P6.gamma ** 49) * _p6_payout(
+        P6, _p6_shape(chain_peak=27, length=50, n_right=10, n_left=4), excitement=5.6)
+    assert winder > rect * 1.25
+
+
+def test_style_gate_reported_in_episode_metrics(monkeypatch):
+    """House rule: every new reward gate streams its own diagnostic. The style factor
+    actually applied at close must appear in episode_metrics regardless of shape."""
+    monkeypatch.setattr(oe_mod, "APIController", CompletingAPI)
+    env = OpenRCT2Env(verbose=0)
+    env.reward_params = replace(RewardParams(), completion_style_floor=0.6,
+                                struct_turns_target=12.0,
+                                struct_turn_balance_target=2.0, roundtrip_gain=0.0)
+    env.reset()
+    _, _, terminated, _, info = _drive_to_terminal(env)
+    assert terminated
+    frac = 0.5 * (min(env._turn_count() / 12.0, 1.0)
+                  + min(env._turn_balance_count() / 2.0, 1.0))
+    assert info['episode_metrics']['style_gate'] == pytest.approx(0.6 + 0.4 * frac)

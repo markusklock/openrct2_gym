@@ -167,9 +167,11 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
             f"{label}: climb milestones {milestones} >= R_complete {params.R_complete} "
             f"-- not closing the loop can out-pay even a perfect completion")
         if params.completion_hill_floor > 0.0:
-            # Worst-case completion pay compounds ALL gates (hill x length x quality floors).
+            # Worst-case completion pay compounds ALL gates (hill x length x quality x
+            # style floors).
             flat = (params.completion_hill_floor * params.completion_length_floor
-                    * params.completion_quality_floor * params.R_complete)
+                    * params.completion_quality_floor * params.completion_style_floor
+                    * params.R_complete)
             assert milestones < flat, (
                 f"{label}: climb milestones {milestones} >= flat-completion floor {flat} "
                 f"({params.completion_hill_floor}*{params.completion_length_floor}"
@@ -208,6 +210,13 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                 completion_length_floor=0.5,     # quick-loop trap (Jul-15): the 28pc
                                                   # attractor must leave length money
                                                   # on the table from step one
+                completion_style_floor=0.5,      # winding-frequency war (Jul-24): the
+                                                  # 4-turn rectangle must leave shape
+                                                  # money on the table from step one
+                                                  # (0.5, not 0.6: milestones/viable/
+                                                  # quality are shape-blind, so the
+                                                  # gate must cut deeper to clear a
+                                                  # decisive step-one edge)
                 exc_gate_target=6.0,
                 R_struct_max=250.0,
                 struct_w_chain=0.0,

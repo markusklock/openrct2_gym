@@ -155,6 +155,15 @@ class RewardParams:
     struct_sbend_target: float = 4.0
     struct_w_turn_balance: float = 0.0
     struct_turn_balance_target: float = 2.0
+    # Style gate on completion (P6): fraction of the (hill*length)-gated payout a
+    # shapeless loop earns; the rest ramps with a composite of the two variety legs the
+    # qualified gate checks (turns AND handedness balance, averaged -- a single-handed
+    # zigzag maxes turns yet still leaves half the remainder unpaid). Jul-24: with the
+    # style money purely ADDITIVE (R_qualify + ~0.40*R_struct_max), a winding build
+    # out-paid the 4-turn drop-rectangle by only ~3% at equal measured excitement, and
+    # the live run showed the plain shape winning the frequency war (balance density
+    # thinned 11/20 -> 5/20 while warm k_max annealed 59 -> 83). 1.0 = no gating.
+    completion_style_floor: float = 1.0
     # Discrete excitement milestones: R_exc_milestone paid per bar cleared by the measured
     # excitement (post-test). Staged bars make each increment a paid event on the way to
     # the E7-9 band -- the phase2-stage pattern applied to quality.
@@ -586,6 +595,7 @@ class OpenRCT2Env(gym.Env):
                 # length-trap fix diagnostics: the combined completion gate actually paid
                 # and whether the phase-gate qualification bonus fired
                 'completion_gate': float(getattr(self, '_last_completion_gate', 0.0)),
+                'style_gate': float(getattr(self, '_last_style_gate', 0.0)),
                 'qualify_bonus': float(getattr(self, '_last_qualify_bonus', 0.0)),
                 # P5 quality-economics diagnostics
                 'exc_milestone_bonus': float(getattr(self, '_last_exc_milestone_bonus', 0.0)),
@@ -687,6 +697,7 @@ class OpenRCT2Env(gym.Env):
         self._last_qualify_bonus = 0.0
         self._last_completion_gate = 0.0
         self._last_gate_prequality = 0.0
+        self._last_style_gate = 0.0
         self._last_exc_milestone_bonus = 0.0
         self._last_measurements = None
         self._last_caps_bonus = 0.0
@@ -871,6 +882,7 @@ class OpenRCT2Env(gym.Env):
         self._last_struct_bonus = 0.0          # reset each step (covers the failure early-return)
         self._last_completion_gate = 0.0
         self._last_gate_prequality = 0.0
+        self._last_style_gate = 0.0
         if not success:
             return float(params.fail_penalty)
 
@@ -891,6 +903,24 @@ class OpenRCT2Env(gym.Env):
                 length_frac = min(self.track_length / params.struct_length_target, 1.0)
                 gate *= (params.completion_length_floor
                          + (1.0 - params.completion_length_floor) * length_frac)
+            # Style gate (P6, multiplicative like length/quality): a shapeless completion
+            # discounts the WHOLE payout, so choosing to wind is no longer a ~3%-margin
+            # additive carrot losing to the plain rectangle's reliability. Sits above the
+            # prequality stash so the post-test excitement remainder scales with it too.
+            if params.completion_style_floor < 1.0:
+                legs = []
+                if params.struct_turns_target > 0:
+                    legs.append(min(self._turn_count()
+                                    / params.struct_turns_target, 1.0))
+                if params.struct_turn_balance_target > 0:
+                    legs.append(min(self._turn_balance_count()
+                                    / params.struct_turn_balance_target, 1.0))
+                if legs:
+                    style_frac = sum(legs) / len(legs)
+                    self._last_style_gate = (
+                        params.completion_style_floor
+                        + (1.0 - params.completion_style_floor) * style_frac)
+                    gate *= self._last_style_gate
             # Quality gate split (P5): only the floor share is paid here -- the remainder
             # is added post-test in step() scaled by measured excitement (same terminal
             # step, so together they form one multiplicative gate). Pre-quality gate is
