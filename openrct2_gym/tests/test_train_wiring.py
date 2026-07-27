@@ -1032,3 +1032,29 @@ def test_env_factory_requests_game_speed_best_effort(monkeypatch, tmp_path):
     monkeypatch.setattr(oe_mod, "APIController", FakeAPI)   # no set_game_speed at all
     env = T.create_curriculum_masked_env(8080, verbose=0, game_speed=8)   # must not raise
     env.close()
+
+
+def test_callback_logs_cold_split_shape_tags():
+    """The P6 style-flip verdict needs COLD shape evidence: aggregates mixing warm
+    replays cannot show whether cold builds wind. Cold episodes stream their own
+    turn count/balance tags; warm episodes must not pollute them."""
+    from types import SimpleNamespace
+    cb = T.ParallelCurriculumMaskableCallback(n_envs=1)
+    cb.model = SimpleNamespace(target_kl=None, ent_coef=0.01, get_env=lambda: None)
+    store = {}
+    cb.model.logger = SimpleNamespace(
+        name_to_value={}, record=lambda k, v, *a, **kw: store.__setitem__(k, v))
+
+    def infos_for(cold):
+        return [{'loop_completed': True, 'cold_start': cold, 'learning_phase': 6,
+                 'track_length': 44, 'current_distance': 0.0, 'collision_count': 0,
+                 'episode_metrics': {'track_length': 44, 'min_distance': 0.0,
+                                     'turn_count': 9.0, 'turn_balance': 3.0}}]
+
+    cb.locals = {'dones': [True], 'infos': infos_for(cold=False)}
+    cb._on_step()
+    assert 'structure/cold_turn_count' not in store        # warm must not pollute
+    cb.locals = {'dones': [True], 'infos': infos_for(cold=True)}
+    cb._on_step()
+    assert store['structure/cold_turn_count'] == pytest.approx(9.0)
+    assert store['structure/cold_turn_balance'] == pytest.approx(3.0)

@@ -244,6 +244,11 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                 qualify_min_turn_balance=2.0,
                 qualify_requires_test=True,
                 w_exc_feat=6.0,
+                w_route=3.0,   # Jul-27: wound layouts fail closure on the RETURN ROUTE
+                               # (cold winding attempts truncate; rectangles never do).
+                               # The P1-4 angular-progress potential taught exactly that
+                               # navigation and was retired in P5 when the memorized
+                               # rectangle stopped needing it -- novel shapes still do.
             )
         if phase >= 5:  # quality; discovery off (w_h=0), step_cost 0 (quality scales with
             # size). Jul-9 redesign: the old params zeroed every gate/struct term and the

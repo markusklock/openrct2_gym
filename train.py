@@ -602,6 +602,15 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
                             self.logger.record('rewards/completion_gate', info_metrics['completion_gate'])
                         if 'style_gate' in info_metrics:
                             self.logger.record('rewards/style_gate', info_metrics['style_gate'])
+                        # Cold-split shape tags: the style-flip verdict needs to see
+                        # whether COLD builds wind; the mixed aggregates cannot.
+                        if (self.locals['infos'][env_idx].get('cold_start')
+                                and 'turn_count' in info_metrics):
+                            self.logger.record('structure/cold_turn_count',
+                                               info_metrics['turn_count'])
+                            if 'turn_balance' in info_metrics:
+                                self.logger.record('structure/cold_turn_balance',
+                                                   info_metrics['turn_balance'])
                         if 'qualify_bonus' in info_metrics:
                             self.logger.record('rewards/qualify_bonus', info_metrics['qualify_bonus'])
                         # P5 quality-economics diagnostics: the excitement gate/milestones/

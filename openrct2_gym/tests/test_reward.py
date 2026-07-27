@@ -3319,3 +3319,12 @@ def test_style_gate_reported_in_episode_metrics(monkeypatch):
     frac = 0.5 * (min(env._turn_count() / 12.0, 1.0)
                   + min(env._turn_balance_count() / 2.0, 1.0))
     assert info['episode_metrics']['style_gate'] == pytest.approx(0.6 + 0.4 * frac)
+
+
+def test_p6_arms_route_potential():
+    """Jul-27 bundle: wound layouts fail closure precisely where rectangles never do --
+    on the RETURN ROUTE. w_route (angular progress around the station, monotone along
+    both detours, PBRS-clean) taught that navigation in P1-4 and was retired in P5 when
+    the memorized rectangle stopped needing it; novel winding shapes still do."""
+    assert ImprovedPhasedCurriculumWrapper._phase_reward_params(6).w_route == 3.0
+    assert ImprovedPhasedCurriculumWrapper._phase_reward_params(5).w_route == 0.0
