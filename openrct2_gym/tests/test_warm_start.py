@@ -1316,3 +1316,45 @@ def test_scripted_seeds_bypass_harvest_caps(tmp_path):
     seed = LoopRecord.from_actions([4, 4, 10, 9, 9, 9, 9, 13, 12, 27, 28, 14, 4, 4, 0], "scripted")
     assert lib.add(seed) is True                                # curated seed admitted
     assert lib.add(LoopRecord.from_actions([3, 3, 10, 9, 13, 12, 6, 14, 2], "harvest")) is False
+
+
+def test_annealer_min_prefix_floors_deep_draws(tmp_path):
+    """P6 opening-seed mode (Jul-29): with min_prefix set, a deep frontier must NOT
+    dissolve into cold draws -- it replays the record's first min_prefix pieces (a
+    winding opening seed) and the agent builds everything after. The opening habit is
+    the one skill the k-anneal otherwise never practices (k >= len converted to cold,
+    so 'replay just the opening' episodes only came from the pool's few longest
+    records)."""
+    lib = _lib(tmp_path, [FLAT])                                # 12-piece record
+    ann = WarmStartAnnealer(k_init=999, p_cold=0.0, rng=random.Random(2))
+    ann.min_prefix = 6
+    plans = [ann.sample_plan(lib, 1, 40) for _ in range(400)]
+    # cold now comes ONLY from the competence-scaled die (0.50 at deep k), never from
+    # k >= len dissolution -- without the floor this fixture converts ~half the warm
+    # draws too (see the default-dissolution test), pushing cold far above the die.
+    cold = sum(p.cold for p in plans) / len(plans)
+    assert 0.40 <= cold <= 0.60
+    warm = [p for p in plans if not p.cold]
+    assert all(p.k <= 12 - 6 for p in warm)                     # k capped at len - min_prefix
+    assert all(len(p.prefix) >= 6 for p in warm)                # opening seed always replayed
+    assert any(len(p.prefix) == 6 for p in warm)                # the deep draw is reachable
+
+
+def test_annealer_min_prefix_default_keeps_natural_dissolution(tmp_path):
+    """Default min_prefix=0 preserves the pre-P6 contract: k annealed past the loop
+    length converts the draw to a genuinely cold episode."""
+    lib = _lib(tmp_path, [FLAT])
+    ann = WarmStartAnnealer(k_init=999, p_cold=0.0, rng=random.Random(3))
+    plans = [ann.sample_plan(lib, 1, 40) for _ in range(50)]
+    assert any(p.cold for p in plans)                           # conversion still happens
+
+
+def test_p6_sets_opening_seed_min_prefix(monkeypatch):
+    monkeypatch.setattr(oe_mod, "APIController", FakeAPI)
+    w = ImprovedPhasedCurriculumWrapper(OpenRCT2Env(verbose=0), verbose=0)
+    w.current_phase = 6
+    w._update_phase_settings()
+    assert w._annealer.min_prefix == 6
+    w.current_phase = 5
+    w._update_phase_settings()
+    assert w._annealer.min_prefix == 0

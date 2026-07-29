@@ -303,6 +303,13 @@ class WarmStartAnnealer:
         self.promote_n = int(promote_n)
         self.promote_rate = float(promote_rate)
         self.demote_rate = float(demote_rate)
+        # Opening-seed floor (P6, Jul-29): when > 0, deep draws never dissolve into
+        # cold plans -- k is capped at rec.length - min_prefix so the record's first
+        # min_prefix pieces (a winding OPENING) are always replayed and the agent
+        # builds everything after. The k-anneal otherwise converts k >= len draws to
+        # cold ("natural end of the scaffold"), which meant the opening habit -- the
+        # exact skill the P6 cold conversion is stuck on -- got almost no practice.
+        self.min_prefix = 0
         self._rng = rng if rng is not None else random.Random()
 
     @property
@@ -342,7 +349,10 @@ class WarmStartAnnealer:
         if not pool or self._rng.random() < self.p_cold:
             return self._cold_plan()
         rec = pool[self._rng.randrange(len(pool))]
-        k_hi = min(self.k_max, rec.length)
+        k_cap = rec.length - self.min_prefix if self.min_prefix > 0 else rec.length
+        if k_cap < 1:
+            return self._cold_plan()
+        k_hi = min(self.k_max, k_cap)
         k = k_hi if self._rng.random() < 0.5 else self._rng.randint(1, k_hi)
         if k >= rec.length:
             return self._cold_plan()

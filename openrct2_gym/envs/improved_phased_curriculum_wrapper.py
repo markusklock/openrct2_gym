@@ -592,6 +592,10 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
         # Harvest budget follows the phase's track budget (a P4/P5 loop longer than the
         # old fixed 40 cap is exactly the material the later pools need).
         base_env.harvest_max_len = max_length
+        # P6 opening-seed mode: deep scaffold draws replay a 6-piece winding OPENING
+        # instead of dissolving to cold, so the one skill the cold conversion is stuck
+        # on (starting a build with a jog) finally gets perpetual practice.
+        self._annealer.min_prefix = 6 if self.current_phase >= 6 else 0
 
         if self.verbose >= 1:
             phase_names = {
