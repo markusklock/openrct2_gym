@@ -141,7 +141,39 @@ class APIController:
 
         return {"success": False, "error": "Max retries exceeded"}
     
-    def create_ride(self, ride_type=52, ride_object=0):
+    # Preferred vehicle object for the wooden RC. rideObject is an INDEX into the
+    # park's loaded-object list, and scan order is filesystem-dependent: on one
+    # machine index 0 was the wooden coaster trains, on another it was a Balloon
+    # Stall -- rides built fine but no train could ever dispatch, so no ride ever
+    # rated (the Jul-31 htpc migration bug). Resolve by identifier, never assume.
+    WOODEN_TRAINS_IDENTIFIER = "rct2.ride.ptct1"
+
+    def resolve_ride_object(self, ride_type=52):
+        """Index of the vehicle object to build rides with, resolved from the live
+        instance via listLoadedRideObjects and cached. Preference: the canonical
+        wooden-RC trains by identifier, else the first object supporting ride_type.
+        Returns None (uncached, retried next call) when the endpoint is missing or
+        no compatible object is loaded -- callers fall back to the legacy index 0."""
+        cached = getattr(self, "_ride_object_idx", None)
+        if cached is not None:
+            return cached
+        resp = self.send_request({"endpoint": "listLoadedRideObjects", "params": {}})
+        if not resp.get("success"):
+            return None
+        objs = resp.get("payload") or []
+        idx = next((o.get("index") for o in objs
+                    if o.get("identifier") == self.WOODEN_TRAINS_IDENTIFIER), None)
+        if idx is None:
+            idx = next((o.get("index") for o in objs
+                        if ride_type in (o.get("rideType") or [])), None)
+        if idx is not None:
+            self._ride_object_idx = idx
+        return idx
+
+    def create_ride(self, ride_type=52, ride_object=None):
+        if ride_object is None:
+            resolved = self.resolve_ride_object(ride_type)
+            ride_object = resolved if resolved is not None else 0
         req = {
             "endpoint": "createRide",
             "params": {
@@ -173,6 +205,7 @@ class APIController:
         self.ride_id), or None on failure / when the plugin lacks the endpoint, so the caller
         can fall back to the multi-call path.
         """
+        resolved = self.resolve_ride_object(ride_type)
         req = {
             "endpoint": "resetEpisode",
             "params": {
@@ -182,6 +215,9 @@ class APIController:
                 "startZ": start[2],
                 "startDir": start_direction,
                 "rideType": ride_type,
+                # index of the vehicle object (see resolve_ride_object); older
+                # plugins ignore unknown params, so this is backward-compatible
+                "rideObject": resolved if resolved is not None else 0,
             },
         }
         # resetEpisode runs ~8 game actions server-side (demolish + create + N station

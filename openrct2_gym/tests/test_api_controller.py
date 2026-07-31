@@ -124,3 +124,81 @@ def test_get_ride_measurements_request_shape():
     ctrl2 = _controller([[ok]])
     ctrl2.ride_id = None
     assert ctrl2.get_ride_measurements()["success"] is False
+
+
+# ----------------------- ride-object resolution (the htpc balloon-stall bug, Jul-31)
+# create_ride/resetEpisode hardcoded rideObject=0 == "first loaded ride object". On the
+# laptop that happened to be the wooden coaster trains; on the htpc scenario the object
+# scan order put a Balloon Stall at index 0 -- every ride was track-with-no-train, so
+# tests never dispatched and NOTHING ever rated (test_ok pinned at 0.00 while
+# placements worked perfectly). The object index must be resolved from the live
+# instance, never assumed.
+
+def _obj_list_payload():
+    return json.dumps({"success": True, "payload": [
+        {"index": 0, "identifier": "rct2.ride.balln", "name": "Balloon Stall",
+         "rideType": [32, 255, 255]},
+        {"index": 4, "identifier": "rct2.ride.arrt1", "name": "Corkscrew Trains",
+         "rideType": [19, 255, 255]},
+        {"index": 15, "identifier": "rct2.ride.ptct1", "name": "Wooden RC Trains",
+         "rideType": [52, 255, 255]},
+    ]}) + "\n"
+
+
+def test_create_ride_resolves_vehicle_object_by_identifier():
+    created = json.dumps({"success": True, "payload": {"rideId": 3}}) + "\n"
+    ctrl = _controller([[_obj_list_payload(), created]])
+    sent = []
+    ctrl.sock.sendall = lambda data: sent.append(json.loads(data.decode()))
+    assert ctrl.create_ride() == 3
+    assert sent[0]["endpoint"] == "listLoadedRideObjects"
+    assert sent[1]["endpoint"] == "createRide"
+    assert sent[1]["params"]["rideObject"] == 15          # ptct1, not blind index 0
+    # resolution is cached: a second create must not re-query the object list
+    created2 = json.dumps({"success": True, "payload": {"rideId": 4}}) + "\n"
+    ctrl.sock.lines.append(created2)
+    sent.clear()
+    assert ctrl.create_ride() == 4
+    assert sent[0]["endpoint"] == "createRide"
+    assert sent[0]["params"]["rideObject"] == 15
+
+
+def test_create_ride_falls_back_to_ride_type_match():
+    objs = json.dumps({"success": True, "payload": [
+        {"index": 0, "identifier": "rct2.ride.balln", "name": "Balloon Stall",
+         "rideType": [32, 255, 255]},
+        {"index": 7, "identifier": "custom.wood.trains", "name": "Some Wooden Trains",
+         "rideType": [52, 255, 255]},
+    ]}) + "\n"
+    created = json.dumps({"success": True, "payload": {"rideId": 1}}) + "\n"
+    ctrl = _controller([[objs, created]])
+    sent = []
+    ctrl.sock.sendall = lambda data: sent.append(json.loads(data.decode()))
+    assert ctrl.create_ride() == 1
+    assert sent[1]["params"]["rideObject"] == 7           # first rideType-52 entry
+
+
+def test_create_ride_uses_legacy_default_when_resolution_unavailable():
+    """Old plugins without listLoadedRideObjects (or a failing call) must keep the
+    pre-fix behavior: rideObject 0, no crash -- and no poisoned-cache (retry next time)."""
+    err = json.dumps({"success": False, "error": "Unknown endpoint"}) + "\n"
+    created = json.dumps({"success": True, "payload": {"rideId": 9}}) + "\n"
+    ctrl = _controller([[err, created]])
+    sent = []
+    ctrl.sock.sendall = lambda data: sent.append(json.loads(data.decode()))
+    assert ctrl.create_ride() == 9
+    assert sent[1]["params"]["rideObject"] == 0
+
+
+def test_reset_episode_carries_resolved_ride_object():
+    reset_ok = json.dumps({"success": True, "payload": {
+        "rideId": 2, "finalEndpoint": {"x": 55, "y": 66, "z": 14, "direction": 0},
+        "validNextPieces": []}}) + "\n"
+    ctrl = _controller([[_obj_list_payload(), reset_ok]])
+    sent = []
+    ctrl.sock.sendall = lambda data: sent.append(json.loads(data.decode()))
+    payload = ctrl.reset_episode()
+    assert payload["rideId"] == 2
+    assert sent[0]["endpoint"] == "listLoadedRideObjects"
+    assert sent[1]["endpoint"] == "resetEpisode"
+    assert sent[1]["params"]["rideObject"] == 15
