@@ -1796,13 +1796,15 @@ class OpenRCT2Env(gym.Env):
                 'nausea': 0
             }
 
-    def _poll_for_ride_stats(self, max_wait=5, poll_interval=0.5):
+    def _poll_for_ride_stats(self, max_wait=5, poll_interval=0.1):
         """
         Poll for ride statistics with smart detection of completion.
 
         Args:
             max_wait: Maximum wait time in seconds (default: 5, reduced from 10)
-            poll_interval: Time between polls in seconds (default: 0.5, reduced from 1)
+            poll_interval: Time between polls in seconds (0.1: at 5,000 ticks/s ratings
+                land in <1s, and under SubprocVecEnv every worker idles at the step
+                barrier for the poll overhang -- granularity is straggler cost)
         """
         start_time = time.time()
         polls = 0

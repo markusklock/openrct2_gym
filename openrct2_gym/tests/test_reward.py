@@ -3328,3 +3328,13 @@ def test_p6_arms_route_potential():
     the memorized rectangle stopped needing it; novel winding shapes still do."""
     assert ImprovedPhasedCurriculumWrapper._phase_reward_params(6).w_route == 3.0
     assert ImprovedPhasedCurriculumWrapper._phase_reward_params(5).w_route == 0.0
+
+
+def test_ride_stats_poll_interval_matches_fast_ratings():
+    """Aug-1 straggler fix: at 5,000 ticks/s ratings land in <1s, so the 0.5s poll
+    granularity (tuned for the 4-5s laptop era) had become a large share of the
+    terminal step -- and under SubprocVecEnv every other worker idles at the barrier
+    for exactly that overhang. Poll at 0.1s; the max_wait timeout guard is unchanged."""
+    import inspect
+    sig = inspect.signature(OpenRCT2Env._poll_for_ride_stats)
+    assert sig.parameters["poll_interval"].default == 0.1
