@@ -1371,3 +1371,86 @@ def test_wrapper_warm_k_init_resumes_frontier(monkeypatch, tmp_path):
     # default unchanged: fresh runs still anneal from scratch
     w2, _ = _wrapped(monkeypatch, tmp_path.joinpath("d"))
     assert w2._annealer.k_max == 3
+
+
+# ------------------------------------------------- prefix annealing (Aug-3, the last gap)
+# 570k steps of static-6 opening seeds produced flawless SEEDED winding and zero COLD
+# winding: the policy went bimodal by context (seed present -> wind; bare station ->
+# rectangle) and both modes pay, so no gradient bridges them. The fix is the campaign's
+# own playbook applied to the seed itself: when floor-bound draws succeed reliably,
+# shrink min_prefix 6 -> 5 -> ... -> 0, closing the context gap one piece at a time.
+# At 0, dissolution returns naturally -- and cold IS the practiced context.
+
+def test_plan_marks_floor_bound_draws(tmp_path):
+    lib = _lib(tmp_path, [FLAT])                                # 12-piece record
+    ann = WarmStartAnnealer(k_init=999, p_cold=0.0, rng=random.Random(2))
+    ann.min_prefix = 6
+    plans = [ann.sample_plan(lib, 1, 40) for _ in range(200)]
+    floor = [p for p in plans if p.at_floor]
+    assert floor and all(p.k == 12 - 6 for p in floor)          # k at the per-record cap
+    shallow = [p for p in plans if not p.cold and not p.at_floor]
+    assert all(p.k < 12 - 6 for p in shallow)
+
+
+def test_floor_success_anneals_prefix_down_to_zero(tmp_path):
+    ann = WarmStartAnnealer(k_init=999, promote_n=10, promote_rate=0.6,
+                            rng=random.Random(0))
+    ann.min_prefix = 2
+    floor_plan = WarmStartPlan(prefix=FLAT[:2], k=10, loop_len=12, cold=False,
+                               at_floor=True)
+    for _ in range(10):
+        ann.record_outcome(floor_plan, success=True)
+    assert ann.min_prefix == 1                                  # one piece at a time
+    for _ in range(10):
+        ann.record_outcome(WarmStartPlan(FLAT[:1], 11, 12, False, True), success=True)
+    assert ann.min_prefix == 0                                  # fully cold context
+    for _ in range(10):                                         # no underflow
+        ann.record_outcome(WarmStartPlan([], 12, 12, False, True), success=True)
+    assert ann.min_prefix == 0
+
+
+def test_floor_failure_demotes_prefix_back_up(tmp_path):
+    ann = WarmStartAnnealer(k_init=999, promote_n=10, promote_rate=0.6,
+                            demote_rate=0.15, rng=random.Random(0))
+    ann.min_prefix = 3
+    ann.min_prefix_init = 6
+    floor_plan = WarmStartPlan(prefix=FLAT[:3], k=9, loop_len=12, cold=False,
+                               at_floor=True)
+    for _ in range(10):
+        ann.record_outcome(floor_plan, success=True)
+    assert ann.min_prefix == 2
+    for _ in range(10):
+        ann.record_outcome(WarmStartPlan(FLAT[:2], 10, 12, False, True), success=False)
+    assert ann.min_prefix == 3                                  # demote, never above init
+    ann.min_prefix = 6
+    for _ in range(10):
+        ann.record_outcome(WarmStartPlan(FLAT[:6], 6, 12, False, True), success=False)
+    assert ann.min_prefix == 6
+
+
+def test_floor_and_k_frontiers_are_independent(tmp_path):
+    """A floor-bound failure burst must not demote k_max (and vice versa): the two
+    anneals track different skills (depth vs opening) and share no window."""
+    ann = WarmStartAnnealer(k_init=10, promote_n=10, promote_rate=0.6,
+                            demote_rate=0.15, rng=random.Random(0))
+    ann.min_prefix = 3
+    ann.min_prefix_init = 6
+    k_before = ann.k_max
+    for _ in range(10):
+        ann.record_outcome(WarmStartPlan(FLAT[:3], 9, 12, False, True), success=False)
+    assert ann.k_max == k_before                                # k frontier untouched
+    assert ann.min_prefix == 4
+    for _ in range(10):                                         # k-frontier (not floor)
+        ann.record_outcome(WarmStartPlan(FLAT[:2], 10, 12, False, False), success=True)
+    assert ann.k_max == 12 and ann.min_prefix == 4              # floor untouched
+
+
+def test_step_info_emits_warm_min_prefix(monkeypatch, tmp_path):
+    """The prefix anneal's position must be observable in TB (house rule: every new
+    mechanism streams its own diagnostic) -- it IS the progress meter of the last gap."""
+    wrapper, _ = _wrapped(monkeypatch, tmp_path, initial_phase=6, warm_k_init=86)
+    info = _run_episode(wrapper)
+    assert info['warm_min_prefix'] == 6
+    wrapper._annealer.min_prefix = 2
+    info = _run_episode(wrapper)
+    assert info['warm_min_prefix'] == 2

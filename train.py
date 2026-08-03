@@ -570,6 +570,7 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
                     'warm_k_max',
                     'warm_frontier_rate',
                     'warm_prefix_len',
+                    'warm_min_prefix',
                     'loop_library_size',
                     # P5 self-imitation ratchet diagnostics
                     'p5_pool_exc_bar',

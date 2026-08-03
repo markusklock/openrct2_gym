@@ -595,7 +595,17 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
         # P6 opening-seed mode: deep scaffold draws replay a 6-piece winding OPENING
         # instead of dissolving to cold, so the one skill the cold conversion is stuck
         # on (starting a build with a jog) finally gets perpetual practice.
-        self._annealer.min_prefix = 6 if self.current_phase >= 6 else 0
+        # Arm both the working floor and its demote ceiling; the prefix anneal
+        # (Aug-3) walks min_prefix 6 -> 0 on floor-bound success, never above init.
+        # Do not re-arm on every settings refresh: P6 refreshes (e.g. harvest-cap
+        # updates) must not reset a partially-annealed floor back to 6.
+        if self.current_phase >= 6:
+            if getattr(self._annealer, "min_prefix_init", 0) != 6:
+                self._annealer.min_prefix = 6
+                self._annealer.min_prefix_init = 6
+        else:
+            self._annealer.min_prefix = 0
+            self._annealer.min_prefix_init = 0
 
         if self.verbose >= 1:
             phase_names = {
@@ -1009,6 +1019,7 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
             )
             info['warm_k'] = self._current_plan.k
             info['warm_k_max'] = self._annealer.k_max
+            info['warm_min_prefix'] = self._annealer.min_prefix
             info['loop_library_size'] = len(self._loop_library)
             frontier_rate = self._annealer.frontier_rate
             if frontier_rate is not None:

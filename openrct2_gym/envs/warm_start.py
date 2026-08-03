@@ -279,6 +279,8 @@ class WarmStartPlan:
     k: int                       # suffix length the agent must build (0 for cold)
     loop_len: int                # 0 for cold
     cold: bool
+    at_floor: bool = False       # k hit the per-record cap (len - min_prefix): this
+                                 # episode's outcome feeds the PREFIX anneal, not k's
 
 
 class WarmStartAnnealer:
@@ -309,7 +311,16 @@ class WarmStartAnnealer:
         # builds everything after. The k-anneal otherwise converts k >= len draws to
         # cold ("natural end of the scaffold"), which meant the opening habit -- the
         # exact skill the P6 cold conversion is stuck on -- got almost no practice.
+        #
+        # Prefix anneal (Aug-3): a STATIC floor made the policy bimodal by context
+        # (seed present -> wind, bare station -> rectangle; 570k steps, zero cold
+        # winding) -- both modes pay, so no gradient bridges them. Floor-bound
+        # outcomes feed their own frontier window: sustained success shrinks
+        # min_prefix by 1 (down to 0 == genuinely cold context), failure demotes
+        # it back up, never above min_prefix_init. Independent of the k frontier.
         self.min_prefix = 0
+        self.min_prefix_init = 0
+        self.floor_frontier = deque(maxlen=frontier_window)
         self._rng = rng if rng is not None else random.Random()
 
     @property
@@ -357,11 +368,28 @@ class WarmStartAnnealer:
         if k >= rec.length:
             return self._cold_plan()
         return WarmStartPlan(prefix=list(rec.actions[:rec.length - k]),
-                             k=k, loop_len=rec.length, cold=False)
+                             k=k, loop_len=rec.length, cold=False,
+                             at_floor=(self.min_prefix > 0 and k == k_cap))
 
     def record_outcome(self, plan, success):
-        """Feed an episode outcome to the frontier; promote/demote k_max when it fills."""
-        if plan is None or plan.cold or plan.k < self.k_max - 1:
+        """Feed an episode outcome to the frontier; promote/demote k_max when it fills.
+        Floor-bound outcomes feed the PREFIX frontier instead: the two anneals track
+        different skills (build depth vs. opening habit) and must not share a window."""
+        if plan is None or plan.cold:
+            return
+        if getattr(plan, "at_floor", False):
+            self.floor_frontier.append(bool(success))
+            if len(self.floor_frontier) < self.promote_n:
+                return
+            rate = sum(self.floor_frontier) / len(self.floor_frontier)
+            if rate >= self.promote_rate:
+                self.min_prefix = max(0, self.min_prefix - 1)
+                self.floor_frontier.clear()
+            elif rate <= self.demote_rate:
+                self.min_prefix = min(self.min_prefix_init, self.min_prefix + 1)
+                self.floor_frontier.clear()
+            return
+        if plan.k < self.k_max - 1:
             return
         self.frontier.append(bool(success))
         if len(self.frontier) < self.promote_n:
