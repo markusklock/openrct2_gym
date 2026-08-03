@@ -1358,3 +1358,16 @@ def test_p6_sets_opening_seed_min_prefix(monkeypatch):
     w.current_phase = 5
     w._update_phase_settings()
     assert w._annealer.min_prefix == 0
+
+
+def test_wrapper_warm_k_init_resumes_frontier(monkeypatch, tmp_path):
+    """Aug-3: every resume reset k to 3, so each 2M chunk re-proved climb competence
+    the checkpoint demonstrably has (0.99+ success at k=91-95 minutes before the
+    restart) and only reached the opening-seed regime near its end. warm_k_init
+    seeds the frontier where the policy actually is; the annealer's demote path
+    still corrects an overshoot honestly."""
+    wrapper, _ = _wrapped(monkeypatch, tmp_path, initial_phase=6, warm_k_init=86)
+    assert wrapper._annealer.k_max == 86
+    # default unchanged: fresh runs still anneal from scratch
+    w2, _ = _wrapped(monkeypatch, tmp_path.joinpath("d"))
+    assert w2._annealer.k_max == 3

@@ -1058,3 +1058,42 @@ def test_callback_logs_cold_split_shape_tags():
     cb._on_step()
     assert store['structure/cold_turn_count'] == pytest.approx(9.0)
     assert store['structure/cold_turn_balance'] == pytest.approx(3.0)
+
+
+def test_env_factory_threads_warm_k_init(monkeypatch, tmp_path):
+    """Aug-3 continuation-restart fix: --warm-k-init must reach each worker's annealer
+    so a resume can seed the frontier at the checkpoint's proven depth instead of
+    re-annealing from 3 (which consumed most of every 2M chunk). Default stays 3."""
+    from openrct2_gym.envs.openrct2_env import OpenRCT2Env
+    monkeypatch.setattr(OpenRCT2Env, "_LOOP_LIBRARY_PATH", str(tmp_path / "lib.jsonl"))
+    monkeypatch.setattr(oe_mod, "APIController", FakeAPI)
+    env = T.create_curriculum_masked_env(8080, verbose=0, warm_k_init=86)
+    w = env
+    while not hasattr(w, "_annealer"):
+        w = w.env
+    assert w._annealer.k_max == 86
+    env.close()
+    env = T.create_curriculum_masked_env(8080, verbose=0)
+    w = env
+    while not hasattr(w, "_annealer"):
+        w = w.env
+    assert w._annealer.k_max == 3
+    env.close()
+
+
+def test_cli_exposes_warm_k_init(monkeypatch):
+    import argparse
+    parser_actions = []
+    real_add = argparse.ArgumentParser.add_argument
+
+    def spy(self, *a, **kw):
+        parser_actions.append(a)
+        return real_add(self, *a, **kw)
+
+    monkeypatch.setattr(argparse.ArgumentParser, "add_argument", spy)
+    try:
+        T.parse_args(["--ports", "8080"])
+    except SystemExit:
+        pass
+    flags = [a[0] for a in parser_actions if a and isinstance(a[0], str)]
+    assert "--warm-k-init" in flags

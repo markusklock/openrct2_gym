@@ -786,7 +786,8 @@ def create_curriculum_masked_env(port: int, verbose: int = 0,
                                  loop_library_path: Optional[str] = None,
                                  p_cold: float = 0.25,
                                  game_speed: int = 8,
-                                 start_phase: int = 1) -> gym.Env:
+                                 start_phase: int = 1,
+                                 warm_k_init: int = 3) -> gym.Env:
     """Create an improved-curriculum environment with action masking for a port."""
     # A custom library path must redirect BOTH sides: the wrapper's read pool AND the
     # env's harvest destination (class attr; this runs inside each SubprocVecEnv worker).
@@ -833,6 +834,7 @@ def create_curriculum_masked_env(port: int, verbose: int = 0,
         initial_phase=start_phase,
         loop_library_path=loop_library_path,
         p_cold=p_cold,
+        warm_k_init=warm_k_init,
     )
 
     # Add Monitor for logging
@@ -849,12 +851,14 @@ def make_env_factory(port: int, verbose: int = 0,
                      loop_library_path: Optional[str] = None,
                      p_cold: float = 0.25,
                      game_speed: int = 8,
-                     start_phase: int = 1) -> Callable[[], gym.Env]:
+                     start_phase: int = 1,
+                     warm_k_init: int = 3) -> Callable[[], gym.Env]:
     """Create a factory function for an environment on a specific port"""
     def _init() -> gym.Env:
         try:
             env = create_curriculum_masked_env(port, verbose, warm_start_enabled,
-                                               loop_library_path, p_cold, game_speed, start_phase)
+                                               loop_library_path, p_cold, game_speed,
+                                               start_phase, warm_k_init)
             print(f"✅ Successfully connected to OpenRCT2 on port {port}")
             return env
         except Exception as e:
@@ -891,6 +895,7 @@ def train(
     p_cold: float = 0.25,
     game_speed: int = 8,
     start_phase: int = 1,
+    warm_k_init: int = 3,
 ):
     """Train agent with curriculum learning AND action masking on multiple parallel environments"""
 
@@ -945,7 +950,8 @@ def train(
 
     # Create environment factories for each port
     env_factories = [make_env_factory(port, verbose, warm_start_enabled,
-                                      loop_library_path, p_cold, game_speed, start_phase) for port in ports]
+                                      loop_library_path, p_cold, game_speed, start_phase,
+                                      warm_k_init) for port in ports]
 
     # Create vectorized environments
     print(f"\n🔌 Connecting to {n_envs} OpenRCT2 instances...")
@@ -1195,7 +1201,7 @@ def train(
 
     return model, env
 
-def main():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Parallel training with curriculum + masking")
     parser.add_argument("--ports", type=str, default="8080",
                        help="Comma-separated list of ports for OpenRCT2 API servers (e.g., 8080,8081,8082)")
@@ -1231,7 +1237,17 @@ def main():
     parser.add_argument("--start-phase", type=int, default=1,
                         help="Start the curriculum at this phase (deep resume: a mature "
                              "P5/P6 policy cannot re-walk Phase 1's 40-piece budget)")
-    args = parser.parse_args()
+    parser.add_argument("--warm-k-init", type=int, default=3,
+                        help="Initial warm-start frontier k (per worker). On a continuation "
+                             "restart set this to the checkpoint's proven depth (e.g. 86): "
+                             "every resume otherwise re-anneals from 3 and spends most of "
+                             "the chunk re-proving competence; the annealer's demote path "
+                             "still corrects an overshoot honestly.")
+    return parser.parse_args(argv)
+
+
+def main():
+    args = parse_args()
     
     # Parse ports
     try:
@@ -1317,6 +1333,7 @@ def main():
         p_cold=args.p_cold,
         game_speed=args.game_speed,
         start_phase=args.start_phase,
+        warm_k_init=args.warm_k_init,
     )
     # Training function already evaluates between chunks and closes env.
     # No additional evaluation here to avoid interfering with API ports.
