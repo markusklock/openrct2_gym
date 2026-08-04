@@ -1485,3 +1485,16 @@ def test_harvest_tags_cold_source(monkeypatch, tmp_path):
             break
     lib2 = LoopLibrary(lib_path2)
     assert all(r.source == "harvest" for r in lib2._records.values())
+
+
+def test_wrapper_warm_min_prefix_resumes_descent(monkeypatch, tmp_path):
+    """Aug-4: the prefix-descent state is in-memory like k was -- a restart re-armed
+    the floor at 6 and re-walked ~30h of descent. warm_min_prefix seeds the floor at
+    the achieved rung (0 = the natural end state that produced the cold drift);
+    min_prefix_init stays 6 so the demote safety ceiling is unchanged."""
+    wrapper, _ = _wrapped(monkeypatch, tmp_path, initial_phase=6, warm_k_init=86,
+                          warm_min_prefix=0)
+    assert wrapper._annealer.min_prefix == 0
+    assert wrapper._annealer.min_prefix_init == 6
+    w2, _ = _wrapped(monkeypatch, tmp_path.joinpath("d"), initial_phase=6)
+    assert w2._annealer.min_prefix == 6                       # default arming unchanged

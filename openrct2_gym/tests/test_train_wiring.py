@@ -1097,3 +1097,33 @@ def test_cli_exposes_warm_k_init(monkeypatch):
         pass
     flags = [a[0] for a in parser_actions if a and isinstance(a[0], str)]
     assert "--warm-k-init" in flags
+
+
+def test_env_factory_threads_warm_min_prefix(monkeypatch, tmp_path):
+    from openrct2_gym.envs.openrct2_env import OpenRCT2Env
+    monkeypatch.setattr(OpenRCT2Env, "_LOOP_LIBRARY_PATH", str(tmp_path / "lib.jsonl"))
+    monkeypatch.setattr(oe_mod, "APIController", FakeAPI)
+    env = T.create_curriculum_masked_env(8080, verbose=0, start_phase=6,
+                                         warm_min_prefix=0)
+    w = env
+    while not hasattr(w, "_annealer"):
+        w = w.env
+    assert w._annealer.min_prefix == 0 and w._annealer.min_prefix_init == 6
+    env.close()
+
+
+def test_cli_exposes_warm_min_prefix(monkeypatch):
+    import argparse
+    seen = []
+    real_add = argparse.ArgumentParser.add_argument
+
+    def spy(self, *a, **kw):
+        seen.append(a)
+        return real_add(self, *a, **kw)
+
+    monkeypatch.setattr(argparse.ArgumentParser, "add_argument", spy)
+    try:
+        T.parse_args(["--ports", "8080"])
+    except SystemExit:
+        pass
+    assert "--warm-min-prefix" in [a[0] for a in seen if a and isinstance(a[0], str)]

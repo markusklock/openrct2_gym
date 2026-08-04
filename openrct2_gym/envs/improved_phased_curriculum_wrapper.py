@@ -54,6 +54,7 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                  loop_library_path=None,
                  p_cold=0.25,
                  warm_k_init=3,
+                 warm_min_prefix=None,
                  # Jul-19: a deep-P5/P6 policy cannot re-walk Phase 1 (its committed
                  # 90+ piece builds truncate inside the 40-piece budget -- live stall:
                  # cold completion 0.00 and active unlearning). Start the curriculum
@@ -100,6 +101,10 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
         self.warm_start_enabled = warm_start_enabled
         self._loop_library = LoopLibrary(loop_library_path or OpenRCT2Env._LOOP_LIBRARY_PATH)
         self._annealer = WarmStartAnnealer(k_init=warm_k_init, p_cold=p_cold)
+        # Continuation override for the prefix descent (in-memory like k): None ->
+        # the phase default (P6 arms 6/6); an explicit value seeds min_prefix at the
+        # achieved rung while keeping the init=6 demote ceiling.
+        self._warm_min_prefix_override = warm_min_prefix
         self._current_plan = WarmStartPlan(prefix=[], k=0, loop_len=0, cold=True)
 
         # Performance tracking. episode_results (and the qualified/phase-2 windows below)
@@ -601,7 +606,8 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
         # updates) must not reset a partially-annealed floor back to 6.
         if self.current_phase >= 6:
             if getattr(self._annealer, "min_prefix_init", 0) != 6:
-                self._annealer.min_prefix = 6
+                ov = getattr(self, "_warm_min_prefix_override", None)
+                self._annealer.min_prefix = 6 if ov is None else max(0, min(6, ov))
                 self._annealer.min_prefix_init = 6
         else:
             self._annealer.min_prefix = 0
