@@ -863,8 +863,12 @@ class OpenRCT2Env(gym.Env):
             if self._loop_library is None or self._loop_library.path != self._LOOP_LIBRARY_PATH:
                 self._loop_library = LoopLibrary(self._LOOP_LIBRARY_PATH)
             self._loop_library.add(
-                LoopLibrary.record_from_history(self.track_builder.history,
-                                                excitement=excitement))
+                LoopLibrary.record_from_history(
+                    self.track_builder.history,
+                    # cold-vs-scaffolded provenance for inspection tooling
+                    # (build_gallery.py splits current UNAIDED behavior from warm work)
+                    source="harvest_cold" if self._warm_cold else "harvest",
+                    excitement=excitement))
         except Exception:
             pass
 

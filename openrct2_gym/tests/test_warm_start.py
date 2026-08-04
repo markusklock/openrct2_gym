@@ -811,7 +811,7 @@ def test_harvest_writes_completed_loop_and_dedups(monkeypatch):
     assert len(lib) == 1
     (rec,) = lib.pool(phase=1, max_len=40)
     assert rec.actions == (0, 0)                                    # the two placed agent pieces
-    assert rec.source == "harvest"
+    assert rec.source == "harvest_cold"      # bare env = cold episode (Aug-4 tag)
     env.reset()                                                     # same loop again -> dedup
     for _ in range(4):
         _, _, terminated, _, _ = env.step(0)
@@ -1454,3 +1454,34 @@ def test_step_info_emits_warm_min_prefix(monkeypatch, tmp_path):
     wrapper._annealer.min_prefix = 2
     info = _run_episode(wrapper)
     assert info['warm_min_prefix'] == 2
+
+
+def test_harvest_tags_cold_source(monkeypatch, tmp_path):
+    """Aug-4 (gallery request): harvests must record whether the build was UNAIDED --
+    'harvest_cold' vs 'harvest' -- so inspection samples can split current cold
+    behavior from scaffolded work. Source is a free string; no schema migration."""
+    monkeypatch.setattr(oe_mod, "APIController", CompletingAPI)
+    lib_path = str(tmp_path / "lib.jsonl")
+    monkeypatch.setattr(OpenRCT2Env, "_LOOP_LIBRARY_PATH", lib_path)
+    env = OpenRCT2Env(verbose=0)
+    env.reset()
+    env._warm_cold = True
+    for _ in range(20):
+        _, _, term, trunc, _ = env.step(0)
+        if term or trunc:
+            break
+    lib = LoopLibrary(lib_path)
+    assert len(lib) >= 1
+    assert all(r.source == "harvest_cold" for r in lib._records.values())
+
+    lib_path2 = str(tmp_path / "lib2.jsonl")
+    monkeypatch.setattr(OpenRCT2Env, "_LOOP_LIBRARY_PATH", lib_path2)
+    env2 = OpenRCT2Env(verbose=0)
+    env2.reset()
+    env2._warm_cold = False
+    for _ in range(20):
+        _, _, term, trunc, _ = env2.step(0)
+        if term or trunc:
+            break
+    lib2 = LoopLibrary(lib_path2)
+    assert all(r.source == "harvest" for r in lib2._records.values())
