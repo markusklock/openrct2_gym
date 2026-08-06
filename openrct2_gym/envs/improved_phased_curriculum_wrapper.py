@@ -10,6 +10,9 @@ from typing import Dict, Any, Tuple
 
 from openrct2_gym.envs.openrct2_env import OpenRCT2Env, RewardParams
 from openrct2_gym.envs.warm_start import LoopLibrary, WarmStartAnnealer, WarmStartPlan
+from openrct2_gym.envs.track_pieces import (
+    LEFT_TURN_ACTIONS, RIGHT_TURN_ACTIONS, TURN_ACTIONS,
+)
 
 
 class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
@@ -444,15 +447,14 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
     def _history_turn_count(base_env):
         """Turn-family pieces in the history (mirrors env._turn_count)."""
         history = getattr(base_env.track_builder, 'history', [])
-        return sum(1 for h in history
-                   if h.get('action') in (1, 2, 3, 4, 21, 22, 23, 24, 29, 30))
+        return sum(1 for h in history if h.get('action') in TURN_ACTIONS)
 
     @staticmethod
     def _history_turn_balance(base_env):
         """min(left, right) turn-family pieces (mirrors env._turn_balance_count)."""
         history = getattr(base_env.track_builder, 'history', [])
-        left = sum(1 for h in history if h.get('action') in (1, 3, 21, 23, 29))
-        right = sum(1 for h in history if h.get('action') in (2, 4, 22, 24, 30))
+        left = sum(1 for h in history if h.get('action') in LEFT_TURN_ACTIONS)
+        right = sum(1 for h in history if h.get('action') in RIGHT_TURN_ACTIONS)
         return min(left, right)
 
     @staticmethod

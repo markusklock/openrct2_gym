@@ -20,8 +20,9 @@ from openrct2_gym.envs.api_track_builder import APITrackBuilder
 from openrct2_gym.envs.warm_start import LoopLibrary
 
 STATION_LENGTH = 6
-LEFT_TURNS = (1, 3, 21, 23, 29)
-RIGHT_TURNS = (2, 4, 22, 24, 30)
+from openrct2_gym.envs.track_pieces import (
+    LEFT_TURN_ACTIONS as LEFT_TURNS, RIGHT_TURN_ACTIONS as RIGHT_TURNS,
+)
 QUALIFY_MIN_E, QUALIFY_MIN_TURNS, QUALIFY_MIN_BALANCE = 4.5, 12, 2
 
 

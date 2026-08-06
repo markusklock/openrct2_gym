@@ -11,6 +11,10 @@ from .obs_config import (
     make_observation_space, SEQ_LEN, HIST_FEAT_DIM, MAP_SHAPE, SCALE, H_SCALE,
 )
 from .warm_start import LoopLibrary
+from .track_pieces import (
+    CURVED_ACTIONS, LEFT_TURN_ACTIONS, RIGHT_TURN_ACTIONS,
+    SBEND_ACTIONS, TURN_ACTIONS,
+)
 
 
 @dataclass(frozen=True)
@@ -1427,23 +1431,23 @@ class OpenRCT2Env(gym.Env):
         return sum(1 for h in hist if h.get("action") in (21, 22, 23, 24))
 
     def _turn_count(self):
-        """All turn-family pieces (plain/banked turns + S-bends): direction changes
-        feed the rating's turns sub-rating."""
+        """HEADING-changing turn pieces (plain + banked). S-bends are excluded: they
+        hand back the original heading, and counting them here let the policy farm
+        the variety legs with a stack of them (see track_pieces)."""
         hist = getattr(self.track_builder, "history", None) or []
-        return sum(1 for h in hist
-                   if h.get("action") in (1, 2, 3, 4, 21, 22, 23, 24, 29, 30))
+        return sum(1 for h in hist if h.get("action") in TURN_ACTIONS)
 
     def _sbend_count(self):
         """S-bend pieces (29/30): lateral weave without a heading change."""
         hist = getattr(self.track_builder, "history", None) or []
-        return sum(1 for h in hist if h.get("action") in (29, 30))
+        return sum(1 for h in hist if h.get("action") in SBEND_ACTIONS)
 
     def _turn_balance_count(self):
         """min(left-family, right-family) turn pieces: 0 for a single-handed rectangle,
         rising only when the layout genuinely winds both ways (the P6 variety gate leg)."""
         hist = getattr(self.track_builder, "history", None) or []
-        left = sum(1 for h in hist if h.get("action") in (1, 3, 21, 23, 29))
-        right = sum(1 for h in hist if h.get("action") in (2, 4, 22, 24, 30))
+        left = sum(1 for h in hist if h.get("action") in LEFT_TURN_ACTIONS)
+        right = sum(1 for h in hist if h.get("action") in RIGHT_TURN_ACTIONS)
         return min(left, right)
 
     def _chain_max_gain(self):
@@ -1998,7 +2002,10 @@ class OpenRCT2Env(gym.Env):
             energy -= self.FRICTION_BASE
 
             # Extra friction for turns
-            if piece in [1, 2, 3, 4, 21, 22, 23, 24, 29, 30]:  # Turn pieces
+            # CURVED (turns AND S-bends): an S-bend is real curved track, so the
+            # PHYSICS estimate charges it friction even though the style legs above
+            # deliberately do not count it as a heading change.
+            if piece in CURVED_ACTIONS:
                 energy -= self.TURN_FRICTION
 
         return max(0.0, energy)

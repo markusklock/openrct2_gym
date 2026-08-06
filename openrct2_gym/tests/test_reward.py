@@ -2886,7 +2886,9 @@ def test_turn_and_banked_counters():
     rows = [(3, 14, 14), (21, 14, 14), (24, 14, 14), (29, 14, 14), (6, 14, 12)]
     env = _bare_env(history=_env_hist(rows))
     assert env._banked_turn_count() == 2                     # 21, 24
-    assert env._turn_count() == 4                            # 3, 21, 24, 29; drop is not a turn
+    # Aug-6: S-bends are NOT turns (no heading change) -- 3, 21, 24 only.
+    assert env._turn_count() == 3
+    assert env._sbend_count() == 1                           # 29 counted on its own leg
 
 
 # ------------------------------------- P6 variety legs (the monoculture problem)
@@ -2895,12 +2897,13 @@ def test_turn_and_banked_counters():
 # HANDEDNESS BALANCE (rectangles are all-one-direction; balance forces winding).
 
 def test_turn_balance_and_sbend_counters():
-    # left family: 1,3,21,23,29 -- right family: 2,4,22,24,30
+    # heading turns only: left 1,3,21,23 -- right 2,4,22,24 (Aug-6: S-bends excluded,
+    # an alternating S-stack used to manufacture balance out of a net-zero weave)
     rows = [(4, 14, 14), (4, 14, 14), (4, 14, 14), (4, 14, 14),   # 4 right (a rectangle)
-            (3, 14, 14), (29, 14, 14), (30, 14, 14)]              # 1 left + S-pair (1L/1R)
+            (3, 14, 14), (29, 14, 14), (30, 14, 14)]              # 1 left + S-pair
     env = _bare_env(history=_env_hist(rows))
     assert env._sbend_count() == 2                           # 29, 30
-    assert env._turn_balance_count() == 2                    # min(left=2, right=5)
+    assert env._turn_balance_count() == 1                    # min(left=1, right=4)
     rect = _bare_env(history=_env_hist([(4, 14, 14)] * 4))
     assert rect._turn_balance_count() == 0                   # single-handed: no balance
 
@@ -2922,10 +2925,10 @@ def test_hill_quality_pays_variety_components():
                      struct_w_sbend=0.25, struct_sbend_target=4.0,
                      struct_w_turn_balance=0.25, struct_turn_balance_target=2.0)
     rows = ([(4, 14, 14)] * 4 + [(3, 14, 14)] * 2                 # 6 turns, balance 2
-            + [(29, 14, 14), (30, 14, 14)])                       # +2 S (also turns)
+            + [(29, 14, 14), (30, 14, 14)])                       # +2 S (own leg only)
     env = _bare_env(history=_env_hist(rows))
-    # turns 8/12, sbend 2/4, balance min(3,5)=3 -> capped 2/2
-    expected = 0.5 * (8 / 12) + 0.25 * (2 / 4) + 0.25 * 1.0
+    # turns 6/12 (S-bends excluded), sbend 2/4, balance min(2,4)=2 -> capped 2/2
+    expected = 0.5 * (6 / 12) + 0.25 * (2 / 4) + 0.25 * 1.0
     assert env._hill_quality(params) == pytest.approx(expected)
 
 
@@ -2998,7 +3001,7 @@ def test_p6_qualified_requires_variety_and_tested_excitement():
         return SimpleNamespace(track_builder=SimpleNamespace(history=hist),
                                _last_test_ok=test_ok, last_ride_excitement=exc)
 
-    winding = [4] * 6 + [3] * 4 + [29, 30]                   # 12 turns, balance 5
+    winding = [4] * 6 + [3] * 6                              # 12 heading turns, balance 6
     assert w._is_qualified(base(winding), True) is True
     assert w._is_qualified(base(winding), False) is False    # must complete
     assert w._is_qualified(base(winding, exc=4.0), True) is False      # E floor
@@ -3007,6 +3010,9 @@ def test_p6_qualified_requires_variety_and_tested_excitement():
     assert w._is_qualified(base(rectangle), True) is False
     few_turns = [4] * 4 + [3] * 4                            # balanced but only 8 turns
     assert w._is_qualified(base(few_turns), True) is False
+    # Aug-6 exploit: two 180s + a stack of S-bends farmed turns AND balance
+    sbend_farm = [4] * 4 + [29, 30] * 5                      # 4 turns + 10 S-bends
+    assert w._is_qualified(base(sbend_farm), True) is False
 
 
 def test_p5_advances_to_p6_when_ladder_done_and_quality_holds(monkeypatch):
@@ -3338,3 +3344,94 @@ def test_ride_stats_poll_interval_matches_fast_ratings():
     import inspect
     sig = inspect.signature(OpenRCT2Env._poll_for_ride_stats)
     assert sig.parameters["poll_interval"].default == 0.1
+
+
+# ------------------------------- S-bend turn-farming (Aug-6, live-observed exploit)
+# Markus watched the checkpoint build: 180-turn, hill, 180-turn back, then SIX-TO-EIGHT
+# stacked S-bends drifting diagonally home. Library audit confirmed the farm: in the 40
+# newest COLD harvests, 61% of counted "turns" were S-bends (10.4 counted -> 4.1 real
+# heading changes; longest run 8). S-bends leaked into BOTH variety legs -- _turn_count
+# counted them as "direction changes" while _sbend_count's own docstring calls them
+# "lateral weave WITHOUT a heading change", and in the balance leg 29 scored left / 30
+# scored right, so an alternating stack manufactured handedness too. Fix: the style legs
+# count HEADING changes only; S-bends keep their own leg (weight .05, capped at 4), so
+# stacking past 4 earns exactly nothing.
+
+def _p6_mix(n_right=0, n_left=0, n_sbend_pairs=0, chain_peak=27, length=80):
+    """A P6-scale build (chain hill + steep drop + length) whose trailing flat pads are
+    converted into the requested turn / S-bend mix, so tests vary ONLY the style legs."""
+    rows = _big_hill(chain_peak=chain_peak, steep=True, length=length)
+    fill = [4] * n_right + [3] * n_left
+    for _ in range(n_sbend_pairs):
+        fill += [29, 30]
+    for i in range(len(rows) - 1, -1, -1):
+        if not fill:
+            break
+        if rows[i] == (0, 14, 14):
+            rows[i] = (fill.pop(), 14, 14)
+    assert not fill, "not enough flat pads to convert"
+    return rows
+
+
+def test_turn_count_excludes_sbends():
+    env = _bare_env(history=_env_hist(
+        [(4, 14, 14), (3, 14, 14), (21, 14, 14), (24, 14, 14)]        # 4 heading turns
+        + [(29, 14, 14), (30, 14, 14)] * 4))                          # 8 S-bends
+    assert env._turn_count() == 4
+    assert env._sbend_count() == 8                                    # own leg unchanged
+
+
+def test_turn_balance_excludes_sbends():
+    """An alternating S-bend stack is net-zero heading change: it must score NO
+    handedness, or the balance leg (the leg that exists to force genuine winding)
+    is farmable by the flattest possible motif."""
+    stack = _bare_env(history=_env_hist([(29, 14, 14), (30, 14, 14)] * 4))
+    assert stack._turn_balance_count() == 0
+    genuine = _bare_env(history=_env_hist([(4, 14, 14)] * 3 + [(3, 14, 14)] * 3))
+    assert genuine._turn_balance_count() == 3
+
+
+def test_sbend_stack_cannot_farm_p6_variety_credit():
+    """THE regression: the observed exploit build must score strictly below a genuinely
+    winding build, and piling on more S-bends must add nothing once the S-bend leg caps."""
+    P6 = ImprovedPhasedCurriculumWrapper._phase_reward_params(6)
+
+    def variety_credit(rows):
+        return _bare_env(history=_env_hist(rows))._hill_quality(P6)
+
+    exploit = [(4, 14, 14)] * 4 + [(29, 14, 14), (30, 14, 14)] * 4     # 4 turns + 8 S-bends
+    genuine = [(4, 14, 14)] * 6 + [(3, 14, 14)] * 6                    # 12 balanced turns
+    assert variety_credit(exploit) < variety_credit(genuine)
+    # Marginal S-bends past the capped target earn nothing the same number of PLAIN
+    # pieces would not (length credit is the only thing extra track buys).
+    pad_sbends = exploit + [(29, 14, 14), (30, 14, 14)] * 3
+    pad_straights = exploit + [(0, 14, 14)] * 6
+    assert variety_credit(pad_sbends) == pytest.approx(variety_credit(pad_straights))
+
+
+def test_sbend_stack_does_not_meet_p6_qualified_gate():
+    P6 = ImprovedPhasedCurriculumWrapper._phase_reward_params(6)
+
+    def env_for(rows):
+        env = _bare_env(history=_env_hist(rows))
+        env._last_test_ok = True
+        env.last_ride_excitement = 6.0
+        env._calculate_energy_margin = lambda: 10.0
+        return env
+
+    # full-size builds so only the VARIETY legs differ (P6 also gates height/drop/length)
+    exploit = _p6_mix(n_right=4, n_left=0, n_sbend_pairs=4)
+    genuine = _p6_mix(n_right=6, n_left=6, n_sbend_pairs=0)
+    assert env_for(exploit)._qualifies(P6) is False
+    assert env_for(genuine)._qualifies(P6) is True
+
+
+def test_energy_model_still_charges_sbend_friction():
+    """S-bends are curved track: the PHYSICS estimate must keep charging them turn
+    friction even though the STYLE legs no longer count them as heading changes."""
+    climb = [(10, 14, 15)] + [(9, 15 + 2 * i, 17 + 2 * i) for i in range(8)]  # banked energy
+    straight = _bare_env(
+        history=_env_hist(climb + [(0, 31, 31)] * 4))._calculate_estimated_energy()
+    sbends = _bare_env(history=_env_hist(
+        climb + [(29, 31, 31), (30, 31, 31)] * 2))._calculate_estimated_energy()
+    assert straight > 0 and sbends < straight

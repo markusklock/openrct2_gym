@@ -20,8 +20,7 @@ from dataclasses import dataclass
 
 CHAIN_ACTIONS = (9, 10)          # matches openrct2_env / api_track_builder chain-lift actions
 STEEP_ACTIONS = (8, 27, 28)      # 60-degree family (matches env._steep_drop_z / P4's gate leg)
-TURN_ACTIONS = (1, 2, 3, 4, 21, 22, 23, 24, 29, 30)   # matches env._turn_count
-SBEND_ACTIONS = (29, 30)
+from openrct2_gym.envs.track_pieces import SBEND_ACTIONS, TURN_ACTIONS  # noqa: F401
 
 # Static per-action z geometry (live-verified via the base-z offset probes): descents drop
 # by their span, ascents climb by theirs. Lets the pool grade loops by real drop height and

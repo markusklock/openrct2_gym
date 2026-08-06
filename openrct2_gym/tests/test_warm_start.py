@@ -401,7 +401,7 @@ def test_generate_p6_candidates_wind_both_ways():
 
 def test_loop_record_turn_and_sbend_properties():
     rec = LoopRecord.from_actions([4, 4, 0, 3, 29, 30, 0, 4, 4], "scripted")
-    assert rec.turn_count == 7                               # 4,4,3,29,30,4,4
+    assert rec.turn_count == 5                               # 4,4,3,4,4 (S-bends excluded)
     assert rec.sbend_count == 2
     assert LoopRecord.from_actions([0, 0, 6], "scripted").turn_count == 0
 
