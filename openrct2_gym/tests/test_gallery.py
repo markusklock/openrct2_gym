@@ -61,3 +61,19 @@ def test_gallery_slots_spaced_and_on_map():
     assert all(abs(a - b) >= 20 for a, b in zip(ys, ys[1:]))
     assert all(2 <= y <= 250 for y in ys)                      # stays on the flat map
     assert all(x == 61 and z == 14 for x, _, z in slots)
+
+
+# ------------------------------- provenance -> training step (Aug-6)
+# Records stamp wall-clock ts; TB stamps wall_time on every scalar. The join turns
+# "when was this coaster built" into "at which training step", with no plumbing into
+# the training loop. Pure lookup so it is testable without TB event files.
+
+def test_step_at_time_interpolates_and_bounds():
+    from build_gallery import step_at_time
+    samples = [(1000.0, 100), (2000.0, 200), (3000.0, 300)]
+    assert step_at_time(2000.0, samples) == 200
+    assert step_at_time(2500.0, samples) == 250          # between samples
+    assert step_at_time(500.0, samples) == 100           # before first -> first
+    assert step_at_time(9999.0, samples) == 300          # after last -> last
+    assert step_at_time(0.0, samples) is None            # unknown ts -> honest None
+    assert step_at_time(2000.0, []) is None              # no TB data -> honest None

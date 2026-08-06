@@ -26,6 +26,46 @@ from openrct2_gym.envs.track_pieces import (
 QUALIFY_MIN_E, QUALIFY_MIN_TURNS, QUALIFY_MIN_BALANCE = 4.5, 12, 2
 
 
+def step_at_time(ts, samples):
+    """Training step at wall-clock `ts`, linearly interpolated from TB (wall_time, step)
+    samples. Returns None when the record predates provenance stamping (ts == 0) or no
+    TB data is available -- an honest gap beats a fabricated step."""
+    if not ts or not samples:
+        return None
+    samples = sorted(samples)
+    if ts <= samples[0][0]:
+        return samples[0][1]
+    if ts >= samples[-1][0]:
+        return samples[-1][1]
+    for (t0, s0), (t1, s1) in zip(samples, samples[1:]):
+        if t0 <= ts <= t1:
+            span = (t1 - t0) or 1.0
+            return int(s0 + (s1 - s0) * (ts - t0) / span)
+    return None
+
+
+def tb_time_samples(tb_glob="parallel_curriculum_masked_tensorboard/*/events.*"):
+    """(wall_time, step) pairs from every TB run dir; [] if TB is unreadable."""
+    import glob
+    try:
+        from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+    except ImportError:
+        return []
+    out = []
+    for path in glob.glob(tb_glob):
+        try:
+            acc = EventAccumulator(path, size_guidance={"scalars": 0})
+            acc.Reload()
+            tags = acc.Tags()["scalars"]
+            tag = "rollout/ep_rew_mean" if "rollout/ep_rew_mean" in tags else (
+                next(iter(tags)) if tags else None)
+            if tag:
+                out += [(e.wall_time, e.step) for e in acc.Scalars(tag)]
+        except Exception:
+            continue
+    return out
+
+
 def turn_balance_of(actions):
     """min(left-family, right-family) turn pieces -- the env's P6 balance leg."""
     left = sum(1 for a in actions if a in LEFT_TURNS)
@@ -142,6 +182,7 @@ def main():
               f"E={rec.excitement:4.2f} turns={rec.turn_count:2d} "
               f"balance={turn_balance_of(rec.actions)} -> {status}")
 
+    _tb_samples = tb_time_samples()
     print(f"\nwaiting {args.rate_wait:.0f}s for test trains to rate...")
     time.sleep(args.rate_wait)
     api.set_game_speed(1)
@@ -153,8 +194,12 @@ def main():
             p = stats.get("payload") or {}
             e = p.get("excitement", -1)
             rated = f"live E {e:.2f}" if isinstance(e, (int, float)) and e > 0 else "unrated"
+            step = step_at_time(getattr(rec, "ts", 0.0), _tb_samples)
+            prov = (f"  built ~step {step:,} on port {rec.port}"
+                    if step is not None else
+                    (f"  port {rec.port}" if getattr(rec, "port", -1) >= 0 else ""))
             print(f"  y={slot[1]:3d}  {label:9s}  {rec.length:3d} pieces  "
-                  f"harvest-E {rec.excitement:4.2f}  {rated}")
+                  f"harvest-E {rec.excitement:4.2f}  {rated}{prov}")
     print("\nNow save the park and open it in any OpenRCT2 to inspect.")
 
 

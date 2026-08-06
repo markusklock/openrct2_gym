@@ -1498,3 +1498,46 @@ def test_wrapper_warm_min_prefix_resumes_descent(monkeypatch, tmp_path):
     assert wrapper._annealer.min_prefix_init == 6
     w2, _ = _wrapped(monkeypatch, tmp_path.joinpath("d"), initial_phase=6)
     assert w2._annealer.min_prefix == 6                       # default arming unchanged
+
+
+# ------------------------------------ harvest provenance (Aug-6, "which episode?")
+# Markus asked which episodes two gallery coasters came from and the library could not
+# say: records carry no time or instance identity, so age could only be guessed from
+# file position and one coaster narrowed to 8 candidates. Records now stamp wall-clock
+# ts + the OpenRCT2 port that built them. ts (not a step counter) because TB timestamps
+# every scalar, so ts -> exact training step is a lookup -- and no plumbing has to reach
+# into the running training loop to fetch num_timesteps.
+
+def test_loop_record_provenance_roundtrip(tmp_path):
+    lib = LoopLibrary(str(tmp_path / "lib.jsonl"))
+    lib.add(LoopRecord.from_actions([4, 0, 3], "harvest_cold", ts=1785000000.5, port=8093))
+    reloaded = LoopLibrary(str(tmp_path / "lib.jsonl"))
+    (rec,) = reloaded._records.values()
+    assert rec.ts == pytest.approx(1785000000.5)
+    assert rec.port == 8093
+
+
+def test_loop_record_provenance_defaults_for_legacy(tmp_path):
+    """Every pre-Aug-6 line lacks both fields; they must load, not crash, and be
+    identifiable as unknown (the excitement-field precedent: no migration)."""
+    path = tmp_path / "legacy.jsonl"
+    path.write_text(json.dumps({"actions": [4, 0, 3], "length": 3, "chain_count": 0,
+                                "max_gain": 0.0, "drop_z": 0.0, "source": "harvest"}) + "\n")
+    (rec,) = LoopLibrary(str(path))._records.values()
+    assert rec.ts == 0.0 and rec.port == -1
+
+
+def test_harvest_stamps_time_and_port(monkeypatch, tmp_path):
+    monkeypatch.setattr(oe_mod, "APIController", CompletingAPI)
+    lib_path = str(tmp_path / "lib.jsonl")
+    monkeypatch.setattr(OpenRCT2Env, "_LOOP_LIBRARY_PATH", lib_path)
+    monkeypatch.setattr(oe_mod.time, "time", lambda: 1785123456.0)
+    env = OpenRCT2Env(port=8087, verbose=0)
+    env.reset()
+    for _ in range(20):
+        _, _, term, trunc, _ = env.step(0)
+        if term or trunc:
+            break
+    recs = list(LoopLibrary(lib_path)._records.values())
+    assert recs and all(r.ts == pytest.approx(1785123456.0) for r in recs)
+    assert all(r.port == 8087 for r in recs)

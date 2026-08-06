@@ -16,6 +16,7 @@ class FakeAPI:
     """Minimal stand-in for APIController; advances one tile per placed piece."""
 
     def __init__(self, host=None, port=None, verbose=0):
+        self.port = port                  # real APIController stores it; harvests stamp it
         self.station_length = 3
         self._dv = [(0, 1), (1, 0), (0, -1), (-1, 0)]
         self._stack = []  # endpoints of placed pieces (for delete)

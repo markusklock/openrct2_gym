@@ -872,7 +872,12 @@ class OpenRCT2Env(gym.Env):
                     # cold-vs-scaffolded provenance for inspection tooling
                     # (build_gallery.py splits current UNAIDED behavior from warm work)
                     source="harvest_cold" if self._warm_cold else "harvest",
-                    excitement=excitement))
+                    excitement=excitement,
+                    # when + which instance: ts joins to TB wall_time for the exact
+                    # training step; port identifies the worker (a sick instance shows
+                    # up as a cluster instead of vanishing into the average)
+                    ts=time.time(),
+                    port=getattr(self.api_controller, "port", -1)))
         except Exception:
             pass
 

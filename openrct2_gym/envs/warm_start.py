@@ -37,11 +37,17 @@ class LoopRecord:
     chain_count: int
     max_gain: float              # peak z above the start height (0 for flat loops)
     drop_z: float                # total z dropped over descent pieces (static per-action geometry)
-    source: str                  # "scripted" | "harvest" | "mined" | "imported"
+    source: str                  # "scripted" | "harvest" | "harvest_cold" | "mined" | "imported"
     excitement: float = 0.0     # MEASURED ride excitement (0.0 = untested/legacy; P5 ratchet key)
+    # Provenance (Aug-6): wall-clock seconds and the OpenRCT2 port that built it.
+    # ts rather than a training-step counter: TB stamps wall_time on every scalar, so
+    # ts -> exact step is a lookup, and nothing has to reach into the training loop.
+    # 0.0 / -1 mean "legacy record, unknown".
+    ts: float = 0.0
+    port: int = -1
 
     @staticmethod
-    def from_actions(actions, source, max_gain=0.0, excitement=0.0):
+    def from_actions(actions, source, max_gain=0.0, excitement=0.0, ts=0.0, port=-1):
         acts = tuple(int(a) for a in actions)     # coerce numpy ints -> json-serializable
         return LoopRecord(
             actions=acts,
@@ -51,6 +57,8 @@ class LoopRecord:
             drop_z=float(sum(ACTION_DROP_Z.get(a, 0) for a in acts)),
             source=str(source),
             excitement=float(excitement),
+            ts=float(ts),
+            port=int(port),
         )
 
     @property
@@ -123,7 +131,8 @@ class LoopLibrary:
                         d = json.loads(line)
                         rec = LoopRecord.from_actions(
                             d["actions"], d.get("source", "harvest"), d.get("max_gain", 0.0),
-                            excitement=d.get("excitement", 0.0))
+                            excitement=d.get("excitement", 0.0),
+                            ts=d.get("ts", 0.0), port=d.get("port", -1))
                     except (ValueError, KeyError, TypeError):
                         continue           # corrupt/partial line -> skip
                     if rec.length > 0:
@@ -185,6 +194,7 @@ class LoopLibrary:
                 "chain_count": record.chain_count, "max_gain": record.max_gain,
                 "drop_z": record.drop_z, "source": record.source,
                 "excitement": record.excitement,
+                "ts": record.ts, "port": record.port,
             }) + "\n"
             with open(self.path, "a") as f:
                 f.write(line)
@@ -253,7 +263,7 @@ class LoopLibrary:
         return max(fits, default=0.0)
 
     @staticmethod
-    def record_from_history(history, source="harvest", excitement=0.0):
+    def record_from_history(history, source="harvest", excitement=0.0, ts=0.0, port=-1):
         """A LoopRecord from a COMPLETED track_builder.history, else None.
 
         max_gain is measured against the first entry's start height (== station height,
@@ -268,7 +278,7 @@ class LoopLibrary:
         except (KeyError, IndexError, TypeError, ValueError):
             return None
         return LoopRecord.from_actions(actions, source, max_gain=max(max_gain, 0.0),
-                                       excitement=excitement)
+                                       excitement=excitement, ts=ts, port=port)
 
 
 @dataclass
