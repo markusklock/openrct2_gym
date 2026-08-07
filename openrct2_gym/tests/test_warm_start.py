@@ -1177,7 +1177,8 @@ def test_wrapper_records_outcomes_into_annealer(monkeypatch, tmp_path):
     # accidental-closure abort): raise the fake's completion point past any prefix length.
     base.api_controller.complete_after = 13
     calls = []
-    wrapper._annealer.record_outcome = lambda plan, success: calls.append((plan, success))
+    wrapper._annealer.record_outcome = (
+        lambda plan, success, styled=None: calls.append((plan, success)))
     _run_episode(wrapper)
     assert base._warm_aborted is False
     assert len(calls) == 1
@@ -1190,7 +1191,8 @@ def test_wrapper_skips_annealer_recording_for_aborted_prefix(monkeypatch, tmp_pa
     demote the frontier."""
     wrapper, base = _wrapped(monkeypatch, tmp_path, api_cls=FlakyPrefixAPI, p_cold=0.0)
     calls = []
-    wrapper._annealer.record_outcome = lambda plan, success: calls.append((plan, success))
+    wrapper._annealer.record_outcome = (
+        lambda plan, success, styled=None: calls.append((plan, success)))
     _run_episode(wrapper)
     assert base._warm_aborted is True                   # the prefix did abort in this episode
     assert calls == []                                  # ...and the annealer never heard of it
@@ -1541,3 +1543,58 @@ def test_harvest_stamps_time_and_port(monkeypatch, tmp_path):
     recs = list(LoopLibrary(lib_path)._records.values())
     assert recs and all(r.ts == pytest.approx(1785123456.0) for r in recs)
     assert all(r.port == 8087 for r in recs)
+
+
+# --------------------------- descent must be gated on STYLE, not completion (Aug-7)
+# The prefix descent shrank the opening seed whenever floor-bound builds COMPLETED --
+# never checking whether they still wound. So it dismantled the winding scaffold on
+# evidence of the wrong thing: it walked 6 -> 0 twice (once on S-bend-farmed successes,
+# once on honest ones) and both times left cold builds at the 4-turn rectangle, because
+# a seeded build that completes as a rectangle still counts as "ready for a smaller
+# seed". Floor-bound outcomes now require completion AND retained style.
+
+def test_floor_descent_ignores_unstyled_completions():
+    ann = WarmStartAnnealer(k_init=999, promote_n=10, promote_rate=0.6,
+                            rng=random.Random(0))
+    ann.min_prefix = 4
+    ann.min_prefix_init = 6
+    plan = WarmStartPlan(prefix=FLAT[:4], k=8, loop_len=12, cold=False, at_floor=True)
+    for _ in range(10):
+        ann.record_outcome(plan, success=True, styled=False)   # completes, but flat
+    # Not merely "does not shrink": an all-unstyled window is a demote signal, so the
+    # seed WIDENS back toward init -- the agent gets more winding demonstration, which
+    # is the correct response to the skill being lost.
+    assert ann.min_prefix == 5
+
+
+def test_floor_descent_advances_on_styled_completions():
+    ann = WarmStartAnnealer(k_init=999, promote_n=10, promote_rate=0.6,
+                            rng=random.Random(0))
+    ann.min_prefix = 4
+    ann.min_prefix_init = 6
+    plan = WarmStartPlan(prefix=FLAT[:4], k=8, loop_len=12, cold=False, at_floor=True)
+    for _ in range(10):
+        ann.record_outcome(plan, success=True, styled=True)
+    assert ann.min_prefix == 3
+
+
+def test_k_frontier_still_promotes_on_plain_completion():
+    """Build DEPTH is genuinely about closing loops -- the style gate must not leak
+    into the k anneal (they track different skills, as the split window already says)."""
+    ann = WarmStartAnnealer(k_init=10, promote_n=10, promote_rate=0.6,
+                            rng=random.Random(0))
+    plan = WarmStartPlan(prefix=FLAT[:2], k=10, loop_len=12, cold=False, at_floor=False)
+    for _ in range(10):
+        ann.record_outcome(plan, success=True, styled=False)
+    assert ann.k_max == 12
+
+
+def test_record_outcome_styled_defaults_backward_compatible():
+    ann = WarmStartAnnealer(k_init=999, promote_n=10, promote_rate=0.6,
+                            rng=random.Random(0))
+    ann.min_prefix = 2
+    ann.min_prefix_init = 6
+    plan = WarmStartPlan(prefix=FLAT[:2], k=10, loop_len=12, cold=False, at_floor=True)
+    for _ in range(10):
+        ann.record_outcome(plan, success=True)                 # no styled arg
+    assert ann.min_prefix == 1

@@ -380,14 +380,23 @@ class WarmStartAnnealer:
                              k=k, loop_len=rec.length, cold=False,
                              at_floor=(self.min_prefix > 0 and k == k_cap))
 
-    def record_outcome(self, plan, success):
+    def record_outcome(self, plan, success, styled=None):
         """Feed an episode outcome to the frontier; promote/demote k_max when it fills.
         Floor-bound outcomes feed the PREFIX frontier instead: the two anneals track
-        different skills (build depth vs. opening habit) and must not share a window."""
+        different skills (build depth vs. opening habit) and must not share a window.
+
+        `styled` gates the PREFIX descent only (Aug-7): shrinking the opening seed must
+        require that the seeded build still WOUND, not merely that it closed. Gating on
+        completion alone dismantled the winding scaffold regardless of whether the skill
+        was retained -- the descent walked 6 -> 0 twice and both times left cold builds
+        at the 4-turn rectangle. None = caller has no opinion (backward compatible).
+        Build DEPTH keeps promoting on plain completion: closing a long loop is exactly
+        what that frontier is meant to measure."""
         if plan is None or plan.cold:
             return
         if getattr(plan, "at_floor", False):
-            self.floor_frontier.append(bool(success))
+            retained = bool(success) and (True if styled is None else bool(styled))
+            self.floor_frontier.append(retained)
             if len(self.floor_frontier) < self.promote_n:
                 return
             rate = sum(self.floor_frontier) / len(self.floor_frontier)

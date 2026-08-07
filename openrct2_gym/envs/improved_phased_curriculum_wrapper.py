@@ -152,6 +152,11 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
         # parametrized function owned by the env; the curriculum only sets parameters.
         self._update_phase_settings()
 
+    # Heading turns a floor-bound (smallest-seed) build must reach before the prefix
+    # descent is allowed to shrink the seed further. Matches the P6 pool's min_turns,
+    # i.e. "as wound as the exemplars we are teaching from".
+    FLOOR_STYLE_MIN_TURNS = 8
+
     def _get_base_env(self):
         """Get the base OpenRCT2 environment"""
         env = self.env
@@ -934,7 +939,11 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
             # Aborted prefixes are infrastructure events, not agent outcomes: they must
             # not feed the frontier (a burst of aborts would demote k_max on noise).
             if not info.get('warm_aborted', False):
-                self._annealer.record_outcome(self._current_plan, success)
+                # The prefix descent may only shrink the opening seed when the seeded
+                # build actually wound (>= the pool's teaching level of heading turns),
+                # not merely when it closed -- see WarmStartAnnealer.record_outcome.
+                styled = self._history_turn_count(base_env) >= self.FLOOR_STYLE_MIN_TURNS
+                self._annealer.record_outcome(self._current_plan, success, styled=styled)
             chain_count = self._history_chain_count(base_env)
             phase2_signals = None
             if self.current_phase == 2:
