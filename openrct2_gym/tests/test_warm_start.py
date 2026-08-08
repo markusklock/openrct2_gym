@@ -1598,3 +1598,30 @@ def test_record_outcome_styled_defaults_backward_compatible():
     for _ in range(10):
         ann.record_outcome(plan, success=True)                 # no styled arg
     assert ann.min_prefix == 1
+
+
+def test_floor_style_bar_is_reachable_and_self_correcting(monkeypatch, tmp_path):
+    """The descent bar must be one FLOOR-BOUND builds can actually clear, or the seed
+    never shrinks and the context gap never closes. Live evidence (Aug-8, 2,895
+    provenance-stamped harvests): seeded builds average 7.9 heading turns (49% >= 8),
+    but floor-bound ones -- where the agent builds everything behind a 6-piece seed --
+    sit near the cold end, and a bar of 8 stalled the descent for ~570k steps.
+
+    6 is safe because the demote path makes this an EQUILIBRIUM SEARCH, not a one-way
+    walk: at any bar the seed widens back wherever style fails, so it settles at the
+    seed size the policy can actually hold. (Under the old completion-only criterion no
+    such feedback existed -- completion always succeeded, so the seed always hit 0.)"""
+    W = ImprovedPhasedCurriculumWrapper
+    assert W.FLOOR_STYLE_MIN_TURNS == 6
+
+    ann = WarmStartAnnealer(k_init=999, promote_n=10, promote_rate=0.6,
+                            demote_rate=0.15, rng=random.Random(0))
+    ann.min_prefix, ann.min_prefix_init = 3, 6
+    floor = WarmStartPlan(prefix=FLAT[:3], k=9, loop_len=12, cold=False, at_floor=True)
+    for _ in range(10):                      # style held -> seed shrinks
+        ann.record_outcome(floor, success=True, styled=True)
+    assert ann.min_prefix == 2
+    for _ in range(10):                      # style lost -> seed widens back
+        ann.record_outcome(WarmStartPlan(FLAT[:2], 10, 12, False, True),
+                           success=True, styled=False)
+    assert ann.min_prefix == 3

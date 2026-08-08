@@ -153,9 +153,13 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
         self._update_phase_settings()
 
     # Heading turns a floor-bound (smallest-seed) build must reach before the prefix
-    # descent is allowed to shrink the seed further. Matches the P6 pool's min_turns,
-    # i.e. "as wound as the exemplars we are teaching from".
-    FLOOR_STYLE_MIN_TURNS = 8
+    # descent may shrink the seed further. 6, not the pool's 8 (Aug-8): at 8 the descent
+    # stalled ~570k steps because floor-bound builds -- where the agent builds everything
+    # behind the seed -- sit near the cold end of the distribution. The bar only has to
+    # be clearable, because the demote path makes the descent an EQUILIBRIUM SEARCH: the
+    # seed widens back wherever style fails, so it settles at the width the policy can
+    # actually hold, and that settling point is itself the measurement.
+    FLOOR_STYLE_MIN_TURNS = 6
 
     def _get_base_env(self):
         """Get the base OpenRCT2 environment"""
