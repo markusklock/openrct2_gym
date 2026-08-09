@@ -1280,7 +1280,12 @@ class OpenRCT2Env(gym.Env):
             phi += params.w_exc_feat * self._exc_feature_quality(params)
         # Family-match term (P6): dense per-piece gradient toward the seed's requested
         # footprint family -- the same _family_match the completion gate and R_family
-        # bonus consume, scored on the whole removal-safe history -> telescopes.
+        # bonus consume, scored on the whole removal-safe history -> telescopes. Unlike
+        # w_h (chain gain, rises from ~0) and w_exc_feat (static features, rises from ~0),
+        # the oval band's [0,5] turn and [0,0] switch bounds mean an empty build already
+        # scores 1.0; potential can only fall. That is coherent (for an oval the gradient
+        # comes from length/drop/completion, not from building "something"), but it works
+        # backward: this term mostly shapes the higher-numbered families that rise normally.
         if params.w_family > 0.0:
             phi += params.w_family * self._family_match(params)
         # Descent/return shaping: 0 at/above the summit (no double-pay), rising on the way home.

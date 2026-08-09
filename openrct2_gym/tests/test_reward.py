@@ -3647,7 +3647,7 @@ def test_family_potential_rises_toward_the_requested_family():
     ~900k steps without reaching cold builds), so family progress pays per piece."""
     params = replace(RewardParams(), w_family=6.0)
     near = _bare_env(history=_env_hist([(4, 14, 14)] * 4))       # 4 turns: oval band
-    far = _bare_env(history=_env_hist([(4, 14, 14)] * 12))       # 12 turns: way outside
+    far = _bare_env(history=_env_hist([(4, 14, 14)] * 12))       # 12 turns: family_match=0.5 (turn band 0, switch band 1)
     near.target_family = 0
     far.target_family = 0
     assert near._potential(params) > far._potential(params)
