@@ -576,7 +576,8 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
         P2.1 = one-chain climb-and-return; P2.2 = completion with >=1 chain; P2.3 = completion
         with >=3 chains; P3 = completed with >=2 chain lifts AND a drop
         (tightened from OR so the agent must keep the lift hill and add a drop). Returns
-        None for phases without a structural gate (1, 4, 5)."""
+        None only for phase 1, which has no structural gate; every other phase (2-6) has
+        its own branch below."""
         if self.current_phase == 2:
             signals = self._phase2_signals(base_env, success)
             stage = getattr(self, 'phase2_stage', 1)
@@ -812,6 +813,8 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
         self.phase2_chain1_completion_results.clear()
         self.phase2_chain2_completion_results.clear()
         self.phase2_chain3_completion_results.clear()
+        for window in self.episode_family_results.values():
+            window.clear()
 
     def _advance_phase2_stage(self, new_stage, qualified_rate):
         """Advance within Phase 2 without changing the public curriculum phase."""
@@ -1050,20 +1053,27 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
             # `qualified` is None on phases without a structural gate (e.g. phase 1),
             # where the seed is pinned to 0 and family_hit is reward-inert noise; bool()
             # collapses that to False rather than letting a bare None poison the window.
-            z = int(self._get_base_env().target_family)
+            z = int(base_env.target_family)
+            # NOTE: whole-track predicate (mirrors env._family_hit, openrct2_env.py:1533-
+            # 1536), not the suffix-only variant _is_qualified uses for P6's gate. On a
+            # warm episode this reports the scaffold's shape, not the agent's -- read it
+            # together with `cold_start`.
             family_hit = bool(info.get('episode_metrics', {}).get('family_hit', 0.0))
             if cold:
                 self.episode_family_results[z].append(bool(family_hit and qualified))
             info['target_family'] = z
             info['family_hit'] = float(family_hit)
-            # Always emit every family's diagnostic (0.0 default while its cold window
-            # is still empty), matching qualified_rate/phase_success_rate's convention
-            # elsewhere in this method -- gating the KEY itself on a non-empty window
-            # means the very first episode (often warm) reports no per-family rate at
-            # all, which is a worse diagnostic than an honest 0.0.
-            for fz, window in self.episode_family_results.items():
+            # Emit the rate (+ its family_n_ sample count) only for families the current
+            # phase actually draws from -- matching qualified_rate's convention (:1113)
+            # of gating the KEY itself on applicability, not just its value. 0.0 is kept
+            # as the empty-window fallback so an active family with zero cold samples
+            # still reports a number, but family_n_{z}==0 tells that number apart from a
+            # real all-miss 0.0.
+            for fz in self.PHASE_FAMILIES.get(self.current_phase, ()):
+                window = self.episode_family_results[fz]
                 info[f'family_hit_rate_{fz}'] = (
                     sum(window) / len(window) if window else 0.0)
+                info[f'family_n_{fz}'] = len(window)
 
             if success:
                 self.total_loops_completed += 1

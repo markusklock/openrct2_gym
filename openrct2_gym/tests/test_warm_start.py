@@ -1850,6 +1850,7 @@ def test_phase_family_sets_widen_with_the_track_budget():
     assert W.PHASE_FAMILIES[2] == ()
     assert W.PHASE_FAMILIES[3] == (0, 1, 2)   # oval, spiral, out-and-back
     assert W.PHASE_FAMILIES[4] == (0, 1, 2, 3)
+    assert W.PHASE_FAMILIES[5] == (0, 1, 2, 3, 4)
     assert W.PHASE_FAMILIES[6] == (0, 1, 2, 3, 4)
 
 
@@ -1872,9 +1873,164 @@ def test_early_phases_pin_the_family_to_zero(monkeypatch, tmp_path):
         assert base.target_family == 0
 
 
-def test_step_info_reports_per_family_hit_rate(monkeypatch, tmp_path):
-    wrapper, base = _wrapped(monkeypatch, tmp_path, initial_phase=6)
+def test_step_info_reports_target_family_and_family_hit(monkeypatch, tmp_path):
+    wrapper, base = _wrapped(monkeypatch, tmp_path, api_cls=CompletingAPI,
+                              initial_phase=6, p_cold=1.0)
     info = _run_episode(wrapper)
     assert "target_family" in info
     assert "family_hit" in info
-    assert any(k.startswith("family_hit_rate_") for k in info)
+
+
+# ---------------------- Fix 1: the per-family window survives phase advancement
+
+def test_family_window_clears_on_phase_advancement(monkeypatch, tmp_path):
+    """episode_family_results must not survive a phase change -- otherwise P6 entry
+    inherits stale per-family outcomes measured against an earlier phase's qualified
+    predicate (see _clear_phase_windows)."""
+    wrapper, base = _wrapped(monkeypatch, tmp_path, api_cls=CompletingAPI,
+                              initial_phase=5, p_cold=1.0)
+    wrapper._sample_target_family = lambda: 0
+    base.api_controller.complete_after = len(OVAL_BUILD)
+    wrapper.reset()
+    for a in OVAL_BUILD:
+        _, _, terminated, truncated, _ = wrapper.step(a)
+        if terminated or truncated:
+            break
+    assert len(wrapper.episode_family_results[0]) == 1
+
+    wrapper._advance_to_phase(6)
+    assert len(wrapper.episode_family_results[0]) == 0
+    for fz in range(5):
+        assert len(wrapper.episode_family_results[fz]) == 0
+
+
+# ---------------------- Fix 2: the rate key is gated on active families, with an
+# explicit denominator (family_n_{z}) so 0.0-no-samples reads differently from
+# 0.0-all-miss.
+
+def test_family_hit_rate_key_absent_when_no_family_active(monkeypatch, tmp_path):
+    wrapper, base = _wrapped(monkeypatch, tmp_path, api_cls=CompletingAPI, p_cold=1.0)
+    assert wrapper.current_phase == 1
+    assert wrapper.PHASE_FAMILIES[1] == ()
+    info = _run_episode(wrapper)
+    assert not any(k.startswith("family_hit_rate_") for k in info)
+    assert not any(k.startswith("family_n_") for k in info)
+
+
+def test_family_hit_rate_emits_all_active_families_with_n_companion(monkeypatch, tmp_path):
+    wrapper, base = _wrapped(monkeypatch, tmp_path, api_cls=CompletingAPI,
+                              initial_phase=6, p_cold=1.0)
+    info = _run_episode(wrapper)
+    for fz in range(5):
+        assert f"family_hit_rate_{fz}" in info
+        assert f"family_n_{fz}" in info
+
+
+def test_family_hit_rate_reports_zero_before_any_cold_episode(monkeypatch, tmp_path):
+    wrapper, base = _wrapped(monkeypatch, tmp_path, api_cls=CompletingAPI,
+                              initial_phase=6, p_cold=1.0)
+    wrapper._sample_target_family = lambda: 0
+    base.api_controller.complete_after = len(OVAL_BUILD)
+    wrapper.reset()
+    info = None
+    for a in OVAL_BUILD:
+        _, _, terminated, truncated, info = wrapper.step(a)
+        if terminated or truncated:
+            break
+    assert info['family_n_0'] == 1
+    for fz in (1, 2, 3, 4):
+        assert info[f'family_n_{fz}'] == 0
+        assert info[f'family_hit_rate_{fz}'] == 0.0
+
+
+# ---------------------- Fix 3: lock down what the tracking actually computes, not
+# merely that the keys exist.
+
+def test_family_hit_rate_equals_hits_over_total(monkeypatch, tmp_path):
+    wrapper, base = _wrapped(monkeypatch, tmp_path, api_cls=CompletingAPI,
+                              initial_phase=6, p_cold=1.0)
+    wrapper._sample_target_family = lambda: 0
+    info = None
+    for _ in range(2):                              # two hits: oval build == oval seed
+        base.api_controller.complete_after = len(OVAL_BUILD)
+        wrapper.reset()
+        for a in OVAL_BUILD:
+            _, _, terminated, truncated, info = wrapper.step(a)
+            if terminated or truncated:
+                break
+    # one miss: still seeded oval, but the agent builds a spiral instead
+    base.api_controller.complete_after = len(SPIRAL_BUILD)
+    wrapper.reset()
+    for a in SPIRAL_BUILD:
+        _, _, terminated, truncated, info = wrapper.step(a)
+        if terminated or truncated:
+            break
+    assert info['family_n_0'] == 3
+    assert info['family_hit_rate_0'] == pytest.approx(2 / 3)
+
+
+def test_family_hit_rate_excludes_warm_episodes_from_denominator(monkeypatch, tmp_path):
+    """A scaffolded build inherits its shape from the exemplar, so a warm episode must
+    not move the count -- drive a mixed cold/warm/cold sequence and check the family_n_
+    denominator only advances on the cold ones."""
+    wrapper, base = _wrapped(monkeypatch, tmp_path, api_cls=CompletingAPI,
+                              seed_loops=(FLAT,), p_cold=1.0)
+    wrapper.current_phase = 6
+    wrapper._update_phase_settings()
+    wrapper._sample_target_family = lambda: 0
+
+    plans = iter([
+        WarmStartPlan(prefix=[], k=0, loop_len=0, cold=True),
+        WarmStartPlan(prefix=list(FLAT[:6]), k=6, loop_len=len(FLAT), cold=False),
+        WarmStartPlan(prefix=[], k=0, loop_len=0, cold=True),
+    ])
+    wrapper._sample_warm_start = lambda: next(plans)
+
+    def _drive(actions, complete_after):
+        base.api_controller.complete_after = complete_after
+        wrapper.reset()
+        info = None
+        for a in actions:
+            _, _, terminated, truncated, info = wrapper.step(a)
+            if terminated or truncated:
+                break
+        return info
+
+    info = _drive(OVAL_BUILD, len(OVAL_BUILD))
+    assert info['family_n_0'] == 1                      # cold #1 counted
+
+    info = _drive(FLAT[6:], len(FLAT))
+    assert info['family_n_0'] == 1                      # warm episode must NOT advance it
+
+    info = _drive(OVAL_BUILD, len(OVAL_BUILD))
+    assert info['family_n_0'] == 2                      # cold #2 counted
+
+
+def test_family_hit_lands_in_the_drawn_familys_bucket_only(monkeypatch, tmp_path):
+    """A hit must land in the family the episode's seed drew, not some other family's
+    window -- drive two different seeds and check each window only moves once."""
+    wrapper, base = _wrapped(monkeypatch, tmp_path, api_cls=CompletingAPI,
+                              initial_phase=6, p_cold=1.0)
+    seeds = iter([0, 1])
+    wrapper._sample_target_family = lambda: next(seeds)
+
+    base.api_controller.complete_after = len(OVAL_BUILD)
+    wrapper.reset()
+    info = None
+    for a in OVAL_BUILD:
+        _, _, terminated, truncated, info = wrapper.step(a)
+        if terminated or truncated:
+            break
+    assert info['target_family'] == 0
+    assert info['family_n_0'] == 1
+    assert info['family_n_1'] == 0
+
+    base.api_controller.complete_after = len(SPIRAL_BUILD)
+    wrapper.reset()
+    for a in SPIRAL_BUILD:
+        _, _, terminated, truncated, info = wrapper.step(a)
+        if terminated or truncated:
+            break
+    assert info['target_family'] == 1
+    assert info['family_n_1'] == 1
+    assert info['family_n_0'] == 1                      # untouched by the second episode

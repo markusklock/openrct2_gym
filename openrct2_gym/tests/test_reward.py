@@ -17,7 +17,7 @@ import pytest
 from openrct2_gym.envs import openrct2_env as oe_mod
 from openrct2_gym.envs.openrct2_env import OpenRCT2Env, RewardParams
 from openrct2_gym.envs.obs_config import make_observation_space, SCALE, H_SCALE
-from openrct2_gym.envs.footprint import classify_family
+from openrct2_gym.envs.footprint import classify_family, FAMILY_N
 from openrct2_gym.tests.test_env_smoke import FakeAPI
 
 DIRS = [(-1, 0), (0, 1), (1, 0), (0, -1)]  # API encoding: 0=W, 1=N, 2=E, 3=S (matches env.direction_vectors)
@@ -1712,6 +1712,7 @@ def test_phase2_substage_advancement_sequence():
     # warm-start state touched by _clear_phase_windows / _advance_* hooks
     w.scaffold_results = deque(maxlen=50)
     w._cold_flags = deque(maxlen=50)
+    w.episode_family_results = {z: deque(maxlen=50) for z in range(FAMILY_N)}
     from openrct2_gym.envs.warm_start import WarmStartAnnealer
     w._annealer = WarmStartAnnealer()
     updates = []
