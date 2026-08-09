@@ -1128,3 +1128,114 @@ def test_cli_exposes_warm_min_prefix(monkeypatch):
     except SystemExit:
         pass
     assert "--warm-min-prefix" in [a[0] for a in seen if a and isinstance(a[0], str)]
+
+
+def test_callback_logs_family_tags():
+    """Every mechanism streams its own diagnostic; per-family hit rate is THE headline
+    metric for this redesign."""
+    from types import SimpleNamespace
+    cb = T.ParallelCurriculumMaskableCallback(n_envs=1)
+    cb.model = SimpleNamespace(target_kl=None, ent_coef=0.01, get_env=lambda: None)
+    store = {}
+    cb.model.logger = SimpleNamespace(
+        name_to_value={}, record=lambda k, v, *a, **kw: store.__setitem__(k, v))
+    cb.locals = {
+        'dones': [True],
+        'infos': [{'loop_completed': True, 'cold_start': True, 'learning_phase': 6,
+                   'track_length': 70, 'current_distance': 0.0, 'collision_count': 0,
+                   'target_family': 3, 'family_hit': 1.0, 'family_hit_rate_3': 0.42,
+                   'episode_metrics': {
+                       'track_length': 70, 'min_distance': 0.0,
+                       'family_gate': 0.8, 'family_match': 0.9,
+                       'family_potential': 5.4, 'switch_count': 4.0}}],
+    }
+    cb._on_step()
+    assert store['rewards/family_gate'] == pytest.approx(0.8)
+    assert store['structure/family_match'] == pytest.approx(0.9)
+    assert store['rewards/family_potential'] == pytest.approx(5.4)
+    assert store['structure/switch_count'] == pytest.approx(4.0)
+    assert store['curriculum/family_hit_rate_3'] == pytest.approx(0.42)
+    assert store['curriculum/target_family'] == pytest.approx(3)
+
+
+def test_callback_logs_family_bonus_and_sample_counts():
+    """family_bonus is a 200-point discrete P6 payment with no tag before this task; the
+    family_n_{z} denominators must ride alongside family_hit_rate_{z} so a rate of 0.0 can
+    be told apart from 'no samples yet for that family'."""
+    from types import SimpleNamespace
+    cb = T.ParallelCurriculumMaskableCallback(n_envs=1)
+    cb.model = SimpleNamespace(target_kl=None, ent_coef=0.01, get_env=lambda: None)
+    store = {}
+    cb.model.logger = SimpleNamespace(
+        name_to_value={}, record=lambda k, v, *a, **kw: store.__setitem__(k, v))
+    cb.locals = {
+        'dones': [True],
+        'infos': [{'loop_completed': True, 'cold_start': True, 'learning_phase': 6,
+                   'track_length': 70, 'current_distance': 0.0, 'collision_count': 0,
+                   'target_family': 3, 'family_hit': 0.0,
+                   'family_hit_rate_3': 0.0, 'family_n_3': 0,
+                   'episode_metrics': {
+                       'track_length': 70, 'min_distance': 0.0,
+                       'family_bonus': 200.0}}],
+    }
+    cb._on_step()
+    assert store['rewards/family_bonus'] == pytest.approx(200.0)
+    assert store['curriculum/family_hit_rate_3'] == pytest.approx(0.0)
+    assert store['curriculum/family_n_3'] == 0
+
+
+def test_callback_logs_family_hit_cold_only():
+    """family_hit is a WHOLE-TRACK predicate: on a scaffolded episode it reports the
+    replayed exemplar's shape, not what the agent built. The standing measurement rule
+    (success claims judged on unaided builds only) means it may only be recorded when
+    the episode was cold."""
+    from types import SimpleNamespace
+
+    def _step(cold):
+        cb = T.ParallelCurriculumMaskableCallback(n_envs=1)
+        cb.model = SimpleNamespace(target_kl=None, ent_coef=0.01, get_env=lambda: None)
+        store = {}
+        cb.model.logger = SimpleNamespace(
+            name_to_value={}, record=lambda k, v, *a, **kw: store.__setitem__(k, v))
+        cb.locals = {
+            'dones': [True],
+            'infos': [{'loop_completed': True, 'cold_start': cold, 'learning_phase': 6,
+                       'track_length': 70, 'current_distance': 0.0, 'collision_count': 0,
+                       'target_family': 3,
+                       'episode_metrics': {
+                           'track_length': 70, 'min_distance': 0.0, 'family_hit': 1.0}}],
+        }
+        cb._on_step()
+        return store
+
+    assert _step(cold=True)['structure/family_hit_cold'] == pytest.approx(1.0)
+    assert 'structure/family_hit_cold' not in _step(cold=False)
+
+
+def test_callback_logs_warm_family_narrowed_only_when_requested():
+    """warm_family_requested is None when the phase requested no family (phases 1-2);
+    the narrowed tag's mere presence must mean 'a family was requested', so it must be
+    withheld -- not logged as a 0.0 sentinel -- when no family was requested."""
+    from types import SimpleNamespace
+
+    def _step(requested, narrowed):
+        cb = T.ParallelCurriculumMaskableCallback(n_envs=1)
+        cb.model = SimpleNamespace(target_kl=None, ent_coef=0.01, get_env=lambda: None)
+        store = {}
+        cb.model.logger = SimpleNamespace(
+            name_to_value={}, record=lambda k, v, *a, **kw: store.__setitem__(k, v))
+        cb.locals = {
+            'dones': [True],
+            'infos': [{'loop_completed': True, 'cold_start': True, 'learning_phase': 6,
+                       'track_length': 70, 'current_distance': 0.0, 'collision_count': 0,
+                       'warm_family_requested': requested, 'warm_family_narrowed': narrowed,
+                       'episode_metrics': {'track_length': 70, 'min_distance': 0.0}}],
+        }
+        cb._on_step()
+        return store
+
+    assert _step(requested=3, narrowed=True)['curriculum/warm_family_narrowed'] == \
+        pytest.approx(1.0)
+    assert _step(requested=3, narrowed=False)['curriculum/warm_family_narrowed'] == \
+        pytest.approx(0.0)
+    assert 'curriculum/warm_family_narrowed' not in _step(requested=None, narrowed=False)

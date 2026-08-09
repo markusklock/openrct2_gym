@@ -575,10 +575,29 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
                     # P5 self-imitation ratchet diagnostics
                     'p5_pool_exc_bar',
                     'library_best_excitement',
+                    # seed-conditioned footprint diagnostics (Aug-9 / Task 7)
+                    'target_family',
                 ):
                     if key in _info:
                         self.logger.record(f'curriculum/{key}', _info[key])
-                
+
+                # Per-family hit-rate windows + their sample-count denominators, one pair
+                # per family the current phase actually draws from (Task 7, resolution 2):
+                # without family_n_{z} a rate of 0.0 can't be told apart from "no cold
+                # samples yet for that family".
+                for _k, _v in _info.items():
+                    if _k.startswith('family_hit_rate_') or _k.startswith('family_n_'):
+                        self.logger.record(f'curriculum/{_k}', _v)
+
+                # Warm-start family-narrowing diagnostic (Task 7, resolution 4):
+                # warm_family_requested is None whenever the phase requested no family
+                # (phases 1-2) -- emit the narrowed tag ONLY when a family was requested,
+                # so the tag's mere presence in TB means "a family was requested" rather
+                # than needing a sentinel value to separate "no family" from "not narrowed".
+                if _info.get('warm_family_requested') is not None:
+                    self.logger.record('curriculum/warm_family_narrowed',
+                                       float(_info.get('warm_family_narrowed', False)))
+
                 # Episode metrics provided via info dict before reset
                 info_metrics = self.locals['infos'][env_idx].get('episode_metrics', {})
                 if info_metrics:
@@ -603,6 +622,17 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
                             self.logger.record('rewards/completion_gate', info_metrics['completion_gate'])
                         if 'style_gate' in info_metrics:
                             self.logger.record('rewards/style_gate', info_metrics['style_gate'])
+                        # Seed-conditioned footprint diagnostics (Task 7): family_bonus is
+                        # a 200-point discrete P6 payment that otherwise has no tag.
+                        for _mk, _tag in (
+                            ('family_gate', 'rewards/family_gate'),
+                            ('family_potential', 'rewards/family_potential'),
+                            ('family_match', 'structure/family_match'),
+                            ('switch_count', 'structure/switch_count'),
+                            ('family_bonus', 'rewards/family_bonus'),
+                        ):
+                            if _mk in info_metrics:
+                                self.logger.record(_tag, info_metrics[_mk])
                         # Cold-split shape tags: the style-flip verdict needs to see
                         # whether COLD builds wind; the mixed aggregates cannot.
                         if (self.locals['infos'][env_idx].get('cold_start')
@@ -612,6 +642,14 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
                             if 'turn_balance' in info_metrics:
                                 self.logger.record('structure/cold_turn_balance',
                                                    info_metrics['turn_balance'])
+                        # family_hit is a WHOLE-TRACK predicate: on a scaffolded episode it
+                        # reports the replayed exemplar's shape, not what the agent built,
+                        # so (per the project's cold-only measurement rule) it is only
+                        # meaningful -- and only recorded -- on cold (unaided) episodes.
+                        if (self.locals['infos'][env_idx].get('cold_start')
+                                and 'family_hit' in info_metrics):
+                            self.logger.record('structure/family_hit_cold',
+                                               info_metrics['family_hit'])
                         if 'qualify_bonus' in info_metrics:
                             self.logger.record('rewards/qualify_bonus', info_metrics['qualify_bonus'])
                         # P5 quality-economics diagnostics: the excitement gate/milestones/

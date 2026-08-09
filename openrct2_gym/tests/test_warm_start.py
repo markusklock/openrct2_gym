@@ -267,11 +267,52 @@ def test_p5_ratchet_keys_ride_the_step_done_info(monkeypatch, tmp_path):
     wrapper, _ = _wrapped(monkeypatch, tmp_path, api_cls=CompletingAPI, p_cold=0.0)
     wrapper.current_phase = 5
     wrapper._update_phase_settings()
+    # The ratchet keys are family-scoped (Task 7 fix): pin the draw to BIG_EXCITING's own
+    # family (0) so the bar it gates against is reachable.
+    assert classify_family(BIG_EXCITING) == 0
+    wrapper._family_rng.choice = lambda seq: 0
     wrapper._loop_library.add(
         LoopRecord.from_actions(BIG_EXCITING, "harvest", excitement=5.0))
     info = _run_episode(wrapper)
     assert info['library_best_excitement'] == pytest.approx(5.0)
     assert info['p5_pool_exc_bar'] == pytest.approx(4.0)
+
+
+def test_p5_ratchet_keys_scoped_to_the_episodes_family(monkeypatch, tmp_path):
+    """Fix pass (Task 7, resolution 5): library_best_excitement / p5_pool_exc_bar are
+    diagnostics for the bar that actually gated THIS episode's pool -- _sample_warm_start
+    scopes the real gate to the episode's family, so an unscoped diagnostic query would
+    report a different (higher) number whenever the drawn family lacks the library's
+    cross-family top exemplar. Family 3 (winding) draws its OWN best (3.0), not the
+    family-0 oval's 9.0."""
+    oval = [4, 0, 4, 0, 4, 0, 4] + [0] * 20
+    assert classify_family(oval) == 0
+    winding = [4, 4, 3, 3] * 3 + [0] * 20
+    assert classify_family(winding) == 3
+
+    wrapper, _ = _wrapped(monkeypatch, tmp_path, api_cls=CompletingAPI, p_cold=0.0)
+    wrapper.current_phase = 5
+    wrapper._update_phase_settings()
+    wrapper._family_rng.choice = lambda seq: 3          # pin this episode's draw
+    wrapper._loop_library.add(LoopRecord.from_actions(oval, "harvest", excitement=9.0))
+    wrapper._loop_library.add(LoopRecord.from_actions(winding, "harvest", excitement=3.0))
+    info = _run_episode(wrapper)
+    assert info['target_family'] == 3
+    assert info['library_best_excitement'] == pytest.approx(3.0)     # NOT the oval's 9.0
+    assert info['p5_pool_exc_bar'] == pytest.approx(2.4)
+
+
+def test_p5_ratchet_keys_unscoped_in_earlier_phases(monkeypatch, tmp_path):
+    """Phases 1-2 must stay bit-identical: PHASE_FAMILIES is empty there, so the ratchet
+    keys are never even emitted (unchanged pre-fix behavior) -- verified, not assumed."""
+    wrapper, _ = _wrapped(monkeypatch, tmp_path, api_cls=CompletingAPI, p_cold=0.0)
+    wrapper.current_phase = 2
+    wrapper._update_phase_settings()
+    wrapper._loop_library.add(
+        LoopRecord.from_actions(BIG_EXCITING, "harvest", excitement=5.0))
+    info = _run_episode(wrapper)
+    assert 'library_best_excitement' not in info
+    assert 'p5_pool_exc_bar' not in info
 
 
 def test_annealer_p5_promotes_with_larger_step():

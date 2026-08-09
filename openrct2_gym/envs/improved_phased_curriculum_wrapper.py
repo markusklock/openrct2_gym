@@ -1016,9 +1016,18 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
         if self.current_phase == 5:
             info['phase5_stage'] = self.phase5_stage
             info['max_track_length'] = self.phase5_current_length
-            # Self-imitation ratchet diagnostics: the pool's excitement bar and the best
-            # tagged exemplar it trails (watch the bar climb behind better harvests).
-            best_exc = self._loop_library.best_excitement(self.phase5_current_length)
+            # Self-imitation ratchet diagnostics: the excitement bar that actually gated
+            # THIS episode's pool, and the best tagged exemplar it trails (watch the bar
+            # climb behind better harvests). Family-scoped (Task 7 fix, resolution 5) the
+            # same way _sample_warm_start scopes the real gate -- an unscoped query here
+            # would report a different (higher) number whenever the drawn family lacks
+            # the library's cross-family top exemplar. Empty for phases 1-2
+            # (PHASE_FAMILIES has no entries there), leaving the query unscoped and this
+            # branch dead anyway (current_phase == 5 never holds in phases 1-2).
+            family = int(getattr(base_env, "target_family", 0)) \
+                if self.PHASE_FAMILIES.get(self.current_phase) else None
+            best_exc = self._loop_library.best_excitement(
+                self.phase5_current_length, family=family)
             info['library_best_excitement'] = best_exc
             info['p5_pool_exc_bar'] = 0.8 * best_exc
         else:
@@ -1209,7 +1218,13 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
             if self.current_phase >= 5:
                 # Ratchet diagnostics must ride the STEP done-info (the TB callback never
                 # sees reset infos -- the reset()-side copy exists for humans/debuggers).
-                best_exc = self._loop_library.best_excitement(self.phase5_current_length)
+                # Family-scoped (Task 7 fix, resolution 5) -- see the matching comment in
+                # reset() for why an unscoped query here would misreport the bar that
+                # actually gated this episode's pool.
+                family = int(getattr(base_env, "target_family", 0)) \
+                    if self.PHASE_FAMILIES.get(self.current_phase) else None
+                best_exc = self._loop_library.best_excitement(
+                    self.phase5_current_length, family=family)
                 info['library_best_excitement'] = best_exc
                 info['p5_pool_exc_bar'] = 0.8 * best_exc
 
