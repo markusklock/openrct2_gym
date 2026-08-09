@@ -1662,6 +1662,10 @@ def test_p6_styled_means_built_the_seed_family(monkeypatch, tmp_path):
     wrapper, base = _wrapped(monkeypatch, tmp_path, api_cls=CompletingAPI, p_cold=1.0)
     wrapper.current_phase = 6
     wrapper._update_phase_settings()
+    # This test is about the family-hit predicate, not the Aug-9 per-episode sampler
+    # (task 5) -- pin the seed so it stays deterministic now that P6 draws widely from
+    # PHASE_FAMILIES[6].
+    wrapper._sample_target_family = lambda: 0
     assert base.target_family == 0
     (styled,) = _styled_flags(wrapper, base, OVAL_BUILD)
     assert wrapper._history_turn_count(base) == 4 < wrapper.FLOOR_STYLE_MIN_TURNS
@@ -1715,6 +1719,10 @@ def _p6_floor_wrapper(monkeypatch, tmp_path, min_prefix=FLOOR_PREFIX_LEN):
     wrapper._annealer.k_max = len(JOG_OPENER) - min_prefix
     assert wrapper._annealer.p_cold == 0.0
     wrapper._annealer.min_prefix = min_prefix
+    # These tests are about the family-hit predicate at a fixed family, not the Aug-9
+    # per-episode sampler (task 5) -- pin the seed so it stays deterministic now that
+    # P6 draws widely from PHASE_FAMILIES[6].
+    wrapper._sample_target_family = lambda: 0
     return wrapper, base
 
 
@@ -1832,3 +1840,41 @@ def test_harvest_stamps_prefix_len(monkeypatch, tmp_path):
             break
     recs = list(LoopLibrary(lib_path)._records.values())
     assert recs and all(r.prefix_len == 3 for r in recs)
+
+
+# ------------------------------- per-phase family sets (Aug-9 seed conditioning)
+
+def test_phase_family_sets_widen_with_the_track_budget():
+    W = ImprovedPhasedCurriculumWrapper
+    assert W.PHASE_FAMILIES[1] == ()          # 40 pieces: too tight to express shape
+    assert W.PHASE_FAMILIES[2] == ()
+    assert W.PHASE_FAMILIES[3] == (0, 1, 2)   # oval, spiral, out-and-back
+    assert W.PHASE_FAMILIES[4] == (0, 1, 2, 3)
+    assert W.PHASE_FAMILIES[6] == (0, 1, 2, 3, 4)
+
+
+def test_wrapper_sets_the_target_family_on_the_base_env_before_reset(monkeypatch, tmp_path):
+    wrapper, base = _wrapped(monkeypatch, tmp_path, initial_phase=6)
+    seen = set()
+    for _ in range(40):
+        wrapper.reset()
+        seen.add(base.target_family)
+    assert seen <= set(range(5))
+    assert len(seen) >= 2, "the seed must actually vary across episodes"
+
+
+def test_early_phases_pin_the_family_to_zero(monkeypatch, tmp_path):
+    """Phases 1-2 have no family reward, so the seed must not wander -- it would be
+    pure noise in the observation."""
+    wrapper, base = _wrapped(monkeypatch, tmp_path)
+    for _ in range(10):
+        wrapper.reset()
+        assert base.target_family == 0
+
+
+def test_step_info_reports_per_family_hit_rate(monkeypatch, tmp_path):
+    wrapper, base = _wrapped(monkeypatch, tmp_path, initial_phase=6)
+    info = _run_episode(wrapper)
+    assert "target_family" in info
+    assert "family_hit" in info
+    assert any(k.startswith("family_hit_rate_") for k in info)

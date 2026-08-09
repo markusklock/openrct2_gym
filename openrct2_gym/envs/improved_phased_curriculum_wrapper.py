@@ -2,6 +2,7 @@
 Improved Phased Curriculum Learning Wrapper for OpenRCT2 Environment
 Implements 5-phase progressive learning with physics-aware rewards.
 """
+import random
 import gymnasium as gym
 import numpy as np
 from collections import deque
@@ -11,7 +12,7 @@ from typing import Dict, Any, Tuple
 from openrct2_gym.envs.openrct2_env import OpenRCT2Env, RewardParams
 from openrct2_gym.envs.warm_start import LoopLibrary, WarmStartAnnealer, WarmStartPlan
 from openrct2_gym.envs.track_pieces import SBEND_ACTIONS, TURN_ACTIONS
-from openrct2_gym.envs.footprint import classify_family
+from openrct2_gym.envs.footprint import classify_family, FAMILY_N
 
 
 class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
@@ -115,6 +116,11 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
         self.scaffold_results = deque(maxlen=window_size)
         self._cold_flags = deque(maxlen=window_size)
         self.episode_qualified_results = deque(maxlen=window_size)
+        # Per-phase family seed sampling (Aug-9) and its own cold-only measurement
+        # window, one per family index (see PHASE_FAMILIES / _sample_target_family).
+        self._family_rng = random.Random()
+        self.episode_family_results = {z: deque(maxlen=window_size)
+                                       for z in range(FAMILY_N)}
         self.phase2_summit_results = deque(maxlen=window_size)
         self.phase2_roundtrip_results = deque(maxlen=window_size)
         self.phase2_chain1_completion_results = deque(maxlen=window_size)
@@ -159,6 +165,14 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
     # seed widens back wherever style fails, so it settles at the width the policy can
     # actually hold, and that settling point is itself the measurement.
     FLOOR_STYLE_MIN_TURNS = 6
+
+    # Families the seed may request, per phase. Widens with the track budget: a
+    # 40-piece build cannot express a serpentine. Phases 1-2 pin the seed to 0 so
+    # the observation input is constant rather than noise while its reward is off.
+    PHASE_FAMILIES = {
+        1: (), 2: (), 3: (0, 1, 2), 4: (0, 1, 2, 3), 5: (0, 1, 2, 3, 4),
+        6: (0, 1, 2, 3, 4),
+    }
 
     def _get_base_env(self):
         """Get the base OpenRCT2 environment"""
@@ -867,6 +881,12 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
             print(f"   Previous phase success rate: {success_rate:.1%}")
             print(f"{'='*70}\n")
 
+    def _sample_target_family(self):
+        """The episode's seed: a family drawn from the phase's active set (0 when the
+        phase has none, so the observation input stays constant rather than noisy)."""
+        active = self.PHASE_FAMILIES.get(self.current_phase, ())
+        return self._family_rng.choice(active) if active else 0
+
     def _sample_warm_start(self):
         """This episode's warm-start plan. Cold when disabled, during evaluation (eval must
         measure the true task), or past the scaffolded phases (1-5). Each phase prefers
@@ -920,6 +940,9 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
         base_env = self._get_base_env()
         base_env.warm_start_actions = list(self._current_plan.prefix) or None
         base_env.warm_start_suffix_k = self._current_plan.k or None
+        # The episode's seed (footprint family). Set on the base env, which does NOT
+        # reset it in reset() -- see PHASE_FAMILIES / _sample_target_family.
+        base_env.target_family = self._sample_target_family()
 
         obs, info = self.env.reset(**kwargs)
 
@@ -1020,6 +1043,27 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
             qualified = self._is_qualified(base_env, success)
             if qualified is not None and cold:
                 self.episode_qualified_results.append(qualified)
+
+            # Per-family hit tracking (Aug-9 seed conditioning): cold-only, like every
+            # other gate window -- a scaffolded build inherits its shape from the
+            # exemplar, so counting it would measure the scaffold rather than the policy.
+            # `qualified` is None on phases without a structural gate (e.g. phase 1),
+            # where the seed is pinned to 0 and family_hit is reward-inert noise; bool()
+            # collapses that to False rather than letting a bare None poison the window.
+            z = int(self._get_base_env().target_family)
+            family_hit = bool(info.get('episode_metrics', {}).get('family_hit', 0.0))
+            if cold:
+                self.episode_family_results[z].append(bool(family_hit and qualified))
+            info['target_family'] = z
+            info['family_hit'] = float(family_hit)
+            # Always emit every family's diagnostic (0.0 default while its cold window
+            # is still empty), matching qualified_rate/phase_success_rate's convention
+            # elsewhere in this method -- gating the KEY itself on a non-empty window
+            # means the very first episode (often warm) reports no per-family rate at
+            # all, which is a worse diagnostic than an honest 0.0.
+            for fz, window in self.episode_family_results.items():
+                info[f'family_hit_rate_{fz}'] = (
+                    sum(window) / len(window) if window else 0.0)
 
             if success:
                 self.total_loops_completed += 1
