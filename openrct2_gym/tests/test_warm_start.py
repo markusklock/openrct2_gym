@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 
 from openrct2_gym.envs import openrct2_env as oe_mod
+from openrct2_gym.envs.footprint import classify_family
 from openrct2_gym.envs.openrct2_env import OpenRCT2Env
 from openrct2_gym.envs.warm_start import (
     ACTION_CLIMB_Z,
@@ -1676,6 +1677,118 @@ def test_pre_p6_styled_still_means_the_turn_count_bar(monkeypatch, tmp_path):
     (styled,) = _styled_flags(wrapper, base, OVAL_BUILD)
     assert wrapper._history_turn_count(base) == 4
     assert styled is False
+
+
+# ------------- ...and it is judged on the AGENT-BUILT SUFFIX (Aug-9 fix pass 2)
+# `styled` only ever reaches the annealer on floor-bound WARM plans -- the exact episodes
+# that replay a 6-piece winding OPENING. Classifying the whole track therefore let the
+# scaffold's own jog decide the predicate: a jog is a direction switch, family 0 (oval)
+# allows none, so every at-floor episode reported styled=False and the descent stalled at
+# min_prefix_init. The predicate means "did the AGENT build the shape", so it skips the
+# replayed prefix -- the same conflation LoopRecord.agent_turn_count exists to avoid.
+
+class _FrontierRng(random.Random):
+    """random() == 0.0: sample_plan never draws cold (with p_cold=0) and always takes
+    k = k_hi, so every episode is the floor-bound draw the prefix descent feeds on."""
+
+    def random(self):
+        return 0.0
+
+
+# A 12-piece scaffold record whose OPENING jogs (R, L, R -> a direction switch), like the
+# seeded P6 exemplars; the chain piece puts it in the pool's `chained` fallback tier.
+JOG_OPENER = [4, 0, 3, 0, 4, 10, 0, 0, 0, 0, 0, 0]
+FLOOR_PREFIX_LEN = 5                        # k_max = 12 - 5 = 7 keeps p_cold at its base
+SPIRAL_BUILD = [4, 4, 4, 4, 4, 4]           # 6 turns, no alternation -> family 1 (spiral)
+
+
+def _p6_floor_wrapper(monkeypatch, tmp_path, min_prefix=FLOOR_PREFIX_LEN):
+    """A P6 wrapper wired so every draw is a floor-bound warm plan (`at_floor=True`),
+    the only configuration in which `styled` has any effect."""
+    wrapper, base = _wrapped(monkeypatch, tmp_path, api_cls=CompletingAPI,
+                             seed_loops=(JOG_OPENER,), p_cold=0.0)
+    wrapper.current_phase = 6
+    wrapper._update_phase_settings()
+    wrapper._annealer._rng = _FrontierRng()
+    # k_max == the per-record cap (len - min_prefix) is what makes a draw floor-bound;
+    # keeping it under 8 also keeps the competence-scaled p_cold at its base of 0.
+    wrapper._annealer.k_max = len(JOG_OPENER) - min_prefix
+    assert wrapper._annealer.p_cold == 0.0
+    wrapper._annealer.min_prefix = min_prefix
+    return wrapper, base
+
+
+def _floor_episode(wrapper, base, actions):
+    """One floor-bound scaffolded episode: the opening seed is replayed, then the agent
+    builds `actions` and the last one closes the circuit."""
+    base.api_controller.complete_after = wrapper._annealer.min_prefix + len(actions)
+    wrapper.reset()
+    plan = wrapper._current_plan
+    assert plan.cold is False and plan.at_floor is True
+    assert len(plan.prefix) == wrapper._annealer.min_prefix
+    assert len(base.track_builder.history) == len(plan.prefix)
+    for a in actions:
+        _, _, terminated, truncated, _ = wrapper.step(a)
+        if terminated or truncated:
+            break
+    else:
+        raise AssertionError("episode did not end")
+    assert base.loop_completed is True, "the build must actually close the loop"
+    return [h.get('action') for h in base.track_builder.history]
+
+
+def _floor_styled(wrapper, base, actions):
+    """The `styled` value one floor-bound episode hands the annealer (spied, so the
+    descent itself stays frozen and the floor-bound configuration stays valid)."""
+    seen = []
+    wrapper._annealer.record_outcome = (
+        lambda plan, success, styled=None: seen.append((success, styled)))
+    history = _floor_episode(wrapper, base, actions)
+    assert [s for s, _ in seen] == [True]
+    return seen[0][1], history
+
+
+def test_p6_styled_judges_the_agent_suffix_not_the_replayed_opening(monkeypatch, tmp_path):
+    """THE regression: the scaffold's jogging opening must not decide the predicate. The
+    agent builds a clean oval behind it, so the episode is styled even though the whole
+    track (jog + oval) classifies as out_and_back."""
+    wrapper, base = _p6_floor_wrapper(monkeypatch, tmp_path)
+    styled, history = _floor_styled(wrapper, base, OVAL_BUILD)
+    assert base.target_family == 0
+    assert classify_family(history) != 0                    # whole track: the jog decides
+    assert classify_family(history[FLOOR_PREFIX_LEN:]) == 0  # agent's suffix: a clean oval
+    assert styled is True
+
+
+def test_p6_styled_still_says_no_when_the_agent_suffix_misses_the_family(monkeypatch,
+                                                                        tmp_path):
+    """...and the predicate must still be able to refuse: same jogging opening, but the
+    agent's own suffix is a spiral, not the oval the seed asked for."""
+    wrapper, base = _p6_floor_wrapper(monkeypatch, tmp_path)
+    styled, history = _floor_styled(wrapper, base, SPIRAL_BUILD)
+    assert base.target_family == 0
+    assert classify_family(history[FLOOR_PREFIX_LEN:]) == 1  # spiral
+    assert styled is False
+
+
+def test_p6_prefix_descent_moves_on_the_agent_built_style(monkeypatch, tmp_path):
+    """The descent itself, end to end: `styled` reaches the annealer only through
+    floor-bound WARM plans (record_outcome returns early on cold ones, and phases 1-5
+    pin min_prefix to 0), so this is the only configuration where the predicate has
+    consequences. Styled successes shrink the opening seed; unstyled ones widen it."""
+    wrapper, base = _p6_floor_wrapper(monkeypatch, tmp_path)
+    wrapper._annealer.promote_n = 4
+    for _ in range(4):
+        _floor_episode(wrapper, base, OVAL_BUILD)
+    assert wrapper._annealer.min_prefix == FLOOR_PREFIX_LEN - 1
+
+    # re-arm the floor-bound draw, then lose the style
+    wrapper._annealer.min_prefix = FLOOR_PREFIX_LEN
+    wrapper._annealer.floor_frontier.clear()
+    for _ in range(4):
+        _floor_episode(wrapper, base, SPIRAL_BUILD)
+    assert wrapper._annealer.min_prefix == FLOOR_PREFIX_LEN + 1
+    assert wrapper._annealer.min_prefix <= wrapper._annealer.min_prefix_init
 
 
 # ------------------------ agent-built vs replayed credit (Aug-9, "who built the turns?")

@@ -471,11 +471,16 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
         return sum(1 for h in history if h.get('action') in TURN_ACTIONS)
 
     @staticmethod
-    def _history_family_hit(base_env):
+    def _history_family_hit(base_env, skip=0):
         """Whether the build lands in the family the episode's seed asked for
-        (mirrors env._family_hit)."""
+        (mirrors env._family_hit).
+
+        `skip` drops that many leading history entries, so a caller can ask about the
+        AGENT-BUILT suffix instead of the whole track -- the same distinction
+        LoopRecord.agent_turn_count draws between composed and inherited structure.
+        Default 0 = the whole track, which is what the reward gate scores."""
         history = getattr(base_env.track_builder, 'history', [])
-        return classify_family([h.get('action') for h in history]) == int(
+        return classify_family([h.get('action') for h in history[skip:]]) == int(
             getattr(base_env, 'target_family', 0))
 
     @staticmethod
@@ -976,8 +981,16 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                 # phase (qualify_requires_family, P6 only today) pays maximally at <=5
                 # turns on an oval seed -- there the turn bar would refuse to shrink the
                 # seed for a correctly built oval and the descent would stall forever.
-                if self._phase_reward_params(self.current_phase).qualify_requires_family:
-                    styled = self._history_family_hit(base_env)
+                # The family is judged on the AGENT-BUILT SUFFIX, not the whole track:
+                # `styled` only ever acts on floor-bound WARM plans, whose replayed
+                # opening is a winding jog -- a direction switch, which an oval seed
+                # forbids -- so scoring the whole track would let the scaffold decide the
+                # predicate against the agent and stall the descent at min_prefix_init.
+                if self._phase_reward_params(self.current_phase,
+                                             self.phase2_stage).qualify_requires_family:
+                    plan = self._current_plan
+                    styled = self._history_family_hit(
+                        base_env, skip=len(plan.prefix) if plan is not None else 0)
                 else:
                     styled = self._history_turn_count(base_env) >= self.FLOOR_STYLE_MIN_TURNS
                 self._annealer.record_outcome(self._current_plan, success, styled=styled)
