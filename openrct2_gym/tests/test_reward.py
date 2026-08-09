@@ -17,7 +17,7 @@ import pytest
 from openrct2_gym.envs import openrct2_env as oe_mod
 from openrct2_gym.envs.openrct2_env import OpenRCT2Env, RewardParams
 from openrct2_gym.envs.obs_config import make_observation_space, SCALE, H_SCALE
-from openrct2_gym.envs.footprint import classify_family, FAMILY_N
+from openrct2_gym.envs.footprint import classify_family, switch_count, FAMILY_N
 from openrct2_gym.tests.test_env_smoke import FakeAPI
 
 DIRS = [(-1, 0), (0, 1), (1, 0), (0, -1)]  # API encoding: 0=W, 1=N, 2=E, 3=S (matches env.direction_vectors)
@@ -1765,6 +1765,9 @@ def test_no_terminal_double_count_through_wrapper(monkeypatch):
     wrapper = ImprovedPhasedCurriculumWrapper(base, verbose=0)
     wrapper.current_phase = 5
     wrapper._update_phase_settings()       # phase 5: quality on, ride testing on
+    # P5 draws the episode's seed from PHASE_FAMILIES at random and (Aug-9) pays R_family
+    # on a hit, so pin it -- an unpinned draw makes this exact-arithmetic test flaky.
+    wrapper._sample_target_family = lambda: 0
     wrapper.reset()
     base_env = wrapper._get_base_env()
     p = base_env.reward_params
@@ -1782,9 +1785,14 @@ def test_no_terminal_double_count_through_wrapper(monkeypatch):
     # Jul-15: the P5 length gate is armed, so this tiny CompletingAPI loop pays only the
     # composed effective gate (hill x length x quality release) -- read it back from the
     # env's own accounting rather than assuming full R_complete.
+    # Aug-9: P5 now also pays R_family, and this all-flat loop (0 turns, 0 switches) is a
+    # hit on the phase-pinned oval seed -- so it belongs in the once-only accounting too.
+    assert base_env.target_family == 0 and base_env._family_hit()
+    assert base_env._last_family_bonus == p.R_family > 0.0
     assert reward == pytest.approx(
         p.R_complete * base_env._last_completion_gate - phi_prev_before + quality
-        + p.step_cost + p.R_viable + 3 * p.R_exc_milestone + base_env._last_struct_bonus)
+        + p.step_cost + p.R_viable + 3 * p.R_exc_milestone + base_env._last_struct_bonus
+        + p.R_family)
     assert base_env._last_completion_gate < 1.0          # the length gate actually bit
 
 
@@ -2805,16 +2813,19 @@ def test_exc_feature_potential_monotone_and_phase_gated():
     assert delta == pytest.approx(p5.w_exc_feat * env._exc_feature_quality(p5))
 
 
-def test_exc_feature_quality_pays_turn_balance_densely():
-    """Jul-22 deadlock fix: cold builds never sample the winding opening because the
-    jog only pays after a risky completion. Turn BALANCE joins the dense Phi features,
-    so the out-and-back motif earns shaped credit the moment it is placed."""
-    p6 = ImprovedPhasedCurriculumWrapper._phase_reward_params(6)
+def test_exc_feature_quality_pays_turn_balance_densely_when_the_target_is_armed():
+    """Jul-22 deadlock fix: cold builds never sample the winding opening because the jog
+    only pays after a risky completion, so turn BALANCE joined the dense Phi features.
+    The leg is still there for any params that arm struct_turn_balance_target -- but no
+    live phase does any more (Aug-9 final review: on a 0-switch seed it is unreachable AND
+    it cancelled the family potential; see test_p5_p6_turn_balance_target_is_retired)."""
+    armed = replace(ImprovedPhasedCurriculumWrapper._phase_reward_params(6),
+                    struct_turn_balance_target=2.0)
     # SAME turn count (6 pieces), different handedness mix: only balance distinguishes
     rect6 = _bare_env(history=_env_hist([(4, 14, 14)] * 6))
     jogged = _bare_env(history=_env_hist([(4, 14, 14)] * 4 + [(3, 14, 14)] * 2))
-    assert (jogged._exc_feature_quality(p6)
-            - rect6._exc_feature_quality(p6)) == pytest.approx(1 / 6, abs=0.01)
+    assert (jogged._exc_feature_quality(armed)
+            - rect6._exc_feature_quality(armed)) == pytest.approx(1 / 6, abs=0.01)
 
 
 def test_p5_qualified_is_tested_excitement_diagnostic():
@@ -2981,7 +2992,10 @@ def test_p6_params_grade_variety():
     p6 = ImprovedPhasedCurriculumWrapper._phase_reward_params(6)
     assert (p6.struct_w_turns, p6.struct_turns_target) == (0.0, 12.0)
     assert (p6.struct_w_sbend, p6.struct_sbend_target) == (0.05, 4.0)
-    assert (p6.struct_w_turn_balance, p6.struct_turn_balance_target) == (0.0, 2.0)
+    # target retired alongside the weight (Aug-9 final review): _exc_feature_quality reads
+    # the TARGET directly, so a nonzero one kept the leg live inside the dense potential
+    # -- see test_p5_p6_turn_balance_target_is_retired.
+    assert (p6.struct_w_turn_balance, p6.struct_turn_balance_target) == (0.0, 0.0)
     assert (p6.struct_w_single_drop, p6.struct_w_drop_runs) == (0.35, 0.15)
     assert (p6.struct_w_length, p6.struct_w_banked) == (0.30, 0.15)
     total = (p6.struct_w_single_drop + p6.struct_w_drop_runs + p6.struct_w_length
@@ -3728,16 +3742,18 @@ def test_family_reward_inert_in_phases_1_and_2():
 
 def test_family_ramp_phases_3_4_5_match_the_table():
     """The ramp: floor loosens 0.85 -> 0.75 -> 0.60 as the budget widens, w_family rises
-    3.0 -> 4.0 -> 6.0, and R_family/qualify_requires_family stay off below P6 (each phase
-    keeps its own tuned advancement predicate; R_family pays only post-test, and P3 has
-    no ride test yet)."""
+    3.0 -> 4.0 -> 6.0, and R_family arms at 0 -> 75 -> 125 (Aug-9 final review: the gate
+    alone forfeits too little on the near bands to pay for the shape; P3 stays at 0
+    because its ride test is off and R_family pays only post-test).
+    qualify_requires_family stays off below P6 -- each phase keeps its own tuned
+    advancement predicate."""
     W = ImprovedPhasedCurriculumWrapper
-    table = {3: (0.85, 3.0), 4: (0.75, 4.0), 5: (0.60, 6.0)}
-    for phase, (floor, weight) in table.items():
+    table = {3: (0.85, 3.0, 0.0), 4: (0.75, 4.0, 75.0), 5: (0.60, 6.0, 125.0)}
+    for phase, (floor, weight, bonus) in table.items():
         p = W._phase_reward_params(phase)
         assert p.completion_family_floor == floor
         assert p.w_family == weight
-        assert p.R_family == 0.0
+        assert p.R_family == bonus
         assert p.qualify_requires_family is False
 
 
@@ -3798,3 +3814,332 @@ def test_family_margin_ramps_stronger_at_p6_than_p3():
         return hit / miss
 
     assert margin(P6) > margin(P3)
+
+
+# ---------------------------------------------------------------- Fix 1 (Aug-9 final
+# review): the family margin must beat the BUILD COST of the shape, not merely point the
+# right way.
+#
+# Deferred finding #8 is what let this defect through: the pre-existing P3 test compares
+# ONE build under two seeds, which measures gate SENSITIVITY. The decision the agent
+# actually faces is the opposite -- one seed, two builds -- and it has an entry fee. With
+# family_turn_falloff=5.0 / family_switch_falloff=3.0 (wider than the 4-6 turn and 1-3
+# switch gaps between footprint.FAMILIES' bands) the 4-turn oval the policy already makes
+# scored 0.800 against a spiral seed and 0.633 against an out_and_back seed, so the
+# forfeited share of the completion payout (30 / 55 at P3) was smaller than the cost of
+# building the shape and the optimal policy was "build the oval anyway".
+#
+# THE COST MODEL, stated:
+#   * extra pieces -- FAMILY_EXTRA_PIECES below. The near-band footprints need 4-10 more
+#     pieces than the 4-turn oval (final-fix-brief.md, Fix 1). 9 is used: it is inside
+#     that measured range and it is the largest value P3's repaired margin (75 points at
+#     its deliberately mild 0.85 floor -- the brief leaves P3's floor alone) still covers,
+#     so the assertion states exactly how much build cost the repaired gate can buy.
+#   * cost per piece -- the gamma discount of one extra build step, (1 - gamma) * payout.
+#     Derived from the phase's own payout rather than hardcoded; it lands at 7.8-10.2
+#     points here, matching CLAUDE.md's recorded "~-10/piece gamma-discount of the
+#     completion payout" from the Jul-5 length-trap diagnosis.
+FAMILY_EXTRA_PIECES = 9
+
+
+def _family_fixture(z):
+    """A P6-scale build (chain hill + steep drop + length, so every phase's structural
+    bar is saturated and only the SHAPE differs) whose footprint is VERIFIED to classify
+    into family `z`. This plan has shipped a mis-specified footprint fixture four times;
+    the assert is the guard."""
+    rows = {
+        0: _p6_mix(n_right=4, n_left=0),                        # 4 turns, 0 switches
+        1: _p6_mix(n_right=8, n_left=0),                        # 8 turns, 0 switches
+        2: _p6_mix(fill=[4, 4, 4, 3, 3, 3, 4, 4, 4]),           # 9 turns, 2 switches
+        3: _p6_mix(fill=[4, 4, 3, 3] * 3),                      # 12 turns, 5 switches
+        4: _p6_mix(fill=[4, 4, 3, 3] * 4),                      # 16 turns, 7 switches
+    }[z]
+    assert classify_family([r[0] for r in rows]) == z, \
+        "fixture must BE the family it is named for"
+    return rows
+
+
+def _family_inversion_payouts(params, z, excitement=5.6):
+    """The four terminal payouts of the inversion pair: the default oval build and the
+    family-`z` build, each scored under an oval seed and under a family-`z` seed."""
+    oval, shaped = _family_fixture(0), _family_fixture(z)
+    return {
+        ("oval", 0): _p6_payout(params, oval, excitement=excitement, family=0),
+        ("shaped", 0): _p6_payout(params, shaped, excitement=excitement, family=0),
+        ("oval", z): _p6_payout(params, oval, excitement=excitement, family=z),
+        ("shaped", z): _p6_payout(params, shaped, excitement=excitement, family=z),
+    }
+
+
+def _assert_family_economics(phase):
+    """Inversion + magnitude for every non-oval family the phase actually seeds."""
+    W = ImprovedPhasedCurriculumWrapper
+    params = W._phase_reward_params(phase)
+    for z in W.PHASE_FAMILIES[phase]:
+        if z == 0:
+            continue
+        pay = _family_inversion_payouts(params, z)
+        # Inversion: the SAME two builds, each seed preferring its own.
+        assert pay[("oval", 0)] > pay[("shaped", 0)], f"phase {phase}, family {z}"
+        assert pay[("shaped", z)] > pay[("oval", z)], f"phase {phase}, family {z}"
+        # Magnitude: the win must pay for the shape, not just exist.
+        per_piece = (1.0 - params.gamma) * pay[("shaped", z)]
+        cost = FAMILY_EXTRA_PIECES * per_piece
+        margin = pay[("shaped", z)] - pay[("oval", z)]
+        assert margin > cost, (
+            f"phase {phase}, family {z}: margin {margin:.1f} does not cover "
+            f"{FAMILY_EXTRA_PIECES} extra pieces at {per_piece:.2f}/piece ({cost:.1f})")
+
+
+def test_p3_seeded_family_out_pays_the_default_oval_by_the_build_cost():
+    _assert_family_economics(3)
+
+
+def test_p4_seeded_family_out_pays_the_default_oval_by_the_build_cost():
+    _assert_family_economics(4)
+
+
+def test_p5_seeded_family_out_pays_the_default_oval_by_the_build_cost():
+    _assert_family_economics(5)
+
+
+def test_p6_seeded_family_out_pays_the_default_oval_by_the_build_cost():
+    """P6 was already correct by construction (floor 0.5 + R_family=200); asserted here
+    so the whole ramp is covered by one criterion."""
+    _assert_family_economics(6)
+
+
+def test_family_falloffs_make_the_bands_distinguishable():
+    """Fix 1A. The falloffs must be NARROWER than the gaps between footprint.FAMILIES'
+    bands (4-6 turns, 1-3 switches) or a build scores high credit against seeds it is
+    nothing like. 2.0 is the floor, not a target: one turn short of the band still scores
+    0.5 on that leg and one switch short still scores 0.5, so the near-miss ramp this
+    codebase's house rule requires survives ('every leg ... needs its own ramp')."""
+    p = RewardParams()
+    assert (p.family_turn_falloff, p.family_switch_falloff) == (2.0, 2.0)
+    oval = [r[0] for r in _family_fixture(0)]
+    env = _bare_env(history=_env_hist(_family_fixture(0)))
+
+    def match(seed):
+        env.target_family = seed
+        return env._family_match(p)
+
+    assert match(0) == pytest.approx(1.0)
+    assert match(1) == pytest.approx(0.50)     # spiral:       6-9 turns, 0 switches
+    assert match(2) == pytest.approx(0.25)     # out_and_back: 6-9 turns, 1-2 switches
+    assert match(3) == pytest.approx(0.0)      # winding
+    assert match(4) == pytest.approx(0.0)      # serpentine
+    # ...and the near-miss ramp is still graded, not a cliff: one turn short of the
+    # spiral band scores exactly 0.5 on the turn leg.
+    near = _bare_env(history=_env_hist([(4, 14, 14)] * 5))
+    near.target_family = 1
+    assert near._family_match(p) == pytest.approx(0.5 * (0.5 + 1.0))
+    assert len(oval) == len(_family_fixture(1))   # the pair differs only in SHAPE
+
+
+def test_family_ramp_arms_r_family_at_p4_and_p5():
+    """Fix 1B. Below P6 the multiplicative gate was the ONLY family incentive, and at
+    P4/P5 floors (0.75/0.60) it is too small on the near bands. R_family gives them the
+    same discrete step P6 gives. P3 stays at 0: ride testing is off there, so R_family --
+    which pays only inside the completion-AND-tested branch -- could never fire."""
+    W = ImprovedPhasedCurriculumWrapper
+    assert W._phase_reward_params(3).R_family == 0.0
+    assert W._phase_reward_params(4).R_family == 75.0
+    assert W._phase_reward_params(5).R_family == 125.0
+    assert W._phase_reward_params(6).R_family == 200.0
+    # ...and it stays a RAMP: monotone with the phase number, like the floor and weight.
+    bonuses = [W._phase_reward_params(p).R_family for p in (1, 2, 3, 4, 5, 6)]
+    assert all(a <= b for a, b in zip(bonuses, bonuses[1:]))
+
+
+def test_r_family_cannot_break_completion_first_in_p4_p5():
+    """R_family is paid inside step()'s completion-and-tested branch, so it can only ever
+    ADD to the completion side of the completion-first inequality (climb milestones must
+    stay below what closing the loop pays). Checked here with the numbers, not assumed."""
+    W = ImprovedPhasedCurriculumWrapper
+    for phase in (4, 5):
+        p = W._phase_reward_params(phase)          # raises if the invariant is violated
+        milestones = p.R_roundtrip + p.R_summit
+        assert milestones < p.R_complete
+        flat = (p.completion_hill_floor * p.completion_length_floor
+                * p.completion_quality_floor * p.completion_style_floor
+                * p.completion_family_floor * p.R_complete)
+        # P4 sets completion_hill_floor=0.0, so only the first check binds there (see
+        # _validate_completion_first); P5's floors are all >= its own milestone total.
+        assert p.completion_hill_floor == 0.0 or milestones < flat
+    # An unclosed episode never reaches the R_family branch at all: it is guarded by
+    # loop_completed (the terminal branch), _last_test_ok AND the family hit.
+    P5 = W._phase_reward_params(5)
+    env = _family_env(_family_fixture(0), 0, P5)
+    env._last_test_ok = False
+    assert P5.R_family > 0.0
+    assert env._calculate_reward(True, 0) == pytest.approx(
+        _family_env(_family_fixture(0), 0, P5)._calculate_reward(True, 0))
+
+
+# --------------------------------------------------- Fix 3 (Aug-9 final review): the
+# family_hit diagnostic must be completion-conditioned.
+#
+# family_hit was computed LIVE at metrics time while family_gate/family_match are only
+# set on completion. A truncated 20-piece build with 2 turns and 0 switches classifies as
+# `oval`, so every oval-seeded TRUNCATION reported family_hit=1.0 next to family_gate=0.0.
+# Oval is 20% of the seed draws in P5/P6, so structure/family_hit_cold would sit near 0.2
+# for a policy that never completes -- a false floor on the tag a human watches hourly
+# through an unattended multi-day run.
+
+def test_family_hit_is_zero_on_a_truncated_episode(monkeypatch):
+    """The partial track DOES classify into the requested family; the episode still did
+    not close, so the hit tag must read 0."""
+    monkeypatch.setattr(oe_mod, "APIController", FakeAPI)   # never completes the circuit
+    env = OpenRCT2Env(verbose=0)
+    env.skip_ride_testing = True
+    env.reset()
+    env.target_family = 0                                   # oval: <= 5 turns, 0 switches
+    env.max_track_length = 4
+    for _ in range(3):
+        env.step(4)                                         # right turns, one handedness
+    _, _, terminated, truncated, info = env.step(4)
+    assert truncated and not terminated
+    assert env.loop_completed is False
+    # the build really is an oval -- this is the false-positive the fix removes
+    assert classify_family(env._history_actions()) == 0
+    assert env._family_hit() is True
+    m = info['episode_metrics']
+    assert m['family_hit'] == 0.0
+    assert m['family_gate'] == 0.0                          # ...consistent with its sibling
+
+
+def test_family_hit_still_reports_on_a_completed_episode(monkeypatch):
+    """Guard against the null fix (zeroing the tag outright)."""
+    monkeypatch.setattr(oe_mod, "APIController", CompletingAPI)
+    env = OpenRCT2Env(verbose=0)
+    env.reward_params = replace(RewardParams(), completion_family_floor=0.5,
+                                roundtrip_gain=0.0)
+    env.reset()
+    env.target_family = 0
+    _, _, terminated, _, info = _drive_to_terminal(env)
+    assert terminated and env.loop_completed is True
+    assert info['episode_metrics']['family_hit'] == float(env._family_hit()) == 1.0
+
+
+# ------------------------------------------------- Fix 5 (Aug-9 final review): the dense
+# potential's balance leg exactly cancelled the dense family potential on the switch axis.
+#
+# _exc_feature_quality's balance leg is min(turn_balance / struct_turn_balance_target, 1),
+# and the target was still 2.0 in P5/P6 even though struct_w_turn_balance was correctly
+# zeroed. turn_balance is min(left, right), so the leg is STRUCTURALLY unreachable for the
+# two 0-switch families (oval and spiral) -- a permanent forfeit on 2 of 5 seeds -- and on
+# an oval seed the arithmetic cancelled: adding one direction switch (2L+2R => balance 2)
+# gained w_exc_feat * (1/6) * 1 = 1.0 of Phi and lost w_family * 0.5 * (1/3) = 1.0 (at the
+# pre-Fix-1 switch falloff of 3.0). Zero net dense gradient on exactly the axis that
+# separates oval from out_and_back and spiral from out_and_back -- and the dense potential
+# exists because terminal-only shaping is too slow here.
+
+def _switch_axis_pair():
+    """Two builds identical in EVERY other reward-visible feature -- same length, same
+    piece count, same hill/drop/banked profile, same TURN count (4) -- differing only in
+    handedness: 4 right turns (0 switches, balance 0) vs R,R,L,L (1 switch, balance 2)."""
+    one_handed = _p6_mix(n_right=4, n_left=0)
+    switched = _p6_mix(fill=[4, 4, 3, 3])
+    a, b = _bare_env(history=_env_hist(one_handed)), _bare_env(history=_env_hist(switched))
+    assert a._turn_count() == b._turn_count() == 4
+    assert (a._turn_balance_count(), b._turn_balance_count()) == (0, 2)
+    assert (switch_count(a._history_actions()), switch_count(b._history_actions())) == (0, 1)
+    assert a.track_length == b.track_length
+    return a, b
+
+
+def test_p5_p6_turn_balance_target_is_retired():
+    """Fix 5: with the weight already 0, a nonzero target only kept the unreachable leg
+    alive inside the DENSE potential. Retiring the target makes that leg a constant 0."""
+    W = ImprovedPhasedCurriculumWrapper
+    for phase in (5, 6):
+        p = W._phase_reward_params(phase)
+        assert p.struct_w_turn_balance == 0.0
+        assert p.struct_turn_balance_target == 0.0
+        # no other live consumer: the style gate is retired and the struct leg is unweighted
+        assert p.completion_style_floor == 1.0
+        a, b = _switch_axis_pair()
+        assert a._exc_feature_quality(p) == pytest.approx(b._exc_feature_quality(p))
+
+
+def test_adding_a_switch_on_an_oval_seed_is_net_negative_in_phi():
+    """THE cancellation, asserted with its arithmetic so it cannot silently return.
+
+    On an oval seed (0 switches by band) the switch must cost, and cost the FULL family
+    loss: w_family * 0.5 * (1 / family_switch_falloff) = 6 * 0.5 * 0.5 = 1.5, with the
+    exc-feature balance leg contributing exactly nothing. Before the fix the balance leg
+    handed back w_exc_feat / 6 = 1.0 of that, leaving -0.5."""
+    W = ImprovedPhasedCurriculumWrapper
+    for phase in (5, 6):
+        p = W._phase_reward_params(phase)
+        a, b = _switch_axis_pair()
+        a.target_family = b.target_family = 0
+        expected_family_loss = p.w_family * 0.5 * (1.0 / p.family_switch_falloff)
+        assert expected_family_loss == pytest.approx(1.5)
+        d_phi = b._potential(p) - a._potential(p)
+        assert d_phi < 0.0
+        assert d_phi == pytest.approx(-expected_family_loss), f"phase {phase}"
+        # ...and the whole delta is the family term: the exc-feature term is flat here.
+        d_exc = p.w_exc_feat * (b._exc_feature_quality(p) - a._exc_feature_quality(p))
+        assert d_exc == pytest.approx(0.0)
+
+
+# ----------------------------------------------- Fix 6.1 (Aug-9 final review): a retired
+# gate must not stream as a total forfeit.
+#
+# completion_style_floor=1.0 in P6 means the style block in _calculate_reward never runs,
+# so _last_style_gate stayed at its 0.0 reset and rewards/style_gate streamed a constant
+# 0.0 -- which reads as "every completion forfeited all of its style money", the opposite
+# of "this gate is retired". Chosen fix: stop EMITTING the key while the gate is inert
+# (rather than emitting 1.0). It matches the convention the curriculum wrapper already
+# uses for family_hit_rate_* -- gate the KEY itself on applicability, not just its value
+# -- train.py already writes the scalar only `if 'style_gate' in info_metrics`, and an
+# absent series is unambiguous in TB in a way that a flat line is not.
+
+def test_style_gate_key_absent_while_the_gate_is_retired(monkeypatch):
+    monkeypatch.setattr(oe_mod, "APIController", CompletingAPI)
+    env = OpenRCT2Env(verbose=0)
+    P6 = ImprovedPhasedCurriculumWrapper._phase_reward_params(6)
+    assert P6.completion_style_floor == 1.0            # retired by the family gate
+    env.reward_params = P6
+    env.reset()
+    _, _, terminated, _, info = _drive_to_terminal(env)
+    assert terminated
+    m = info['episode_metrics']
+    assert 'style_gate' not in m
+    assert 'family_gate' in m                          # its live successor still streams
+
+
+def test_style_gate_key_present_while_the_gate_is_armed(monkeypatch):
+    """Guard against the null fix (dropping the diagnostic outright)."""
+    monkeypatch.setattr(oe_mod, "APIController", CompletingAPI)
+    env = OpenRCT2Env(verbose=0)
+    env.reward_params = replace(RewardParams(), completion_style_floor=0.6,
+                                struct_turns_target=12.0, roundtrip_gain=0.0)
+    env.reset()
+    _, _, terminated, _, info = _drive_to_terminal(env)
+    assert terminated
+    assert info['episode_metrics']['style_gate'] > 0.0
+
+
+def test_phases_1_and_2_reward_is_bit_identical_under_every_seed():
+    """The Aug-9 final-fix pass changed RewardParams' family falloff DEFAULTS, which P1/P2
+    inherit. Nothing there may read them: the gate floor is 1.0, w_family and R_family are
+    0 and qualify_requires_family is False, so the reward must be numerically identical
+    for every possible seed. Verified, not assumed (the brief's standing requirement that
+    phases 1-2 stay bit-identical)."""
+    W = ImprovedPhasedCurriculumWrapper
+    rows = _p6_mix(fill=[4, 4, 3, 3] * 3)                  # a shape that is NOT an oval
+    for phase, stage in [(1, 1), (2, 1), (2, 2), (2, 3)]:
+        p = W._phase_reward_params(phase, phase2_stage=stage)
+        assert (p.completion_family_floor, p.w_family, p.R_family) == (1.0, 0.0, 0.0)
+        assert p.qualify_requires_family is False
+        rewards, phis = set(), set()
+        for seed in range(FAMILY_N):
+            env = _family_env(rows, seed, p)
+            phis.add(round(env._potential(p), 10))
+            env._phi_prev = 0.0
+            rewards.add(round(env._calculate_reward(True, 0), 10))
+        assert len(rewards) == 1, f"phase {phase}.{stage} reward varies with the seed"
+        assert len(phis) == 1, f"phase {phase}.{stage} potential varies with the seed"

@@ -16,6 +16,7 @@ import os
 import random
 from collections import deque
 from dataclasses import dataclass
+from functools import cached_property
 
 from openrct2_gym.envs.footprint import classify_family
 from openrct2_gym.envs.track_pieces import SBEND_ACTIONS, TURN_ACTIONS  # noqa: F401
@@ -68,14 +69,31 @@ class LoopRecord:
             prefix_len=int(prefix_len),
         )
 
-    @property
+    # Every property below is DERIVED FROM `actions` ALONE and cached.
+    #
+    # Why cached (Aug-9 final review): they were recomputed on every access, and pool()
+    # touches most of them once PER RECORD per call -- `family` inside the narrowing
+    # filter, turn_count / max_single_drop_z / steep_drop_z inside _meets_structural,
+    # turn_count + sbend_count inside _shape_bin, and `family` again inside
+    # best_excitement(). Measured on the 196,058-record deployment library,
+    # best_excitement(120) went 9 ms unscoped -> 968 ms family-scoped, and the wrapper
+    # calls it 2-3x per episode per worker: seconds of pure Python per episode on 20
+    # workers, growing with the library.
+    #
+    # Why it is SAFE: LoopRecord is a frozen dataclass and `actions` is set once at
+    # construction, so no cached value can go stale. cached_property writes straight into
+    # __dict__, which bypasses the frozen __setattr__; equality and hashing stay
+    # field-based, so dedup on the actions tuple is unaffected. A future MUTABLE field
+    # feeding any of these would break that invariant -- unfreeze nothing without
+    # revisiting this block.
+    @cached_property
     def steep_drop_z(self):
-        """z dropped via the 60-degree family only. A property (derived from actions),
-        so every legacy JSONL entry gets it on load without a schema migration."""
+        """z dropped via the 60-degree family only. Derived from actions, so every legacy
+        JSONL entry gets it on load without a schema migration."""
         return float(sum(ACTION_DROP_Z.get(a, 0) for a in self.actions
                          if a in STEEP_ACTIONS))
 
-    @property
+    @cached_property
     def max_single_drop_z(self):
         """Max z lost over one run of consecutive drop-family actions — the static
         mirror of env._max_single_drop_z (the wooden-RC highest-drop cap needs >= 12z
@@ -90,22 +108,22 @@ class LoopRecord:
                 run = 0.0
         return float(best)
 
-    @property
+    @cached_property
     def turn_count(self):
         """Turn-family pieces (mirrors env._turn_count); the P6 pool criterion."""
         return sum(1 for a in self.actions if a in TURN_ACTIONS)
 
-    @property
+    @cached_property
     def agent_turn_count(self):
         """Heading turns the AGENT placed (skipping the replayed prefix) -- the honest
         measure of composed structure, as opposed to structure handed over at reset."""
         return sum(1 for a in self.actions[self.prefix_len:] if a in TURN_ACTIONS)
 
-    @property
+    @cached_property
     def sbend_count(self):
         return sum(1 for a in self.actions if a in SBEND_ACTIONS)
 
-    @property
+    @cached_property
     def family(self):
         """Footprint family index, or None when the shape fits no family. Derived, so
         every legacy record gets it on load with no schema migration."""

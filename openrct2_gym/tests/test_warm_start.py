@@ -611,28 +611,35 @@ def test_pool_records_family_narrowing_state_for_diagnostics(tmp_path):
     assert lib.last_family_narrowed is False
 
 
-def test_pool_p6_min_turns_and_shape_bin_diversity(tmp_path):
+def test_pool_shape_bin_cap_keeps_a_monoculture_from_owning_the_p6_pool(tmp_path):
     """P6 pools must sustain MULTIPLE styles: the best tier caps each shape bin so a
-    high-excitement rectangle monoculture cannot crowd out winding newcomers."""
+    high-excitement rectangle monoculture cannot crowd out turnier newcomers.
+
+    Renamed twice over (Aug-9 final review). The old name advertised min_turns, which P6
+    no longer sets (see the task-6b block below) -- it is exercised here only as a plain
+    pool() parameter. And the newcomer fixture was called `winding`: classify_family says
+    it is family 2, OUT_AND_BACK (8 turns, 2 switches). Every family name in this file is
+    computed, never inferred from the shape of the literal."""
     lib = _lib(tmp_path)
     for i in range(5):                                       # rectangle bin, high E
         seq = ([0] * (28 + i) + [4, 4] + [10, 9, 9, 9, 9, 9, 9, 13]
                + [12, 27, 28, 6, 6, 14] + [11, 5, 13] + [12, 6, 14]
                + [0] * (7 + i) + [4, 4])
         assert lib.add(LoopRecord.from_actions(seq, "scripted", excitement=5.8))
-    winding = ([0] * 10 + [4, 0, 3] + [0] * 4 + [3, 0, 4] + [0] * 8 + [29, 30]
-               + [4, 4] + [10, 9, 9, 9, 9, 9, 9, 13] + [12, 27, 28, 6, 6, 14]
-               + [11, 5, 13] + [12, 6, 14] + [0] * 6 + [4, 4])
-    assert lib.add(LoopRecord.from_actions(winding, "scripted", excitement=4.9))
+    out_and_back = ([0] * 10 + [4, 0, 3] + [0] * 4 + [3, 0, 4] + [0] * 8 + [29, 30]
+                    + [4, 4] + [10, 9, 9, 9, 9, 9, 9, 13] + [12, 27, 28, 6, 6, 14]
+                    + [11, 5, 13] + [12, 6, 14] + [0] * 6 + [4, 4])
+    assert classify_family(out_and_back) == 2                # computed, not assumed
+    assert lib.add(LoopRecord.from_actions(out_and_back, "scripted", excitement=4.9))
     pool = lib.pool(phase=6, max_len=120, min_chains=1, min_len=40, min_drop_z=12,
                     min_single_drop_z=12, min_excitement=4.5, min_turns=4)
     actions = [r.actions for r in pool]
-    assert tuple(winding) in actions                         # the winding style survives
-    rect_members = [a for a in actions if a != tuple(winding)]
+    assert tuple(out_and_back) in actions                    # the turnier style survives
+    rect_members = [a for a in actions if a != tuple(out_and_back)]
     assert len(rect_members) <= 3                            # monoculture bin capped
     pool_turny = lib.pool(phase=6, max_len=120, min_chains=1, min_len=40, min_drop_z=12,
                           min_single_drop_z=12, min_excitement=4.5, min_turns=8)
-    assert [r.actions for r in pool_turny] == [tuple(winding)]
+    assert [r.actions for r in pool_turny] == [tuple(out_and_back)]
 
 
 # ------------------------------------------- task 6b: P6's min_turns=8 was unsatisfiable
@@ -2037,7 +2044,7 @@ FLOOR_PREFIX_LEN = 5                        # k_max = 12 - 5 = 7 keeps p_cold at
 SPIRAL_BUILD = [4, 4, 4, 4, 4, 4]           # 6 turns, no alternation -> family 1 (spiral)
 
 
-def _p6_floor_wrapper(monkeypatch, tmp_path, min_prefix=FLOOR_PREFIX_LEN):
+def _p6_floor_wrapper(monkeypatch, tmp_path, min_prefix=FLOOR_PREFIX_LEN, family=0):
     """A P6 wrapper wired so every draw is a floor-bound warm plan (`at_floor=True`),
     the only configuration in which `styled` has any effect."""
     wrapper, base = _wrapped(monkeypatch, tmp_path, api_cls=CompletingAPI,
@@ -2053,7 +2060,7 @@ def _p6_floor_wrapper(monkeypatch, tmp_path, min_prefix=FLOOR_PREFIX_LEN):
     # These tests are about the family-hit predicate at a fixed family, not the Aug-9
     # per-episode sampler (task 5) -- pin the seed so it stays deterministic now that
     # P6 draws widely from PHASE_FAMILIES[6].
-    wrapper._sample_target_family = lambda: 0
+    wrapper._sample_target_family = lambda: family
     return wrapper, base
 
 
@@ -2396,3 +2403,150 @@ def test_seed_p5_exemplars_cli_exposes_family_and_footprint_flags(monkeypatch):
 
     assert args.family == "p5"                          # unchanged default
     assert args.footprint_family is None
+
+
+# ------------------------------------------------------ Fix 2 (Aug-9 final review):
+# LoopRecord's derived properties are recomputed on EVERY access. `family` runs
+# classify_family over the whole action list, and best_excitement(max_len, family=...)
+# touches it once per record: measured 9 ms unscoped -> 968 ms family-scoped on the
+# 196,058-record deployment library, 2-3x per episode per worker on 20 workers.
+# _meets_structural (pool()'s hot predicate) and _shape_bin add turn_count, sbend_count,
+# max_single_drop_z and steep_drop_z to the same per-record scan.
+
+def _count_classify_calls(monkeypatch):
+    calls = []
+    import openrct2_gym.envs.warm_start as ws_mod
+    real = ws_mod.classify_family
+    monkeypatch.setattr(ws_mod, "classify_family",
+                        lambda actions: (calls.append(1), real(actions))[1])
+    return calls
+
+
+def test_loop_record_family_is_computed_once_and_cached(monkeypatch):
+    """The record is FROZEN and `actions` is set at construction, so the cache can never
+    go stale -- a future MUTABLE field feeding these properties would break that and is
+    the one thing this docstring exists to warn about."""
+    calls = _count_classify_calls(monkeypatch)
+    rec = LoopRecord.from_actions([4, 4, 3, 3] * 3, "scripted")
+    assert calls == []                                   # not computed at construction
+    first = rec.family
+    assert len(calls) == 1
+    assert rec.family == rec.family == first             # repeated access
+    assert len(calls) == 1                               # ...still computed exactly once
+    assert "family" in rec.__dict__                      # cached_property writes through
+    assert first == classify_family(rec.actions)
+
+
+def test_loop_record_hot_derived_properties_are_cached():
+    """The siblings on pool()'s hot path (_meets_structural + _shape_bin) cache too, or
+    narrowing still pays a full per-record action scan for each of them."""
+    rec = LoopRecord.from_actions([4, 4, 3, 3, 6, 6, 6, 6, 6, 6, 27, 29, 30], "scripted")
+    hot = ("family", "turn_count", "sbend_count", "max_single_drop_z", "steep_drop_z",
+           "agent_turn_count")
+    values = {name: getattr(rec, name) for name in hot}
+    for name, value in values.items():
+        assert name in rec.__dict__, f"{name} is not cached"
+        assert getattr(rec, name) == value               # and the value is unchanged
+
+
+def test_loop_record_caching_leaves_values_and_dedup_identity_intact(tmp_path):
+    """Caching writes into __dict__ on a frozen dataclass; equality/hashing are field-
+    based, so a cached record must still dedup against a freshly loaded one."""
+    seq = [4, 0, 3, 0, 4, 10, 6, 6, 6, 6, 6, 6]
+    lib = _lib(tmp_path)
+    rec = LoopRecord.from_actions(seq, "scripted")
+    _ = (rec.family, rec.turn_count, rec.sbend_count, rec.max_single_drop_z,
+         rec.steep_drop_z)
+    assert lib.add(rec) is True
+    assert lib.add(LoopRecord.from_actions(seq, "scripted")) is False   # dedup still works
+    reloaded, = LoopLibrary(lib.path)._records.values()
+    assert reloaded.family == rec.family
+    assert reloaded.turn_count == rec.turn_count
+    assert reloaded.sbend_count == rec.sbend_count
+    assert reloaded.max_single_drop_z == rec.max_single_drop_z
+    assert reloaded.steep_drop_z == rec.steep_drop_z
+
+
+# ------------------------------------------------ Fix 4 (Aug-9 final review): the P6
+# prefix-descent `styled` predicate was 0% satisfiable for serpentine.
+#
+# Scoring only the agent-built SUFFIX was right while the scaffold could hand over an
+# off-family opening. Now that pool() narrows to same-family exemplars, the prefix is
+# itself from a record of the requested family -- and dropping it removes ~2 turns and
+# ~1 switch, a whole band for the high-turn families. Measured on the 196,058-record
+# deployment library, the suffix still classifies as its record's own family for 100% of
+# oval, 100% of spiral, 73.5% of out_and_back, 92.3% of winding and 0.0% of serpentine
+# records; with uniform seeds that caps the floor frontier at 0.732, and at a realistic
+# 80% closure rate 0.586 -- below promote_rate=0.60 and above demote_rate=0.15, so
+# min_prefix would sit at its init value forever and never anneal to 0.
+
+# prefix [4,0,3,0,4] jogs (R,L,R -> 2 switches, classifies as NO family); the agent then
+# builds a clean one-handed run. Suffix alone = family 0 (oval); prefix+suffix = family 2
+# (out_and_back: 7 turns, 2 switches). Every family here is computed, never assumed.
+OUT_AND_BACK_SEED = 2
+
+
+def _floor_styled_with_narrowing(wrapper, base, actions, narrowed):
+    """One floor-bound scaffolded episode whose pool()-recorded narrowing decision is
+    pinned to `narrowed` (it is plain instance state on the library, set per pool() call
+    and read straight off it by the wrapper -- see LoopLibrary.last_family_narrowed; that
+    it really is set end-to-end is covered by
+    test_pool_records_family_narrowing_state_for_diagnostics and
+    test_wrapper_p6_scaffold_narrows_to_oval_family_for_oval_seed)."""
+    seen = []
+    wrapper._annealer.record_outcome = (
+        lambda plan, success, styled=None: seen.append((success, styled)))
+    base.api_controller.complete_after = wrapper._annealer.min_prefix + len(actions)
+    wrapper.reset()
+    plan = wrapper._current_plan
+    assert plan.cold is False and plan.at_floor is True
+    assert len(plan.prefix) == wrapper._annealer.min_prefix
+    wrapper._loop_library.last_family_narrowed = narrowed
+    for a in actions:
+        _, _, terminated, truncated, _ = wrapper.step(a)
+        if terminated or truncated:
+            break
+    else:
+        raise AssertionError("episode did not end")
+    assert base.loop_completed is True, "the build must actually close the loop"
+    assert [s for s, _ in seen] == [True]
+    return seen[0][1], [h.get('action') for h in base.track_builder.history]
+
+
+def test_p6_styled_scores_the_whole_track_when_the_pool_narrowed(monkeypatch, tmp_path):
+    """THE fix: with narrowing applied, the replayed opening is itself from a record of
+    the requested family, so the shape the seed asked for is the shape of the WHOLE
+    track. A completed build that matches the target as a whole is styled even though its
+    suffix alone classifies elsewhere."""
+    wrapper, base = _p6_floor_wrapper(monkeypatch, tmp_path, family=OUT_AND_BACK_SEED)
+    styled, history = _floor_styled_with_narrowing(wrapper, base, OVAL_BUILD,
+                                                   narrowed=True)
+    assert base.target_family == OUT_AND_BACK_SEED
+    assert classify_family(history) == OUT_AND_BACK_SEED             # whole track: a hit
+    assert classify_family(history[FLOOR_PREFIX_LEN:]) == 0          # suffix alone: oval
+    assert styled is True
+
+
+def test_p6_styled_keeps_the_suffix_rule_when_narrowing_fell_back(monkeypatch, tmp_path):
+    """...and only in the narrowed case. When pool() could not narrow (no same-family
+    record cleared the phase's structural bar) the opening is an arbitrary off-family
+    exemplar again, so the original suffix rule must still govern -- the same build, same
+    seed, opposite verdict."""
+    wrapper, base = _p6_floor_wrapper(monkeypatch, tmp_path, family=OUT_AND_BACK_SEED)
+    fell_back, history = _floor_styled_with_narrowing(wrapper, base, OVAL_BUILD,
+                                                      narrowed=False)
+    assert classify_family(history) == OUT_AND_BACK_SEED
+    assert fell_back is False                       # judged on the suffix: an oval, a miss
+
+    narrowed, _ = _floor_styled_with_narrowing(wrapper, base, OVAL_BUILD, narrowed=True)
+    assert narrowed is not fell_back, "the two branches must actually differ"
+
+
+def test_p6_styled_narrowed_branch_can_still_refuse(monkeypatch, tmp_path):
+    """Guard against the null fix (whole-track scoring that always says yes): with
+    narrowing applied and a whole track that misses the seed's family, styled is False."""
+    wrapper, base = _p6_floor_wrapper(monkeypatch, tmp_path, family=0)   # oval requested
+    styled, history = _floor_styled_with_narrowing(wrapper, base, OVAL_BUILD,
+                                                   narrowed=True)
+    assert classify_family(history) != 0            # the jogging opening is in the track
+    assert styled is False

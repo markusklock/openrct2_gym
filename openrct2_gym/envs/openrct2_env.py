@@ -192,8 +192,19 @@ class RewardParams:
     completion_family_floor: float = 1.0
     R_family: float = 0.0                    # discrete bonus on family hit + tested quality
     qualify_requires_family: bool = False    # qualified gate leg: built what was asked
-    family_turn_falloff: float = 5.0         # turns outside the band before credit hits 0
-    family_switch_falloff: float = 3.0       # switches outside the band before credit hits 0
+    # Falloffs: how far outside its band a build may sit before that leg's credit hits 0.
+    # They MUST be narrower than the gaps between footprint.FAMILIES' bands (4-6 turns,
+    # 1-3 switches) or the bands stop being distinguishable. At the original 5.0/3.0 the
+    # 4-turn oval the policy already builds scored 0.800 against a spiral seed and 0.633
+    # against an out_and_back seed, so on those seeds the forfeited share of the payout
+    # (30 / 55 points at P3) was smaller than the cost of building the requested shape and
+    # the optimal policy was "build the oval anyway" -- the gate was economically inert for
+    # 3 of the 5 families in P3/P4/P5, where it is the ONLY family incentive. At 2.0 the
+    # same oval scores 0.50 / 0.25 / 0.0. Do not go narrower: 2.0 is the smallest value
+    # that still GRADES a near miss (one turn short of the band scores 0.5 on that leg),
+    # and this codebase's house rule is that a leg with no ramp is never discovered.
+    family_turn_falloff: float = 2.0         # turns outside the band before credit hits 0
+    family_switch_falloff: float = 2.0       # switches outside the band before credit hits 0
     # Discrete excitement milestones: R_exc_milestone paid per bar cleared by the measured
     # excitement (post-test). Staged bars make each increment a paid event on the way to
     # the E7-9 band -- the phase2-stage pattern applied to quality.
@@ -646,7 +657,13 @@ class OpenRCT2Env(gym.Env):
                 # seed-conditioned footprint diagnostics (Aug-9)
                 'family_gate': float(getattr(self, '_last_family_gate', 0.0)),
                 'family_match': float(getattr(self, '_last_family_match', 0.0)),
-                'family_hit': float(self._family_hit()),
+                # Completion-conditioned, like its family_gate/family_match siblings
+                # (which are only ever set in the terminal branch). Scored live, a
+                # truncated build that happens to classify into the seed's family --
+                # e.g. ANY short one-handed build under an oval seed, 20% of P5/P6 draws
+                # -- reported a hit next to a zero gate, putting a false ~0.2 floor under
+                # structure/family_hit_cold for a policy that never completes.
+                'family_hit': float(self.loop_completed and self._family_hit()),
                 'family_bonus': float(getattr(self, '_last_family_bonus', 0.0)),
                 'target_family': float(getattr(self, 'target_family', 0)),
                 'switch_count': float(switch_count(self._history_actions())),
@@ -661,6 +678,16 @@ class OpenRCT2Env(gym.Env):
                 'caps_bonus': float(getattr(self, '_last_caps_bonus', 0.0)),
                 'meas_available': float(bool(getattr(self, '_last_measurements', None))),
             }
+            # A RETIRED gate must not stream as a total forfeit. With
+            # completion_style_floor == 1.0 (P6 since the family gate superseded the fixed
+            # turns+balance ramp) the style block in _calculate_reward never runs, so this
+            # would emit a constant 0.0 -- read as "every completion lost all its style
+            # money", the opposite of the truth. Drop the KEY instead, the same convention
+            # the curriculum wrapper uses for family_hit_rate_* (gate the key on
+            # applicability, not just its value); train.py already records the scalar only
+            # when the key is present.
+            if self.reward_params.completion_style_floor >= 1.0:
+                info['episode_metrics'].pop('style_gate', None)
             meas = getattr(self, '_last_measurements', None)
             if meas:
                 info['episode_metrics'].update({
@@ -1454,6 +1481,14 @@ class OpenRCT2Env(gym.Env):
         Targets are shared with the P5 struct components so the dense gradient and the
         completion-conditioned credit point at the same layout."""
         comps = [
+            # KNOWINGLY LEFT (Aug-9 final review): this hardcoded 8-turn target also
+            # contradicts the oval band (<= 5 turns), so on an oval seed it pays for turns
+            # the seed forbids. It is left because Phi_family dominates it -- one extra
+            # turn past the band gains w_exc_feat*(1/6)*(1/8) = 0.125 here and loses
+            # w_family*0.5*(1/family_turn_falloff) = 1.5 -- so the net gradient already
+            # points the right way, and re-aiming it at the seed is a retune of the whole
+            # excitement-feature potential, not a threshold fix. The balance leg below was
+            # NOT left: its arithmetic cancelled exactly.
             min(self._turn_count() / 8.0, 1.0),
             (min(self._banked_turn_count() / params.struct_banked_target, 1.0)
              if params.struct_banked_target > 0 else 0.0),

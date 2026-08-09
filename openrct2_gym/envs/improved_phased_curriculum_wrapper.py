@@ -164,6 +164,15 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
     # be clearable, because the demote path makes the descent an EQUILIBRIUM SEARCH: the
     # seed widens back wherever style fails, so it settles at the width the policy can
     # actually hold, and that settling point is itself the measurement.
+    #
+    # DEAD ON THE CURRENT CURRICULUM (Aug-9 final review), and a trap if it is revived:
+    # only P6 arms min_prefix, and P6 takes the family branch in step() instead of this
+    # bar. Were any phase BELOW P6 ever to arm min_prefix, this bar would apply -- and 6
+    # heading turns CONTRADICTS the oval band (0-5 turns by definition, footprint.py
+    # FAMILIES), so a correctly-built oval could never be "styled" and that phase's prefix
+    # descent would stall at min_prefix_init forever, exactly the failure the family
+    # branch was added to fix. Arm min_prefix below P6 only together with a
+    # seed-conditioned predicate.
     FLOOR_STYLE_MIN_TURNS = 6
 
     # Families the seed may request, per phase. Widens with the track budget: a
@@ -267,7 +276,14 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                 struct_w_sbend=0.05,
                 struct_sbend_target=4.0,
                 struct_w_turn_balance=0.0,        # switches measure this better
-                struct_turn_balance_target=2.0,   # weights sum to 1.0
+                # ...and the TARGET has to go too (Aug-9 final review), not just the
+                # weight: _exc_feature_quality reads the target directly, so at 2.0 the
+                # dense w_exc_feat potential kept paying a balance leg that min(left,
+                # right) makes structurally unreachable for the 0-switch families. On an
+                # oval seed the gain (w_exc_feat/6 = 1.0) exactly cancelled the family
+                # potential's loss for the same switch, zeroing the dense gradient on the
+                # very axis that separates the bands. 0.0 = the leg returns a constant.
+                struct_turn_balance_target=0.0,   # remaining weights sum to 1.0
                 R_viable=150.0,
                 R_caps_max=250.0,
                 R_exc_milestone=100.0,
@@ -334,11 +350,19 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                 w_exc_feat=6.0,                   # dense per-piece excitement gradient
                 # Family reward ramp, last rung before P6 (see the P3 block's comment for
                 # the full rationale and the table): all 5 families are active here
-                # (PHASE_FAMILIES), the floor keeps loosening and the dense potential
-                # reaches its full P6 weight, but R_family/qualify_requires_family stay
-                # off -- P5 advances on its own length-ladder-on-cold-success predicate.
+                # (PHASE_FAMILIES), the floor keeps loosening, the dense potential reaches
+                # its full P6 weight and R_family steps up to 125 (Aug-9 final review).
+                # qualify_requires_family stays off -- P5 advances on its own
+                # length-ladder-on-cold-success predicate, which a family leg would redefine.
                 completion_family_floor=0.60,
                 w_family=6.0,
+                R_family=125.0,
+                # Retired here for the same reason as in P6 (Aug-9 final review):
+                # struct_w_turn_balance is already 0, but _exc_feature_quality reads the
+                # TARGET, and w_exc_feat=6.0 is live in P5 -- so at the 2.0 default the
+                # unreachable-for-oval/spiral balance leg exactly cancelled the family
+                # potential on the switch axis. See the P6 block.
+                struct_turn_balance_target=0.0,
             )
         if phase == 2:
             if phase2_stage == 1:  # 2.1 climb-and-return: find the chain hill, no completion gate
@@ -437,11 +461,17 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                 # share must not shift onto a skill they aren't teaching yet:
                 #   completion_family_floor: 0.85 (P3) -> 0.75 (P4) -> 0.60 (P5) -> 0.50 (P6)
                 #   w_family:                 3.0 (P3) ->  4.0 (P4) ->  6.0 (P5) ->  6.0 (P6)
-                # R_family stays 0 and qualify_requires_family stays False below P6 on
-                # purpose: R_family only pays post-test (P3 has no ride test yet, and P4/P5
-                # are tuned economies not worth re-balancing for this), and each of P3/4/5
-                # already has its own tuned advancement predicate that a family leg would
-                # change the meaning of. Per-family hit rates are still tracked every phase
+                #   R_family:                 0.0 (P3) -> 75.0 (P4) -> 125.0 (P5) -> 200 (P6)
+                # R_family joined the ramp at P4 (Aug-9 final review): below P6 the
+                # multiplicative gate was the ONLY family incentive, and at these floors it
+                # forfeits too little on the NEAR bands to pay for the shape -- a spiral
+                # seed cost the default oval just 30 (P3) / 50 (P4) / 80 (P5) points, well
+                # under the 4-10 extra pieces a spiral costs at this project's recorded
+                # ~-10/piece gamma discount. P3 stays at 0: ride testing is off there, so
+                # R_family (paid only inside the completion-AND-tested branch) could never
+                # fire. qualify_requires_family stays False below P6 -- each of P3/4/5 has
+                # its own tuned advancement predicate that a family leg would change the
+                # meaning of. Per-family hit rates are still tracked every phase
                 # (episode_family_results) against whatever that phase's `qualified` means,
                 # which is what makes the early read readable without touching the gate.
                 # See docs/superpowers/specs/2026-08-09-seed-conditioned-coaster-variety-design.md.
@@ -479,11 +509,15 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                 # mirroring _is_qualified's P4 legs.
                 completion_length_floor=0.25,
                 # Family reward ramp, next rung after P3 (see the P3 block's comment for
-                # the full rationale and the table): floor loosens, weight rises, with the
-                # same two legs held off (R_family=0, qualify_requires_family=False) --
-                # verified-test economics here are already tuned around R_viable/R_qualify.
+                # the full rationale and the table): floor loosens, weight rises, and
+                # R_family arms here -- P4 is the first phase whose ride test runs, so it
+                # is the first phase where a post-test discrete bonus can pay at all.
+                # 75 (not P6's 200) keeps it a rung on the ramp: it is ~half of the P4
+                # gate's own near-band margin, enough to clear the shape's build cost
+                # without re-balancing the tuned R_viable/R_qualify economics around it.
                 completion_family_floor=0.75,
                 w_family=4.0,
+                R_family=75.0,
                 R_qualify=200.0,
                 qualify_requires_steep_drop=True,
                 qualify_requires_test=True,
@@ -1081,16 +1115,33 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                 # phase (qualify_requires_family, P6 only today) pays maximally at <=5
                 # turns on an oval seed -- there the turn bar would refuse to shrink the
                 # seed for a correctly built oval and the descent would stall forever.
-                # The family is judged on the AGENT-BUILT SUFFIX, not the whole track:
-                # `styled` only ever acts on floor-bound WARM plans, whose replayed
-                # opening is a winding jog -- a direction switch, which an oval seed
-                # forbids -- so scoring the whole track would let the scaffold decide the
-                # predicate against the agent and stall the descent at min_prefix_init.
+                # WHICH TRACK the family is judged on depends on where the opening came
+                # from (Aug-9 final review):
+                #  * pool() NARROWED to the requested family -> the replayed opening is
+                #    itself from a record of that family, so the shape the seed asked for
+                #    is the shape of the WHOLE track and that is what must be scored.
+                #    Scoring the suffix instead drops the prefix's ~2 turns and ~1 switch
+                #    -- a whole band for the high-turn families. Measured on the 196,058-
+                #    record deployment library, a record's suffix still classifies as its
+                #    own family for 100% of oval, 100% of spiral, 73.5% of out_and_back,
+                #    92.3% of winding and 0.0% of SERPENTINE records; with uniform seeds
+                #    that caps the floor frontier at (1+1+.735+.923+0)/5 = 0.732, and at a
+                #    realistic 80% closure rate 0.586 -- under promote_rate (0.60) and over
+                #    demote_rate (0.15), so min_prefix would never anneal to 0 and the
+                #    settling point that "is itself the measurement" would be an artifact.
+                #  * narrowing FELL BACK (no same-family record cleared the phase's
+                #    structural bar) -> the opening is an arbitrary off-family exemplar,
+                #    typically a winding jog whose direction switch an oval seed forbids.
+                #    Scoring the whole track there would let the scaffold decide the
+                #    predicate against the agent and stall the descent at min_prefix_init,
+                #    which is the regression the suffix rule was added for. Keep it.
                 if self._phase_reward_params(self.current_phase,
                                              self.phase2_stage).qualify_requires_family:
                     plan = self._current_plan
-                    styled = self._history_family_hit(
-                        base_env, skip=len(plan.prefix) if plan is not None else 0)
+                    narrowed = bool(getattr(self._loop_library,
+                                            'last_family_narrowed', False))
+                    skip = 0 if narrowed else (len(plan.prefix) if plan is not None else 0)
+                    styled = self._history_family_hit(base_env, skip=skip)
                 else:
                     styled = self._history_turn_count(base_env) >= self.FLOOR_STYLE_MIN_TURNS
                 self._annealer.record_outcome(self._current_plan, success, styled=styled)
