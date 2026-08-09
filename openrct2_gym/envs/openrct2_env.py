@@ -15,6 +15,7 @@ from .track_pieces import (
     CURVED_ACTIONS, LEFT_TURN_ACTIONS, RIGHT_TURN_ACTIONS,
     SBEND_ACTIONS, TURN_ACTIONS,
 )
+from .footprint import classify_family, family_match, switch_count
 
 
 @dataclass(frozen=True)
@@ -168,6 +169,16 @@ class RewardParams:
     # the live run showed the plain shape winning the frequency war (balance density
     # thinned 11/20 -> 5/20 while warm k_max annealed 59 -> 83). 1.0 = no gating.
     completion_style_floor: float = 1.0
+    # Seed-conditioned footprint family (Aug-9). The episode's requested family comes
+    # from the observation, so the target is no longer fixed: on an oval seed, MORE
+    # turns is wrong. completion_family_floor is the fraction of the (hill x length x
+    # style)-gated payout a build earns when it ignores its seed entirely; the rest
+    # ramps with family_match. 1.0 = no gating (phases 1-5 default).
+    completion_family_floor: float = 1.0
+    R_family: float = 0.0                    # discrete bonus on family hit + tested quality
+    qualify_requires_family: bool = False    # qualified gate leg: built what was asked
+    family_turn_falloff: float = 5.0         # turns outside the band before credit hits 0
+    family_switch_falloff: float = 3.0       # switches outside the band before credit hits 0
     # Discrete excitement milestones: R_exc_milestone paid per bar cleared by the measured
     # excitement (post-test). Staged bars make each increment a paid event on the way to
     # the E7-9 band -- the phase2-stage pattern applied to quality.
@@ -527,6 +538,15 @@ class OpenRCT2Env(gym.Env):
             if self.reward_params.R_qualify > 0.0 and self._qualifies(self.reward_params):
                 reward += self.reward_params.R_qualify
                 self._last_qualify_bonus = self.reward_params.R_qualify
+            # Family bonus: building the footprint the seed asked for, as a paid discrete
+            # event -- but only on a ride that verifiably ran at the phase's quality floor,
+            # so "match the seed" can never be farmed by a cheap unrated shape.
+            if (self.reward_params.R_family > 0.0 and self._family_hit()
+                    and self._last_test_ok
+                    and float(getattr(self, "last_ride_excitement", 0.0))
+                    >= self.reward_params.qualify_min_excitement):
+                reward += self.reward_params.R_family
+                self._last_family_bonus = self.reward_params.R_family
             # Quality-gate remainder + excitement milestones: keyed on the MEASURED
             # excitement, so they live here with the other post-test terms. Untested
             # completions keep only the floor share paid in _calculate_reward.
@@ -606,6 +626,13 @@ class OpenRCT2Env(gym.Env):
                 'completion_gate': float(getattr(self, '_last_completion_gate', 0.0)),
                 'style_gate': float(getattr(self, '_last_style_gate', 0.0)),
                 'qualify_bonus': float(getattr(self, '_last_qualify_bonus', 0.0)),
+                # seed-conditioned footprint diagnostics (Aug-9)
+                'family_gate': float(getattr(self, '_last_family_gate', 0.0)),
+                'family_match': float(getattr(self, '_last_family_match', 0.0)),
+                'family_hit': float(self._family_hit()),
+                'family_bonus': float(getattr(self, '_last_family_bonus', 0.0)),
+                'target_family': float(getattr(self, 'target_family', 0)),
+                'switch_count': float(switch_count(self._history_actions())),
                 # P5 quality-economics diagnostics
                 'exc_milestone_bonus': float(getattr(self, '_last_exc_milestone_bonus', 0.0)),
                 'single_drop_z': float(self._max_single_drop_z()),
@@ -707,6 +734,9 @@ class OpenRCT2Env(gym.Env):
         self._last_completion_gate = 0.0
         self._last_gate_prequality = 0.0
         self._last_style_gate = 0.0
+        self._last_family_gate = 0.0
+        self._last_family_match = 0.0
+        self._last_family_bonus = 0.0
         self._last_exc_milestone_bonus = 0.0
         self._last_measurements = None
         self._last_caps_bonus = 0.0
@@ -902,6 +932,8 @@ class OpenRCT2Env(gym.Env):
         self._last_completion_gate = 0.0
         self._last_gate_prequality = 0.0
         self._last_style_gate = 0.0
+        self._last_family_gate = 0.0
+        self._last_family_match = 0.0
         if not success:
             return float(params.fail_penalty)
 
@@ -940,6 +972,17 @@ class OpenRCT2Env(gym.Env):
                         params.completion_style_floor
                         + (1.0 - params.completion_style_floor) * style_frac)
                     gate *= self._last_style_gate
+            # Family gate (multiplicative, like length/quality/style): a build that
+            # ignores its seed forfeits most of the completion payout. Multiplicative
+            # because additive carrots have repeatedly lost to reliable alternatives
+            # in this project. Sits above the prequality stash, so the post-test
+            # excitement remainder scales with it too.
+            if params.completion_family_floor < 1.0:
+                self._last_family_match = self._family_match(params)
+                self._last_family_gate = (
+                    params.completion_family_floor
+                    + (1.0 - params.completion_family_floor) * self._last_family_match)
+                gate *= self._last_family_gate
             # Quality gate split (P5): only the floor share is paid here -- the remainder
             # is added post-test in step() scaled by measured excitement (same terminal
             # step, so together they form one multiplicative gate). Pre-quality gate is
@@ -1448,6 +1491,23 @@ class OpenRCT2Env(gym.Env):
         hist = getattr(self.track_builder, "history", None) or []
         return sum(1 for h in hist if h.get("action") in TURN_ACTIONS)
 
+    def _history_actions(self):
+        """Action ids of the removal-safe history, in build order."""
+        hist = getattr(self.track_builder, "history", None) or []
+        return [h.get("action") for h in hist]
+
+    def _family_match(self, params):
+        """How well this build matches the family the seed asked for, in [0, 1]."""
+        return family_match(self._history_actions(),
+                            int(getattr(self, "target_family", 0)),
+                            turn_falloff=params.family_turn_falloff,
+                            switch_falloff=params.family_switch_falloff)
+
+    def _family_hit(self):
+        """True when the build lands exactly in the requested family."""
+        return classify_family(self._history_actions()) == int(
+            getattr(self, "target_family", 0))
+
     def _sbend_count(self):
         """S-bend pieces (29/30): lateral weave without a heading change."""
         hist = getattr(self.track_builder, "history", None) or []
@@ -1545,6 +1605,8 @@ class OpenRCT2Env(gym.Env):
             if not any(h.get("action") in (8, 27, 28) for h in hist):
                 return False
         if params.qualify_requires_test and not getattr(self, "_last_test_ok", False):
+            return False
+        if params.qualify_requires_family and not self._family_hit():
             return False
         if params.qualify_min_turns > 0 and self._turn_count() < params.qualify_min_turns:
             return False

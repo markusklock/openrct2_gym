@@ -13,6 +13,7 @@ from openrct2_gym.envs.warm_start import LoopLibrary, WarmStartAnnealer, WarmSta
 from openrct2_gym.envs.track_pieces import (
     LEFT_TURN_ACTIONS, RIGHT_TURN_ACTIONS, TURN_ACTIONS,
 )
+from openrct2_gym.envs.footprint import classify_family
 
 
 class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
@@ -185,10 +186,10 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
             f"-- not closing the loop can out-pay even a perfect completion")
         if params.completion_hill_floor > 0.0:
             # Worst-case completion pay compounds ALL gates (hill x length x quality x
-            # style floors).
+            # style x family floors).
             flat = (params.completion_hill_floor * params.completion_length_floor
                     * params.completion_quality_floor * params.completion_style_floor
-                    * params.R_complete)
+                    * params.completion_family_floor * params.R_complete)
             assert milestones < flat, (
                 f"{label}: climb milestones {milestones} >= flat-completion floor {flat} "
                 f"({params.completion_hill_floor}*{params.completion_length_floor}"
@@ -227,29 +228,33 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                 completion_length_floor=0.5,     # quick-loop trap (Jul-15): the 28pc
                                                   # attractor must leave length money
                                                   # on the table from step one
-                completion_style_floor=0.5,      # winding-frequency war (Jul-24): the
-                                                  # 4-turn rectangle must leave shape
-                                                  # money on the table from step one
+                completion_style_floor=1.0,      # superseded by the family gate: the
+                                                  # fixed turns+balance ramp fought the
+                                                  # seed on every non-winding family
+                completion_family_floor=0.5,     # ignore your seed -> forfeit half of
+                                                  # the completion payout, from step one
                                                   # (0.5, not 0.6: milestones/viable/
                                                   # quality are shape-blind, so the
                                                   # gate must cut deeper to clear a
                                                   # decisive step-one edge)
+                R_family=200.0,
+                qualify_requires_family=True,
                 exc_gate_target=6.0,
                 R_struct_max=250.0,
                 struct_w_chain=0.0,
-                struct_w_single_drop=0.20,
+                struct_w_single_drop=0.35,
                 struct_single_drop_target=12.0,
                 struct_w_drop_runs=0.15,
                 struct_drop_runs_target=2.0,
-                struct_w_length=0.15,
+                struct_w_length=0.30,
                 struct_length_target=70.0,
-                struct_w_banked=0.10,
+                struct_w_banked=0.15,
                 struct_banked_target=4.0,
-                struct_w_turns=0.25,
+                struct_w_turns=0.0,               # target comes from the seed now
                 struct_turns_target=12.0,
                 struct_w_sbend=0.05,
                 struct_sbend_target=4.0,
-                struct_w_turn_balance=0.10,
+                struct_w_turn_balance=0.0,        # switches measure this better
                 struct_turn_balance_target=2.0,   # weights sum to 1.0
                 R_viable=150.0,
                 R_caps_max=250.0,
@@ -257,8 +262,8 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                 exc_milestone_bars=(2.5, 4.0, 5.5),
                 R_qualify=200.0,
                 qualify_min_excitement=4.5,
-                qualify_min_turns=12.0,
-                qualify_min_turn_balance=2.0,
+                qualify_min_turns=0.0,            # a fixed turns>=12 bar contradicts the
+                qualify_min_turn_balance=0.0,     # oval/spiral/out-and-back seeds outright
                 qualify_requires_test=True,
                 w_exc_feat=6.0,
                 w_route=3.0,   # Jul-27: wound layouts fail closure on the RETURN ROUTE
@@ -459,6 +464,14 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
         return sum(1 for h in history if h.get('action') in TURN_ACTIONS)
 
     @staticmethod
+    def _history_family_hit(base_env):
+        """Whether the build lands in the family the episode's seed asked for
+        (mirrors env._family_hit)."""
+        history = getattr(base_env.track_builder, 'history', [])
+        return classify_family([h.get('action') for h in history]) == int(
+            getattr(base_env, 'target_family', 0))
+
+    @staticmethod
     def _history_turn_balance(base_env):
         """min(left, right) turn-family pieces (mirrors env._turn_balance_count)."""
         history = getattr(base_env.track_builder, 'history', [])
@@ -561,16 +574,17 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                         and getattr(base_env, 'track_length', 0) >= P.struct_length_target
                         and getattr(base_env, '_last_test_ok', False))
         if self.current_phase >= 6:
-            # "Style": completed, tested at the E floor, AND genuinely winding -- turn
-            # count plus handedness balance (the legs the reward ramps pay toward).
+            # "Style": completed, tested at the E floor, AND shaped like the family the
+            # episode's seed asked for. Aug-9: the fixed turns>=12 / balance>=2 legs are
+            # gone -- they were only ever a stand-in for "not the same rectangle again",
+            # and they contradict an oval/spiral/out-and-back seed outright. Mirrors
+            # env._qualifies' qualify_requires_family leg.
             P = self._phase_reward_params(6)
             return bool(success
                         and getattr(base_env, '_last_test_ok', False)
                         and float(getattr(base_env, 'last_ride_excitement', 0.0))
                         >= P.qualify_min_excitement
-                        and self._history_turn_count(base_env) >= P.qualify_min_turns
-                        and self._history_turn_balance(base_env)
-                        >= P.qualify_min_turn_balance)
+                        and self._history_family_hit(base_env))
         if self.current_phase >= 5:
             # Quality diagnostic (does NOT gate the P5 length ladder, which stays on raw
             # cold success): completed, TESTED, and rated at least the middle milestone
