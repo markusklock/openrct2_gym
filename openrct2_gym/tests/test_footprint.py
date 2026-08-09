@@ -47,22 +47,22 @@ def test_classify_returns_none_when_no_family_fits():
 
 
 def test_family_match_is_full_inside_the_band():
-    assert family_match(WINDING, 3) == pytest.approx(1.0)
-    assert family_match(OVAL, 0) == pytest.approx(1.0)
+    assert family_match(WINDING, 3, 2.0, 2.0) == pytest.approx(1.0)
+    assert family_match(OVAL, 0, 2.0, 2.0) == pytest.approx(1.0)
 
 
 def test_family_match_falls_off_gradually_outside_the_band():
     """Graded, not pass/fail: partial credit for getting nearer, or the target is
     never discovered (the campaign's every-leg-needs-a-ramp rule)."""
-    near = family_match([4, 4, 4, 0, 3, 3, 0, 4, 4, 4, 0, 3, 3], 3)      # 10 turns, 3 switches
-    far = family_match([4, 4, 0, 3, 3, 0, 4, 4], 3)                       # 6 turns, 2 switches
+    near = family_match([4, 4, 4, 0, 3, 3, 0, 4, 4, 4, 0, 3, 3], 3, 2.0, 2.0)      # 10 turns, 3 switches
+    far = family_match([4, 4, 0, 3, 3, 0, 4, 4], 3, 2.0, 2.0)                       # 6 turns, 2 switches
     assert 0.0 < far < near <= 1.0
 
 
 def test_family_match_penalises_the_wrong_family():
     """The core inversion: with an oval requested, a winding build must score worse."""
-    assert family_match(OVAL, 0) > family_match(WINDING, 0)
-    assert family_match(WINDING, 3) > family_match(OVAL, 3)
+    assert family_match(OVAL, 0, 2.0, 2.0) > family_match(WINDING, 0, 2.0, 2.0)
+    assert family_match(WINDING, 3, 2.0, 2.0) > family_match(OVAL, 3, 2.0, 2.0)
 
 
 # --------------------------------------------- the seed as an observation input

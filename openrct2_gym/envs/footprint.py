@@ -52,9 +52,11 @@ def _band_score(value, lo, hi, falloff):
     return 1.0
 
 
-def family_match(actions, family_index, turn_falloff=5.0, switch_falloff=3.0):
+def family_match(actions, family_index, turn_falloff, switch_falloff):
     """How well this build lands in the requested family, in [0, 1]. Graded so that
-    getting nearer pays -- a pass/fail gate would never be discovered."""
+    getting nearer pays -- a pass/fail gate would never be discovered. The falloffs
+    are deliberately required to prevent a stale default from silently degrading the
+    grading."""
     _, tlo, thi, slo, shi = FAMILIES[family_index]
     dirs = turn_directions(actions)
     turns = len(dirs)
