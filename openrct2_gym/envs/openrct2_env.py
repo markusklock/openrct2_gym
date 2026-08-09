@@ -877,7 +877,8 @@ class OpenRCT2Env(gym.Env):
                     # training step; port identifies the worker (a sick instance shows
                     # up as a cluster instead of vanishing into the average)
                     ts=time.time(),
-                    port=getattr(self.api_controller, "port", -1)))
+                    port=getattr(self.api_controller, "port", -1),
+                    prefix_len=int(getattr(self, "_warm_prefix_len", 0) or 0)))
         except Exception:
             pass
 

@@ -1625,3 +1625,46 @@ def test_floor_style_bar_is_reachable_and_self_correcting(monkeypatch, tmp_path)
         ann.record_outcome(WarmStartPlan(FLAT[:2], 10, 12, False, True),
                            success=True, styled=False)
     assert ann.min_prefix == 3
+
+
+# ------------------------ agent-built vs replayed credit (Aug-9, "who built the turns?")
+# "Warm builds wind at 7.9 turns" conflated what the AGENT built with what the scaffold
+# REPLAYED: a record stores the whole track, including the pre-placed prefix, so a long
+# prefix made the exemplar's own turns look like the policy's work. Same class of error
+# as counting S-bends as turns. Records now store prefix_len so agent-built structure
+# can be measured directly.
+
+def test_loop_record_prefix_len_roundtrip_and_legacy(tmp_path):
+    lib = LoopLibrary(str(tmp_path / "lib.jsonl"))
+    lib.add(LoopRecord.from_actions([4, 0, 3, 4], "harvest", prefix_len=2))
+    (rec,) = LoopLibrary(str(tmp_path / "lib.jsonl"))._records.values()
+    assert rec.prefix_len == 2
+    legacy = tmp_path / "legacy.jsonl"
+    legacy.write_text(json.dumps({"actions": [4, 0, 3], "length": 3, "chain_count": 0,
+                                  "max_gain": 0.0, "drop_z": 0.0, "source": "harvest"}) + "\n")
+    (old,) = LoopLibrary(str(legacy))._records.values()
+    assert old.prefix_len == 0            # legacy: unknown, treated as all-agent
+
+
+def test_agent_turn_count_excludes_the_replayed_prefix():
+    """THE measurement that settles whether the policy composes winding or inherits it."""
+    rec = LoopRecord.from_actions([4, 3, 4, 3, 0, 0, 4, 0], "harvest", prefix_len=4)
+    assert rec.turn_count == 5            # whole track
+    assert rec.agent_turn_count == 1      # only the piece the agent placed after the seed
+    cold = LoopRecord.from_actions([4, 3, 4], "harvest_cold", prefix_len=0)
+    assert cold.agent_turn_count == cold.turn_count == 3
+
+
+def test_harvest_stamps_prefix_len(monkeypatch, tmp_path):
+    monkeypatch.setattr(oe_mod, "APIController", CompletingAPI)
+    lib_path = str(tmp_path / "lib.jsonl")
+    monkeypatch.setattr(OpenRCT2Env, "_LOOP_LIBRARY_PATH", lib_path)
+    env = OpenRCT2Env(port=8081, verbose=0)
+    env.reset()
+    env._warm_prefix_len = 3              # pretend 3 pieces were replayed at reset
+    for _ in range(20):
+        _, _, term, trunc, _ = env.step(0)
+        if term or trunc:
+            break
+    recs = list(LoopLibrary(lib_path)._records.values())
+    assert recs and all(r.prefix_len == 3 for r in recs)
