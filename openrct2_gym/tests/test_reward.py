@@ -17,6 +17,7 @@ import pytest
 from openrct2_gym.envs import openrct2_env as oe_mod
 from openrct2_gym.envs.openrct2_env import OpenRCT2Env, RewardParams
 from openrct2_gym.envs.obs_config import make_observation_space, SCALE, H_SCALE
+from openrct2_gym.envs.footprint import classify_family
 from openrct2_gym.tests.test_env_smoke import FakeAPI
 
 DIRS = [(-1, 0), (0, 1), (1, 0), (0, -1)]  # API encoding: 0=W, 1=N, 2=E, 3=S (matches env.direction_vectors)
@@ -2406,6 +2407,7 @@ def test_qualify_fields_default_inert():
     assert p.qualify_requires_energy is False
     assert p.qualify_requires_steep_drop is False
     assert p.qualify_requires_test is False
+    assert p.qualify_max_sbend == float('inf')   # no density cap unless a phase sets one
 
 
 def test_completion_length_gate_scales_r_complete():
@@ -2986,6 +2988,9 @@ def test_p6_params_grade_variety():
     assert p6.qualify_min_excitement == 4.5
     assert (p6.qualify_min_turns, p6.qualify_min_turn_balance) == (0.0, 0.0)
     assert p6.qualify_requires_family is True
+    # the shape guard the retired turns>=12 leg used to provide by accident: the struct
+    # S-bend leg saturates at 4, so 6 leaves honest headroom and blocks the observed farm
+    assert p6.qualify_max_sbend == 6.0
     assert p6.qualify_requires_test is True and p6.R_qualify == 200.0
     # quality economics carried over from P5 unchanged
     assert (p6.completion_quality_floor, p6.exc_gate_target) == (0.4, 6.0)
@@ -3020,11 +3025,21 @@ def test_p6_qualified_requires_seed_family_and_tested_excitement():
     rectangle = [4] * 4                         # 4 turns, no alternation -> oval
     assert w._is_qualified(base(rectangle, family=0), True) is True    # oval seed: correct
     assert w._is_qualified(base(rectangle, family=3), True) is False   # winding seed: wrong
+    # 12 SAME-handed turns: the count lands in the winding band but the alternation count
+    # (0) lands in no band at all, so classify_family returns None. A build that matches
+    # nothing is a hit for no seed -- not a near-miss that qualifies for the closest one.
+    same_handed = [4] * 12
+    assert classify_family(same_handed) is None
+    assert w._is_qualified(base(same_handed, family=3), True) is False
+    assert w._is_qualified(base(same_handed, family=0), True) is False
     # Aug-6 exploit: two 180s + a stack of S-bends farmed turns AND balance. S-bends hand
     # back the heading, so they can no more manufacture a winding FOOTPRINT than they
-    # could manufacture the old turn/balance legs.
+    # could manufacture the old turn/balance legs -- and under the OVAL seed they
+    # geometrically match, so the density leg is what blocks them there (mirrors
+    # env._qualifies' qualify_max_sbend leg).
     sbend_farm = [4] * 4 + [29, 30] * 5                      # 4 turns + 10 S-bends
     assert w._is_qualified(base(sbend_farm, family=3), True) is False
+    assert w._is_qualified(base(sbend_farm, family=0), True) is False
 
 
 def test_p5_advances_to_p6_when_ladder_done_and_quality_holds(monkeypatch):
@@ -3300,20 +3315,6 @@ def _p6_payout(params, rows, excitement, intensity=6.0, nausea=2.5, family=0):
     return r
 
 
-def _p6_shape(chain_peak, length, n_right, n_left):
-    """A P6-scale build: _big_hill's chain/drop skeleton with trailing flat pads
-    converted into the given turn mix (turn pieces are flat at base z here)."""
-    rows = _big_hill(chain_peak=chain_peak, steep=True, length=length)
-    turns = [4] * n_right + [3] * n_left
-    for i in range(len(rows) - 1, -1, -1):
-        if not turns:
-            break
-        if rows[i] == (0, 14, 14):
-            rows[i] = (turns.pop(), 14, 14)
-    assert not turns, "not enough flat pads to convert"
-    return rows
-
-
 def test_p6_winding_beats_rectangle_from_step_one_on_a_winding_seed():
     """THE Jul-24 regression, now seed-conditioned (Aug-9). WHEN THE SEED ASKS FOR
     WINDING, the discounted value of the winding build must still beat the 4-turn
@@ -3434,7 +3435,14 @@ def test_sbend_stack_cannot_farm_p6_shape_credit():
     genuine = [(4, 14, 14), (4, 14, 14), (3, 14, 14), (3, 14, 14)] * 3  # 12 turns, 5 switches
     assert shape_credit(exploit) < shape_credit(genuine)
     assert shape_credit(genuine) == pytest.approx(1.0)   # exactly the requested footprint
-    # ... and the S-bends buy nothing back by being stacked higher.
+    # ... and the S-bends buy nothing back by being stacked higher. Measured against a
+    # base whose match is strictly BETWEEN 0 and 1 (10 turns / 2 switches: the turn band
+    # is met, the alternation band is one short), because the exploit itself scores a flat
+    # 0.0 here and "0.0 == 0.0" cannot fail for the reason this assertion claims.
+    partial = [(4, 14, 14)] * 5 + [(3, 14, 14)] * 3 + [(4, 14, 14)] * 2
+    assert 0.0 < shape_credit(partial) < 1.0
+    assert shape_credit(partial + [(29, 14, 14), (30, 14, 14)] * 3) == pytest.approx(
+        shape_credit(partial))
     assert shape_credit(exploit + [(29, 14, 14), (30, 14, 14)] * 3) == pytest.approx(
         shape_credit(exploit))
 
@@ -3449,8 +3457,15 @@ def test_sbend_stack_cannot_farm_p6_shape_credit():
 
 
 def test_sbend_stack_does_not_meet_p6_qualified_gate():
-    """Aug-9: the gate leg is now "built the family the seed asked for". An S-bend stack
-    classifies as the OVAL it geometrically is, so it can never satisfy a winding seed."""
+    """THE Aug-6 exploit, guarded on BOTH legs -- an oval is a fine answer to an oval
+    seed, an oval stuffed with S-bend padding is not.
+
+    footprint.py deliberately ignores S-bends (they hand back the heading), so
+    "oval + 8 S-bends" classifies as a pristine oval. That is right for CLASSIFICATION
+    and precisely why the family leg alone cannot police padding: under an oval seed the
+    padded build would clear the gate and collect R_qualify + R_family on top of the
+    length credit its 8 padding pieces buy. The density leg (qualify_max_sbend) is what
+    the retired turns>=12 leg used to do by accident."""
     P6 = ImprovedPhasedCurriculumWrapper._phase_reward_params(6)
 
     def env_for(rows, family=3):
@@ -3462,12 +3477,15 @@ def test_sbend_stack_does_not_meet_p6_qualified_gate():
         return env
 
     # full-size builds so only the FOOTPRINT differs (P6 also gates height/drop/length)
-    exploit = _p6_mix(n_right=4, n_left=0, n_sbend_pairs=4)
+    exploit = _p6_mix(n_right=4, n_left=0, n_sbend_pairs=4)   # 4 turns + 8 S-bends
+    clean = _p6_mix(n_right=4, n_left=0)                      # the same oval, unpadded
     genuine = _p6_mix(fill=[4, 4, 3, 3] * 3)
+    # winding seed: no amount of S-bends makes the rectangle a winder
     assert env_for(exploit)._qualifies(P6) is False
     assert env_for(genuine)._qualifies(P6) is True
-    # the exploit is not "wrong", it is an oval -- and an oval seed pays it in full
-    assert env_for(exploit, family=0)._qualifies(P6) is True
+    # oval seed: the honest oval qualifies, the padded one is still blocked
+    assert env_for(clean, family=0)._qualifies(P6) is True
+    assert env_for(exploit, family=0)._qualifies(P6) is False
 
 
 def test_energy_model_still_charges_sbend_friction():
@@ -3527,19 +3545,24 @@ def test_family_bonus_requires_hit_and_quality():
 
 def test_oval_seed_beats_winding_build_from_step_one():
     """THE inversion test. With an oval requested, building winding must LOSE.
-    Without this, 'always add more turns' creeps back in."""
+    Without this, 'always add more turns' creeps back in.
+
+    The winder is `fill=[4,4,3,3]*3` (12 turns, 5 switches -> genuinely `winding`), not
+    six rights followed by six lefts: the latter alternates ONCE, classifies to no family
+    at all, and scored only a partial 0.667 even under the seed it was named for."""
     P6 = ImprovedPhasedCurriculumWrapper._phase_reward_params(6)
     oval_rows = _p6_mix(n_right=4, n_left=0)
-    wind_rows = _p6_mix(n_right=6, n_left=6)
+    wind_rows = _p6_mix(fill=[4, 4, 3, 3] * 3)
     oval_payout = _family_env(oval_rows, 0, P6)._calculate_reward(True, 0)
     wind_payout = _family_env(wind_rows, 0, P6)._calculate_reward(True, 0)
     assert oval_payout > wind_payout * 1.2
 
 
 def test_winding_seed_beats_oval_build_from_step_one():
+    """The mirror of the inversion test: same pair of builds, opposite seed."""
     P6 = ImprovedPhasedCurriculumWrapper._phase_reward_params(6)
     oval_rows = _p6_mix(n_right=4, n_left=0)
-    wind_rows = _p6_mix(n_right=6, n_left=6)
+    wind_rows = _p6_mix(fill=[4, 4, 3, 3] * 3)
     assert (_family_env(wind_rows, 3, P6)._calculate_reward(True, 0)
             > _family_env(oval_rows, 3, P6)._calculate_reward(True, 0) * 1.2)
 

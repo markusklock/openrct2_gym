@@ -1627,6 +1627,57 @@ def test_floor_style_bar_is_reachable_and_self_correcting(monkeypatch, tmp_path)
     assert ann.min_prefix == 3
 
 
+# ------------------ what "styled" MEANS is phase-dependent (Aug-9 seed conditioning)
+# The descent bar was a fixed turns>=6, which matched the P6 reward while that reward
+# paid for turns. It no longer does: on an oval seed the family gate pays MAXIMALLY at
+# <=5 turns, so a correctly-built oval could never be "styled" and the prefix descent
+# stalled -- and cold builds are the only thing the success criteria are measured on.
+
+def _styled_flags(wrapper, base, actions):
+    """Drive one full episode of `actions` to a COMPLETION and return the `styled`
+    values the wrapper handed the annealer."""
+    seen = []
+    wrapper._annealer.record_outcome = (
+        lambda plan, success, styled=None: seen.append((success, styled)))
+    base.api_controller.complete_after = len(actions)
+    wrapper.reset()
+    for a in actions:
+        _, _, terminated, truncated, _ = wrapper.step(a)
+        if terminated or truncated:
+            break
+    else:
+        raise AssertionError("episode did not end")
+    assert [s for s, _ in seen] == [True], "the build must actually close the loop"
+    return [styled for _, styled in seen]
+
+
+OVAL_BUILD = [4, 4, 4, 4, 0]        # 4 heading turns, no alternation -> family 0 (oval)
+
+
+def test_p6_styled_means_built_the_seed_family(monkeypatch, tmp_path):
+    """In P6 the descent bar is the family the seed asked for. target_family is 0 (oval)
+    today, and an oval is 0-5 turns -- under the old turns>=6 bar this correctly-built
+    episode would report styled=False and the seed would never shrink."""
+    wrapper, base = _wrapped(monkeypatch, tmp_path, api_cls=CompletingAPI, p_cold=1.0)
+    wrapper.current_phase = 6
+    wrapper._update_phase_settings()
+    assert base.target_family == 0
+    (styled,) = _styled_flags(wrapper, base, OVAL_BUILD)
+    assert wrapper._history_turn_count(base) == 4 < wrapper.FLOOR_STYLE_MIN_TURNS
+    assert styled is True
+
+
+def test_pre_p6_styled_still_means_the_turn_count_bar(monkeypatch, tmp_path):
+    """The bit-identical guard: phases whose reward still pays for turns keep the fixed
+    turns>=FLOOR_STYLE_MIN_TURNS bar, so the SAME 4-turn build is not styled there."""
+    wrapper, base = _wrapped(monkeypatch, tmp_path, api_cls=CompletingAPI, p_cold=1.0)
+    assert wrapper.current_phase == 1
+    assert wrapper._phase_reward_params(1).qualify_requires_family is False
+    (styled,) = _styled_flags(wrapper, base, OVAL_BUILD)
+    assert wrapper._history_turn_count(base) == 4
+    assert styled is False
+
+
 # ------------------------ agent-built vs replayed credit (Aug-9, "who built the turns?")
 # "Warm builds wind at 7.9 turns" conflated what the AGENT built with what the scaffold
 # REPLAYED: a record stores the whole track, including the pre-placed prefix, so a long

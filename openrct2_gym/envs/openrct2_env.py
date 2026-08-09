@@ -134,6 +134,12 @@ class RewardParams:
     qualify_min_excitement: float = 0.0
     qualify_min_turns: float = 0.0
     qualify_min_turn_balance: float = 0.0
+    # P6: an S-bend stack is PADDING, not shape. footprint.py deliberately ignores
+    # S-bends (they hand back the heading), so "oval + 8 S-bends" classifies as a
+    # pristine oval -- right for classification, insufficient as the sole shape guard.
+    # Before the family gate, turns>=12 blocked the Aug-6 farm by accident; this is that
+    # guard made explicit. inf = no cap (phases 1-5 unchanged).
+    qualify_max_sbend: float = float('inf')
     # --- P5 quality economics (all default-inert) ---
     # Quality gate on completion: pay floor*R_complete at close via _calculate_reward, and
     # the remainder scaled by MEASURED excitement post-test (same terminal step, so it is
@@ -1607,6 +1613,8 @@ class OpenRCT2Env(gym.Env):
         if params.qualify_requires_test and not getattr(self, "_last_test_ok", False):
             return False
         if params.qualify_requires_family and not self._family_hit():
+            return False
+        if self._sbend_count() > params.qualify_max_sbend:
             return False
         if params.qualify_min_turns > 0 and self._turn_count() < params.qualify_min_turns:
             return False

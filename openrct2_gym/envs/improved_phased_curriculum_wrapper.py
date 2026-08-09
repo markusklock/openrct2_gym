@@ -10,9 +10,7 @@ from typing import Dict, Any, Tuple
 
 from openrct2_gym.envs.openrct2_env import OpenRCT2Env, RewardParams
 from openrct2_gym.envs.warm_start import LoopLibrary, WarmStartAnnealer, WarmStartPlan
-from openrct2_gym.envs.track_pieces import (
-    LEFT_TURN_ACTIONS, RIGHT_TURN_ACTIONS, TURN_ACTIONS,
-)
+from openrct2_gym.envs.track_pieces import SBEND_ACTIONS, TURN_ACTIONS
 from openrct2_gym.envs.footprint import classify_family
 
 
@@ -264,6 +262,15 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                 qualify_min_excitement=4.5,
                 qualify_min_turns=0.0,            # a fixed turns>=12 bar contradicts the
                 qualify_min_turn_balance=0.0,     # oval/spiral/out-and-back seeds outright
+                qualify_max_sbend=6.0,            # ...but turns>=12 also blocked the Aug-6
+                                                  # S-bend farm by accident, and the
+                                                  # footprint classifier is blind to
+                                                  # S-bends, so the density cap has to be
+                                                  # explicit. 6 is a TUNABLE, not a derived
+                                                  # constant: struct_sbend_target=4 already
+                                                  # saturates the S-bend struct leg, so 6
+                                                  # leaves honest headroom while the
+                                                  # observed farm (8) stays blocked.
                 qualify_requires_test=True,
                 w_exc_feat=6.0,
                 w_route=3.0,   # Jul-27: wound layouts fail closure on the RETURN ROUTE
@@ -472,12 +479,12 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
             getattr(base_env, 'target_family', 0))
 
     @staticmethod
-    def _history_turn_balance(base_env):
-        """min(left, right) turn-family pieces (mirrors env._turn_balance_count)."""
+    def _history_sbend_count(base_env):
+        """S-bend pieces in the history (mirrors env._sbend_count). They weave without
+        changing the heading, so the footprint classifier cannot see them -- the density
+        cap is the only thing that keeps them from padding a qualified build."""
         history = getattr(base_env.track_builder, 'history', [])
-        left = sum(1 for h in history if h.get('action') in LEFT_TURN_ACTIONS)
-        right = sum(1 for h in history if h.get('action') in RIGHT_TURN_ACTIONS)
-        return min(left, right)
+        return sum(1 for h in history if h.get('action') in SBEND_ACTIONS)
 
     @staticmethod
     def _history_has_steep_drop(base_env):
@@ -574,17 +581,21 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                         and getattr(base_env, 'track_length', 0) >= P.struct_length_target
                         and getattr(base_env, '_last_test_ok', False))
         if self.current_phase >= 6:
-            # "Style": completed, tested at the E floor, AND shaped like the family the
-            # episode's seed asked for. Aug-9: the fixed turns>=12 / balance>=2 legs are
-            # gone -- they were only ever a stand-in for "not the same rectangle again",
-            # and they contradict an oval/spiral/out-and-back seed outright. Mirrors
-            # env._qualifies' qualify_requires_family leg.
+            # "Style": completed, tested at the E floor, shaped like the family the
+            # episode's seed asked for, and not padded with S-bends. Aug-9: the fixed
+            # turns>=12 / balance>=2 legs are gone -- they were only ever a stand-in for
+            # "not the same rectangle again", and they contradict an oval/spiral/
+            # out-and-back seed outright. The S-bend density cap keeps the one thing
+            # turns>=12 blocked by accident (the Aug-6 farm), since the footprint
+            # classifier is blind to S-bends. Mirrors env._qualifies'
+            # qualify_requires_family + qualify_max_sbend legs.
             P = self._phase_reward_params(6)
             return bool(success
                         and getattr(base_env, '_last_test_ok', False)
                         and float(getattr(base_env, 'last_ride_excitement', 0.0))
                         >= P.qualify_min_excitement
-                        and self._history_family_hit(base_env))
+                        and self._history_family_hit(base_env)
+                        and self._history_sbend_count(base_env) <= P.qualify_max_sbend)
         if self.current_phase >= 5:
             # Quality diagnostic (does NOT gate the P5 length ladder, which stays on raw
             # cold success): completed, TESTED, and rated at least the middle milestone
@@ -957,10 +968,18 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
             # Aborted prefixes are infrastructure events, not agent outcomes: they must
             # not feed the frontier (a burst of aborts would demote k_max on noise).
             if not info.get('warm_aborted', False):
-                # The prefix descent may only shrink the opening seed when the seeded
-                # build actually wound (>= the pool's teaching level of heading turns),
-                # not merely when it closed -- see WarmStartAnnealer.record_outcome.
-                styled = self._history_turn_count(base_env) >= self.FLOOR_STYLE_MIN_TURNS
+                # The prefix descent may only shrink the opening seed when the build had
+                # the SHAPE this phase is teaching, not merely when it closed -- see
+                # WarmStartAnnealer.record_outcome. What "shape" means is phase-dependent,
+                # and the branch is load-bearing: phases whose reward still pays for turns
+                # keep the fixed turn-count bar bit-identical, while a seed-conditioned
+                # phase (qualify_requires_family, P6 only today) pays maximally at <=5
+                # turns on an oval seed -- there the turn bar would refuse to shrink the
+                # seed for a correctly built oval and the descent would stall forever.
+                if self._phase_reward_params(self.current_phase).qualify_requires_family:
+                    styled = self._history_family_hit(base_env)
+                else:
+                    styled = self._history_turn_count(base_env) >= self.FLOOR_STYLE_MIN_TURNS
                 self._annealer.record_outcome(self._current_plan, success, styled=styled)
             chain_count = self._history_chain_count(base_env)
             phase2_signals = None
