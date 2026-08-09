@@ -332,6 +332,13 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                 R_exc_milestone=100.0,
                 exc_milestone_bars=(2.5, 4.0, 5.5),
                 w_exc_feat=6.0,                   # dense per-piece excitement gradient
+                # Family reward ramp, last rung before P6 (see the P3 block's comment for
+                # the full rationale and the table): all 5 families are active here
+                # (PHASE_FAMILIES), the floor keeps loosening and the dense potential
+                # reaches its full P6 weight, but R_family/qualify_requires_family stay
+                # off -- P5 advances on its own length-ladder-on-cold-success predicate.
+                completion_family_floor=0.60,
+                w_family=6.0,
             )
         if phase == 2:
             if phase2_stage == 1:  # 2.1 climb-and-return: find the chain hill, no completion gate
@@ -419,6 +426,27 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                 # toward 25 is worth ~+30 (vs the ~-10 discount cost), and pay the phase
                 # gate itself as a discrete event.
                 completion_length_floor=0.25,
+                # Family reward, armed (Aug-9 gap fix): PHASE_FAMILIES already varies the
+                # seed from P3 onward (oval/spiral/out-and-back), but until now nothing in
+                # the reward read it, so the observation carried a one-hot that predicted
+                # nothing -- the "pure noise" PHASE_FAMILIES' own docstring says P1-2 must
+                # avoid. The spec's Phase-3 early read (non-zero, rising per-family hit
+                # rates by ~1 day of training) needs this armed to be measurable at all.
+                # Ramps with the track budget across P3/P4/P5 rather than switching on at
+                # full P6 strength, because P3/P4 are solved/tuned and a large completion
+                # share must not shift onto a skill they aren't teaching yet:
+                #   completion_family_floor: 0.85 (P3) -> 0.75 (P4) -> 0.60 (P5) -> 0.50 (P6)
+                #   w_family:                 3.0 (P3) ->  4.0 (P4) ->  6.0 (P5) ->  6.0 (P6)
+                # R_family stays 0 and qualify_requires_family stays False below P6 on
+                # purpose: R_family only pays post-test (P3 has no ride test yet, and P4/P5
+                # are tuned economies not worth re-balancing for this), and each of P3/4/5
+                # already has its own tuned advancement predicate that a family leg would
+                # change the meaning of. Per-family hit rates are still tracked every phase
+                # (episode_family_results) against whatever that phase's `qualified` means,
+                # which is what makes the early read readable without touching the gate.
+                # See docs/superpowers/specs/2026-08-09-seed-conditioned-coaster-variety-design.md.
+                completion_family_floor=0.85,
+                w_family=3.0,
                 R_qualify=200.0,
                 qualify_requires_energy=True,
                 R_roundtrip=100.0,
@@ -450,6 +478,12 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                 # bonus additionally requires the steep drop and the verified ride test,
                 # mirroring _is_qualified's P4 legs.
                 completion_length_floor=0.25,
+                # Family reward ramp, next rung after P3 (see the P3 block's comment for
+                # the full rationale and the table): floor loosens, weight rises, with the
+                # same two legs held off (R_family=0, qualify_requires_family=False) --
+                # verified-test economics here are already tuned around R_viable/R_qualify.
+                completion_family_floor=0.75,
+                w_family=4.0,
                 R_qualify=200.0,
                 qualify_requires_steep_drop=True,
                 qualify_requires_test=True,

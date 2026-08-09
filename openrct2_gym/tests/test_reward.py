@@ -742,12 +742,14 @@ def test_discovery_potential_off_in_phase1_and_5_on_in_phase2():
     phi_p5 = env._potential(W._phase_reward_params(5))   # discovery OFF
     assert phi_p2 > phi_p1 + 1.0                         # P2 gains the banked-elevation term
     # P5 has no discovery pull either; it differs from P1 by the route term (on in the
-    # completion phases 1-4, off in phase 5) and -- since the Jul-9 quality redesign --
-    # by the excitement-feature term (P5's own dense gradient).
+    # completion phases 1-4, off in phase 5), by the excitement-feature term (P5's own
+    # dense gradient, since the Jul-9 quality redesign), and -- since task 5b armed the
+    # family ramp in P3-5 (Aug-9) -- by the dense family-match potential (off in P1).
     p5 = W._phase_reward_params(5)
     route = W._phase_reward_params(1).w_route * env._route_progress()
     exc_feat = p5.w_exc_feat * env._exc_feature_quality(p5)
-    assert phi_p5 == pytest.approx(phi_p1 - route + exc_feat)
+    family = p5.w_family * env._family_match(p5)
+    assert phi_p5 == pytest.approx(phi_p1 - route + exc_feat + family)
 
 
 # ---- structural bonus
@@ -3637,9 +3639,12 @@ def test_family_gate_resets_between_episodes(monkeypatch):
 # reaching cold builds). w_family adds a THIRD consumer of _family_match: a dense
 # per-piece PBRS potential, so family progress pays every step instead of only at close.
 
-def test_family_potential_defaults_off_and_leaves_early_phases_identical():
+def test_family_potential_defaults_off_and_leaves_phase1_2_identical():
+    """Phases 1-2 pin the seed to family 0 (PHASE_FAMILIES) with no reward reading it, so
+    the potential must stay off there. Phases 3-5 arm it on a ramp -- see
+    test_family_ramp_phases_3_4_5_match_the_table (task 5b, Aug-9)."""
     assert RewardParams().w_family == 0.0
-    for phase in (1, 2, 3, 4, 5):
+    for phase in (1, 2):
         assert ImprovedPhasedCurriculumWrapper._phase_reward_params(phase).w_family == 0.0
 
 
@@ -3691,6 +3696,105 @@ def test_family_potential_streams_its_own_diagnostic(monkeypatch):
 
 
 def test_p6_reward_params_enable_family_potential():
-    """The only phase that consumes the dense family potential is P6."""
+    """P6 consumes the dense family potential at its full ramped-to weight (task 5b arms
+    the same potential, at a lower weight, in P3-5 -- see the ramp tests below)."""
     params = ImprovedPhasedCurriculumWrapper._phase_reward_params(6)
     assert params.w_family == 6.0
+
+
+# ------------------------------- family ramp, phases 3-5 (task 5b, Aug-9)
+# PHASE_FAMILIES already varies the episode's seed from P3 onward, but until this task
+# the entire family reward config (completion_family_floor / R_family /
+# qualify_requires_family / w_family) lived inside `if phase >= 6:` -- so P3-5 handed the
+# agent a one-hot that predicted nothing about its reward, exactly the "pure noise in the
+# observation" PHASE_FAMILIES' own docstring cites as the reason P1-2 pin the seed. This
+# also silently dropped the approved spec's Phase-3 early read (non-zero, rising per-
+# family hit rates by ~1 day of training -- the go/no-go gate before the full 3-5 day
+# retrain). See docs/superpowers/specs/2026-08-09-seed-conditioned-coaster-variety-design.md
+# and the task-5b brief's ramp table for the exact numbers asserted below.
+
+def test_family_reward_inert_in_phases_1_and_2():
+    """P1-2 stay exactly at the RewardParams() defaults (inert) for every phase-2
+    sub-stage -- PHASE_FAMILIES pins the seed to family 0 there precisely because
+    nothing may read it yet."""
+    W = ImprovedPhasedCurriculumWrapper
+    for phase, stage in [(1, 1), (2, 1), (2, 2), (2, 3)]:
+        p = W._phase_reward_params(phase, phase2_stage=stage)
+        assert p.completion_family_floor == 1.0
+        assert p.w_family == 0.0
+        assert p.R_family == 0.0
+        assert p.qualify_requires_family is False
+
+
+def test_family_ramp_phases_3_4_5_match_the_table():
+    """The ramp: floor loosens 0.85 -> 0.75 -> 0.60 as the budget widens, w_family rises
+    3.0 -> 4.0 -> 6.0, and R_family/qualify_requires_family stay off below P6 (each phase
+    keeps its own tuned advancement predicate; R_family pays only post-test, and P3 has
+    no ride test yet)."""
+    W = ImprovedPhasedCurriculumWrapper
+    table = {3: (0.85, 3.0), 4: (0.75, 4.0), 5: (0.60, 6.0)}
+    for phase, (floor, weight) in table.items():
+        p = W._phase_reward_params(phase)
+        assert p.completion_family_floor == floor
+        assert p.w_family == weight
+        assert p.R_family == 0.0
+        assert p.qualify_requires_family is False
+
+
+def test_family_ramp_p6_unchanged():
+    """Explicit values, not a delta -- so this task cannot silently retune the phase the
+    earlier family tasks already tuned."""
+    p6 = ImprovedPhasedCurriculumWrapper._phase_reward_params(6)
+    assert p6.completion_family_floor == 0.5
+    assert p6.w_family == 6.0
+    assert p6.R_family == 200.0
+    assert p6.qualify_requires_family is True
+
+
+def test_family_ramp_is_monotone_across_phases():
+    """The floor may only loosen and the potential weight may only rise as the phase
+    number rises (computed by iterating the phases, not by restating the table) --
+    catches a future edit to one phase that breaks the curriculum's shape."""
+    W = ImprovedPhasedCurriculumWrapper
+    phases = (1, 2, 3, 4, 5, 6)
+    floors = [W._phase_reward_params(p).completion_family_floor for p in phases]
+    weights = [W._phase_reward_params(p).w_family for p in phases]
+    assert all(a >= b for a, b in zip(floors, floors[1:]))
+    assert all(a <= b for a, b in zip(weights, weights[1:]))
+
+
+def test_qualify_requires_family_true_only_in_p6():
+    W = ImprovedPhasedCurriculumWrapper
+    for phase in (1, 2, 3, 4, 5):
+        assert W._phase_reward_params(phase).qualify_requires_family is False
+    assert W._phase_reward_params(6).qualify_requires_family is True
+
+
+def test_p3_family_gate_economics_seed_match_out_pays_mismatch():
+    """Phase-3 analogue of the P6 inversion tests above (test_oval_seed_beats_winding_
+    build_from_step_one and its mirror): even at P3's mild 0.85 floor -- only 15% of the
+    completion payout at stake -- matching the episode's seed must out-pay ignoring it."""
+    P3 = ImprovedPhasedCurriculumWrapper._phase_reward_params(3)
+    oval_rows = _p6_mix(n_right=4, n_left=0)                            # oval footprint,
+                                                                         # well past P3's
+                                                                         # height/drop/length bars
+    hit = _family_env(oval_rows, 0, P3)._calculate_reward(True, 0)      # seed asks oval
+    miss = _family_env(oval_rows, 3, P3)._calculate_reward(True, 0)     # seed asks winding
+    assert hit > miss
+
+
+def test_family_margin_ramps_stronger_at_p6_than_p3():
+    """A ramp, not a switch: the RELATIVE advantage of matching the seed must be strictly
+    larger at P6 (floor 0.5) than at P3 (floor 0.85). Without this assertion a later edit
+    that flattened the curriculum's shape (e.g. equalizing the floors) would go unnoticed
+    by the pairwise hit/miss tests above, which only check direction, not magnitude."""
+    P3 = ImprovedPhasedCurriculumWrapper._phase_reward_params(3)
+    P6 = ImprovedPhasedCurriculumWrapper._phase_reward_params(6)
+    oval_rows = _p6_mix(n_right=4, n_left=0)
+
+    def margin(params):
+        hit = _family_env(oval_rows, 0, params)._calculate_reward(True, 0)
+        miss = _family_env(oval_rows, 3, params)._calculate_reward(True, 0)
+        return hit / miss
+
+    assert margin(P6) > margin(P3)
