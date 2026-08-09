@@ -565,8 +565,11 @@ class OpenRCT2Env(gym.Env):
                 reward += self.reward_params.R_qualify
                 self._last_qualify_bonus = self.reward_params.R_qualify
             # Family bonus: building the footprint the seed asked for, as a paid discrete
-            # event -- but only on a ride that verifiably ran at the phase's quality floor,
-            # so "match the seed" can never be farmed by a cheap unrated shape.
+            # event -- but only on a ride that verifiably ran (_last_test_ok) at or above
+            # qualify_min_excitement, so "match the seed" can never be farmed by a cheap
+            # unrated shape. At P4/P5 qualify_min_excitement is 0.0 (only P6 sets it, to
+            # 4.5), so the excitement comparison is always satisfied there and the guard
+            # reduces to _last_test_ok alone.
             if (self.reward_params.R_family > 0.0 and self._family_hit()
                     and self._last_test_ok
                     and float(getattr(self, "last_ride_excitement", 0.0))
@@ -1487,8 +1490,11 @@ class OpenRCT2Env(gym.Env):
             # turn past the band gains w_exc_feat*(1/6)*(1/8) = 0.125 here and loses
             # w_family*0.5*(1/family_turn_falloff) = 1.5 -- so the net gradient already
             # points the right way, and re-aiming it at the seed is a retune of the whole
-            # excitement-feature potential, not a threshold fix. The balance leg below was
-            # NOT left: its arithmetic cancelled exactly.
+            # excitement-feature potential, not a threshold fix. The balance leg below is
+            # different: its TARGET was zeroed (struct_turn_balance_target=0.0 in P5/P6)
+            # because its arithmetic cancelled the family potential exactly -- but the
+            # comps ENTRY itself is deliberately still here, not deleted. See its comment
+            # below for why that matters.
             min(self._turn_count() / 8.0, 1.0),
             (min(self._banked_turn_count() / params.struct_banked_target, 1.0)
              if params.struct_banked_target > 0 else 0.0),
@@ -1501,6 +1507,15 @@ class OpenRCT2Env(gym.Env):
             # balance joined Jul-22: the winding opening must pay AT PLACEMENT (dense,
             # pre-completion) or cold builds never sample it -- the reliability deadlock:
             # jogging is EV-negative until cold winding is practiced, which needs jogs.
+            # In P5/P6 struct_turn_balance_target is 0.0 (Aug-9 final review: switches
+            # measure this better once the family potential is armed), so this comp
+            # always evaluates to the else-branch 0.0 there. It is DELIBERATELY LEFT IN
+            # `comps` rather than removed: removing it would shrink len(comps) from 6 to
+            # 5 and hand every remaining leg a bigger share of the mean. Leaving it as a
+            # standing 0.0 keeps the divisor at 6, so the dense excitement gradient
+            # (w_exc_feat/6 per leg) is permanently 1/6 weaker in P5/P6 than it would be
+            # with the dead leg pruned. That is intended, not an oversight -- it is the
+            # tax paid for handing the balance signal over to the family potential.
             (min(self._turn_balance_count() / params.struct_turn_balance_target, 1.0)
              if params.struct_turn_balance_target > 0 else 0.0),
         ]

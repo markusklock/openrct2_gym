@@ -646,8 +646,17 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
                         # reports the replayed exemplar's shape, not what the agent built,
                         # so (per the project's cold-only measurement rule) it is only
                         # meaningful -- and only recorded -- on cold (unaided) episodes.
+                        # Also gated on PHASE_FAMILIES[phase] being non-empty (same
+                        # convention as the family_hit_rate_{z} keys below): in P1/P2 the
+                        # seed is pinned to 0 and the reward never reads it, so an
+                        # ungated tag here would just read "cold completions that
+                        # classify as oval" -- approximately the completion rate -- under
+                        # a name that claims to measure family matching.
+                        _phase_for_family = _info.get('learning_phase')
                         if (self.locals['infos'][env_idx].get('cold_start')
-                                and 'family_hit' in info_metrics):
+                                and 'family_hit' in info_metrics
+                                and ImprovedPhasedCurriculumWrapper.PHASE_FAMILIES.get(
+                                    _phase_for_family)):
                             self.logger.record('structure/family_hit_cold',
                                                info_metrics['family_hit'])
                         if 'qualify_bonus' in info_metrics:

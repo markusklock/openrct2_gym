@@ -2183,13 +2183,24 @@ def test_harvest_stamps_prefix_len(monkeypatch, tmp_path):
 # ------------------------------- per-phase family sets (Aug-9 seed conditioning)
 
 def test_phase_family_sets_widen_with_the_track_budget():
+    """Pre-launch re-measurement (final re-review): spiral is a ~100-piece shape (0
+    direction switches on a closed circuit forces a turn count multiple of 4, so the
+    6-9 turn band means exactly 8 same-handed 90-degree turns). Against the 196,058-
+    record deployment library, only 1 of 894 spiral records fits P3's budget (<=58) and
+    only 1 fits P4's (<=78) -- so spiral is deferred to P5, where its median length
+    (102) sits inside the 80-120 range. Winding (8/13,950 fit P3; 592 fit P4) leaves P3
+    but stays at P4. Out-and-back stays at P3: 194 verified loops fit the budget."""
     W = ImprovedPhasedCurriculumWrapper
     assert W.PHASE_FAMILIES[1] == ()          # 40 pieces: too tight to express shape
     assert W.PHASE_FAMILIES[2] == ()
-    assert W.PHASE_FAMILIES[3] == (0, 1, 2)   # oval, spiral, out-and-back
-    assert W.PHASE_FAMILIES[4] == (0, 1, 2, 3)
-    assert W.PHASE_FAMILIES[5] == (0, 1, 2, 3, 4)
+    assert W.PHASE_FAMILIES[3] == (0, 2)      # oval, out-and-back (spiral/winding don't fit)
+    assert W.PHASE_FAMILIES[4] == (0, 2, 3)   # + winding (spiral still doesn't fit)
+    assert W.PHASE_FAMILIES[5] == (0, 1, 2, 3, 4)   # spiral's median (102) fits 80-120
     assert W.PHASE_FAMILIES[6] == (0, 1, 2, 3, 4)
+
+    assert 1 not in W.PHASE_FAMILIES[3]       # spiral absent from P3
+    assert 1 not in W.PHASE_FAMILIES[4]       # spiral absent from P4
+    assert 1 in W.PHASE_FAMILIES[5]           # spiral first appears at P5
 
 
 def test_wrapper_sets_the_target_family_on_the_base_env_before_reset(monkeypatch, tmp_path):

@@ -3831,15 +3831,25 @@ def test_family_margin_ramps_stronger_at_p6_than_p3():
 #
 # THE COST MODEL, stated:
 #   * extra pieces -- FAMILY_EXTRA_PIECES below. The near-band footprints need 4-10 more
-#     pieces than the 4-turn oval (final-fix-brief.md, Fix 1). 9 is used: it is inside
-#     that measured range and it is the largest value P3's repaired margin (75 points at
-#     its deliberately mild 0.85 floor -- the brief leaves P3's floor alone) still covers,
-#     so the assertion states exactly how much build cost the repaired gate can buy.
+#     pieces than the 4-turn oval (final-fix-brief.md, Fix 1).
 #   * cost per piece -- the gamma discount of one extra build step, (1 - gamma) * payout.
 #     Derived from the phase's own payout rather than hardcoded; it lands at 7.8-10.2
 #     points here, matching CLAUDE.md's recorded "~-10/piece gamma-discount of the
 #     completion payout" from the Jul-5 length-trap diagnosis.
-FAMILY_EXTRA_PIECES = 9
+#
+# Pre-launch final re-review: the prior value (9) was chosen as "the largest value P3's
+# repaired margin still covers" -- a constant fitted to the result it certifies proves
+# nothing, and at 10 (still inside the 4-10 range above) the old P3 spiral assertion
+# failed outright (spiral was never closable in P3's budget at all -- see PHASE_FAMILIES,
+# now fixed by moving spiral to P5/P6 and re-aiming P3 at out-and-back, which it actually
+# offers). This bar covers ONLY the gamma discount of the extra pieces -- it deliberately
+# EXCLUDES closure risk, which the re-review measured as the dominant term the agent
+# actually weighs. 12 is comfortably above the 4-10 range the design discussed; every
+# phase below still clears it with room (P3/family 2: margin 112.5 vs bar 93.0, headroom
+# 19.5; P4/family 3: margin 325.0 vs bar 106.5; P5/family 3-4: margin 509.0 vs bar 122.4;
+# P6/family 3-4: margin 880.0 vs bar 138.9 -- narrowest at P3, as expected from its mild
+# 0.85 floor, but still clearing).
+FAMILY_EXTRA_PIECES = 12
 
 
 def _family_fixture(z):
@@ -3952,7 +3962,7 @@ def test_family_ramp_arms_r_family_at_p4_and_p5():
     assert all(a <= b for a, b in zip(bonuses, bonuses[1:]))
 
 
-def test_r_family_cannot_break_completion_first_in_p4_p5():
+def test_r_family_cannot_break_completion_first_in_p4_p5(monkeypatch):
     """R_family is paid inside step()'s completion-and-tested branch, so it can only ever
     ADD to the completion side of the completion-first inequality (climb milestones must
     stay below what closing the loop pays). Checked here with the numbers, not assumed."""
@@ -3967,14 +3977,45 @@ def test_r_family_cannot_break_completion_first_in_p4_p5():
         # P4 sets completion_hill_floor=0.0, so only the first check binds there (see
         # _validate_completion_first); P5's floors are all >= its own milestone total.
         assert p.completion_hill_floor == 0.0 or milestones < flat
-    # An unclosed episode never reaches the R_family branch at all: it is guarded by
-    # loop_completed (the terminal branch), _last_test_ok AND the family hit.
-    P5 = W._phase_reward_params(5)
-    env = _family_env(_family_fixture(0), 0, P5)
-    env._last_test_ok = False
-    assert P5.R_family > 0.0
-    assert env._calculate_reward(True, 0) == pytest.approx(
-        _family_env(_family_fixture(0), 0, P5)._calculate_reward(True, 0))
+    # Fix 3 (Aug-9 final review): the OLD version of this section called
+    # env._calculate_reward(True, 0) on two COMPLETED episodes -- a branch that never
+    # reads R_family at all (R_family is paid at openrct2_env.py:570, inside `if
+    # terminated:`, which sits in step(), one level above _calculate_reward) -- so the
+    # comparison held for EVERY value of R_family and could never fail. This instead
+    # drives a real step()-level TRUNCATED episode whose partial build already matches
+    # the seed (a guaranteed _family_hit()), and checks the actual payment site: the
+    # reward must come out identical whether R_family is armed or zeroed, and the
+    # _last_family_bonus / episode_metrics 'family_bonus' tag must read exactly 0.0. It
+    # fails immediately if R_family's payment is ever moved outside the completion
+    # branch (verified below: monkeypatching it onto the truncation path flips this
+    # test red while leaving the old completed-vs-completed comparison unmoved).
+    monkeypatch.setattr(oe_mod, "APIController", FakeAPI)   # never completes the circuit
+
+    def _run_truncated(params):
+        env = OpenRCT2Env(verbose=0)
+        env.skip_ride_testing = True
+        env.reward_params = params
+        env.reset()
+        env.target_family = 0                            # oval: <= 5 turns, 0 switches
+        env.max_track_length = 4
+        for _ in range(3):
+            env.step(4)                                  # right turns, one handedness
+        _, reward, terminated, truncated, info = env.step(4)
+        assert truncated and not terminated
+        assert env.loop_completed is False
+        assert env._family_hit() is True                 # would be a hit, WERE it read
+        return reward, env, info
+
+    for phase in (4, 5):
+        p = W._phase_reward_params(phase)
+        assert p.R_family > 0.0                          # the branch is actually armed here
+        armed_reward, armed_env, armed_info = _run_truncated(p)
+        zeroed_reward, _, _ = _run_truncated(replace(p, R_family=0.0))
+        assert armed_env._last_family_bonus == 0.0
+        assert armed_info['episode_metrics']['family_bonus'] == 0.0
+        assert armed_reward == pytest.approx(zeroed_reward), (
+            f"phase {phase}: truncation reward changed with R_family armed -- it must "
+            "only be reachable through the completion (terminated) branch")
 
 
 # --------------------------------------------------- Fix 3 (Aug-9 final review): the

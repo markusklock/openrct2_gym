@@ -178,8 +178,30 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
     # Families the seed may request, per phase. Widens with the track budget: a
     # 40-piece build cannot express a serpentine. Phases 1-2 pin the seed to 0 so
     # the observation input is constant rather than noise while its reward is off.
+    #
+    # MEASURED, not guessed (pre-launch final re-review): the length distribution of
+    # every family in the 196,058-record deployment library, checked against each
+    # phase's pool budget (pool() admits length <= max_len - 2, so P3 <= 58, P4 <= 78):
+    #
+    #   family          records   min  median  max   fit P3 (<=58)  fit P4 (<=78)
+    #   0 oval          148,511     6      70  118         25,595        129,597
+    #   1 spiral            894     40     102  115              1              1
+    #   2 out_and_back   29,235      8      74  117            194         18,403
+    #   3 winding        13,950     15      88  116              8            592
+    #   4 serpentine         63     76      98  102              0             10
+    #
+    # Spiral is a ~100-piece shape: 0 direction switches on a closed circuit forces a
+    # turn count that is a multiple of 4, so its 6-9 turn band means exactly 8 same-
+    # handed 90-degree turns -- two full revolutions that still have to return to the
+    # dock. A phase's family set includes a shape only when the library shows it is
+    # closable inside that phase's budget; a floor/weight retune cannot substitute for
+    # a shape the budget cannot express. Spiral therefore leaves P3 and P4 (1 of 894
+    # fits either budget) and first appears at P5, where its median 102 sits inside the
+    # 80-120 range. Winding leaves P3 (8 of 13,950 fit) but stays at P4 (592 fit).
+    # Out-and-back stays at P3: 194 verified loops fit the budget, so the shape is
+    # demonstrably achievable there.
     PHASE_FAMILIES = {
-        1: (), 2: (), 3: (0, 1, 2), 4: (0, 1, 2, 3), 5: (0, 1, 2, 3, 4),
+        1: (), 2: (), 3: (0, 2), 4: (0, 2, 3), 5: (0, 1, 2, 3, 4),
         6: (0, 1, 2, 3, 4),
     }
 
@@ -1174,10 +1196,11 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
             # where the seed is pinned to 0 and family_hit is reward-inert noise; bool()
             # collapses that to False rather than letting a bare None poison the window.
             z = int(base_env.target_family)
-            # NOTE: whole-track predicate (mirrors env._family_hit, openrct2_env.py:1533-
-            # 1536), not the suffix-only variant _is_qualified uses for P6's gate. On a
-            # warm episode this reports the scaffold's shape, not the agent's -- read it
-            # together with `cold_start`.
+            # NOTE: this is env._family_hit() (openrct2_env.py:1568-1571) ANDed with
+            # loop_completed -- not the suffix-only variant _is_qualified uses for P6's
+            # gate -- so a truncated build that happens to classify into the seed's
+            # family reads 0 here, not a false hit. On a warm episode this reports the
+            # scaffold's shape, not the agent's -- read it together with `cold_start`.
             family_hit = bool(info.get('episode_metrics', {}).get('family_hit', 0.0))
             if cold:
                 self.episode_family_results[z].append(bool(family_hit and qualified))

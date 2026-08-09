@@ -1212,6 +1212,42 @@ def test_callback_logs_family_hit_cold_only():
     assert 'structure/family_hit_cold' not in _step(cold=False)
 
 
+def test_callback_withholds_family_hit_cold_when_phase_has_no_family(monkeypatch):
+    """Fix 4.4 (pre-launch final re-review): P1/P2 pin the seed to family 0
+    (PHASE_FAMILIES[phase] == ()) with no reward reading it, so an ungated cold
+    family_hit tag there would just read 'cold completions that classify as oval' --
+    approximately the completion rate -- under a name that claims to measure family
+    matching. The key must be withheld entirely (not logged as a misleading value) on a
+    cold, completed episode in a phase with no active family set, matching the
+    convention family_hit_rate_{z}/family_n_{z} already use."""
+    from types import SimpleNamespace
+
+    def _step(phase):
+        cb = T.ParallelCurriculumMaskableCallback(n_envs=1)
+        cb.model = SimpleNamespace(target_kl=None, ent_coef=0.01, get_env=lambda: None)
+        store = {}
+        cb.model.logger = SimpleNamespace(
+            name_to_value={}, record=lambda k, v, *a, **kw: store.__setitem__(k, v))
+        cb.locals = {
+            'dones': [True],
+            'infos': [{'loop_completed': True, 'cold_start': True, 'learning_phase': phase,
+                       'track_length': 20, 'current_distance': 0.0, 'collision_count': 0,
+                       'target_family': 0,
+                       'episode_metrics': {
+                           'track_length': 20, 'min_distance': 0.0, 'family_hit': 1.0}}],
+        }
+        cb._on_step()
+        return store
+
+    assert T.ImprovedPhasedCurriculumWrapper.PHASE_FAMILIES[1] == ()
+    assert 'structure/family_hit_cold' not in _step(phase=1)
+    assert T.ImprovedPhasedCurriculumWrapper.PHASE_FAMILIES[2] == ()
+    assert 'structure/family_hit_cold' not in _step(phase=2)
+    # Guard against the null fix (withholding it everywhere): P6 still gets it.
+    assert T.ImprovedPhasedCurriculumWrapper.PHASE_FAMILIES[6] != ()
+    assert _step(phase=6)['structure/family_hit_cold'] == pytest.approx(1.0)
+
+
 def test_callback_logs_warm_family_narrowed_only_when_requested():
     """warm_family_requested is None when the phase requested no family (phases 1-2);
     the narrowed tag's mere presence must mean 'a family was requested', so it must be
