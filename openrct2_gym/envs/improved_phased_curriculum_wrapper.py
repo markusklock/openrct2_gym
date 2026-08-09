@@ -273,6 +273,11 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                                                   # observed farm (8) stays blocked.
                 qualify_requires_test=True,
                 w_exc_feat=6.0,
+                w_family=6.0,  # dense per-piece pull toward the seed's requested family
+                               # (Aug-9): the completion gate + R_family bonus are both
+                               # terminal-only, and terminal-only shaping has repeatedly
+                               # been too slow here (this style gate itself ran ~900k
+                               # steps without reaching cold builds).
                 w_route=3.0,   # Jul-27: wound layouts fail closure on the RETURN ROUTE
                                # (cold winding attempts truncate; rectangles never do).
                                # The P1-4 angular-progress potential taught exactly that

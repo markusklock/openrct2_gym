@@ -3628,3 +3628,68 @@ def test_family_gate_resets_between_episodes(monkeypatch):
     assert env._last_family_gate > 0.0
     env.reset()
     assert env._last_family_gate == 0.0 and env._last_family_match == 0.0
+
+
+# ---------------------------------------------------------------- dense family potential
+# Terminal-only shaping (the family completion gate + qualify bonus above) has repeatedly
+# been too slow to discover in this project (the style gate ran ~900k steps without
+# reaching cold builds). w_family adds a THIRD consumer of _family_match: a dense
+# per-piece PBRS potential, so family progress pays every step instead of only at close.
+
+def test_family_potential_defaults_off_and_leaves_early_phases_identical():
+    assert RewardParams().w_family == 0.0
+    for phase in (1, 2, 3, 4, 5):
+        assert ImprovedPhasedCurriculumWrapper._phase_reward_params(phase).w_family == 0.0
+
+
+def test_family_potential_rises_toward_the_requested_family():
+    """Terminal-only shaping has been consistently too slow here (the style gate ran
+    ~900k steps without reaching cold builds), so family progress pays per piece."""
+    params = replace(RewardParams(), w_family=6.0)
+    near = _bare_env(history=_env_hist([(4, 14, 14)] * 4))       # 4 turns: oval band
+    far = _bare_env(history=_env_hist([(4, 14, 14)] * 12))       # 12 turns: way outside
+    near.target_family = 0
+    far.target_family = 0
+    assert near._potential(params) > far._potential(params)
+
+
+def test_family_potential_telescopes_as_a_state_function():
+    """PBRS requires Phi to depend only on state, so place-then-remove must not pay.
+
+    The appended piece must actually move the match, or this test would pass for an
+    implementation that ignores the family entirely. The history is 3 RIGHT turns
+    (action 4) -- already a full oval match (3 turns in [0,5], 0 switches in [0,0], so
+    family_match == 1.0). Appending another RIGHT turn keeps turns in-band and switches
+    at 0, so Phi would not move. Appending a LEFT turn (action 1) instead introduces one
+    direction switch (R,R,R,L), pushing switches out of the oval's [0,0] band and
+    dropping family_match to 0.5*(1.0 + (1 - 1/3)) = 0.8333 -- a real, verifiable change.
+    """
+    params = replace(RewardParams(), w_family=6.0)
+    env = _bare_env(history=_env_hist([(4, 14, 14)] * 3))
+    env.target_family = 0
+    before = env._potential(params)
+    env.track_builder.history.append(
+        {"action": 1, "position": [9, 0, 14], "next_position": [10, 0, 14]})
+    assert env._potential(params) != pytest.approx(before)
+    env.track_builder.history.pop()
+    assert env._potential(params) == pytest.approx(before)
+
+
+def test_family_potential_streams_its_own_diagnostic(monkeypatch):
+    """House rule: every new reward gate/potential streams its own diagnostic."""
+    monkeypatch.setattr(oe_mod, "APIController", CompletingAPI)
+    env = OpenRCT2Env(verbose=0)
+    env.reward_params = replace(RewardParams(), w_family=6.0, roundtrip_gain=0.0)
+    env.reset()
+    env.target_family = 0
+    _, _, terminated, _, info = _drive_to_terminal(env)
+    assert terminated
+    m = info['episode_metrics']
+    assert m['family_potential'] == pytest.approx(
+        env.reward_params.w_family * env._family_match(env.reward_params))
+
+
+def test_p6_reward_params_enable_family_potential():
+    """The only phase that consumes the dense family potential is P6."""
+    params = ImprovedPhasedCurriculumWrapper._phase_reward_params(6)
+    assert params.w_family == 6.0

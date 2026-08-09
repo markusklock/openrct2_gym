@@ -77,6 +77,15 @@ class RewardParams:
     # state function of the removal-safe history -> PBRS-clean. 0 disables (phases 1-4:
     # their own discovery/structure terms already own those gradients).
     w_exc_feat: float = 0.0
+    # --- Family-match potential (P6; the third consumer of _family_match, after the
+    # completion gate and the discrete R_family bonus) ---
+    # Dense per-piece credit for progressing toward the seed's requested footprint
+    # family. Pure state function of the build history (_family_match scores the WHOLE
+    # track) -> telescopes, PBRS-clean. Terminal-only shaping has repeatedly been too
+    # slow in this project (the style gate ran ~900k steps without reaching cold
+    # builds), so family progress pays every step instead of only at completion.
+    # 0 disables (phases 1-5 default; unchanged behavior).
+    w_family: float = 0.0
     # --- Sparse real objectives ---
     R_complete: float = 1000.0     # fixed completion bonus across all phases
     R_quality_max: float = 0.0     # 0 disables quality (phases 1-4); 500 in phase 5
@@ -615,6 +624,8 @@ class OpenRCT2Env(gym.Env):
                 'exc_feat_potential': float(
                     self.reward_params.w_exc_feat
                     * self._exc_feature_quality(self.reward_params)),
+                'family_potential': float(
+                    self.reward_params.w_family * self._family_match(self.reward_params)),
                 'max_gain': max((h['next_position'][2] - self.STATION_HEIGHT
                                  for h in self.track_builder.history), default=0.0),
                 'track_length': self.track_length,
@@ -1267,6 +1278,11 @@ class OpenRCT2Env(gym.Env):
         # function of the removal-safe history + track_length -> telescopes.
         if params.w_exc_feat > 0.0:
             phi += params.w_exc_feat * self._exc_feature_quality(params)
+        # Family-match term (P6): dense per-piece gradient toward the seed's requested
+        # footprint family -- the same _family_match the completion gate and R_family
+        # bonus consume, scored on the whole removal-safe history -> telescopes.
+        if params.w_family > 0.0:
+            phi += params.w_family * self._family_match(params)
         # Descent/return shaping: 0 at/above the summit (no double-pay), rising on the way home.
         phi += self._return_potential(params)
         # Steep, local near-closure FUNNEL: ramps to w_close only in the final close_range tiles at
