@@ -13,13 +13,15 @@ never cross the remaining rating-cap legs together. Run with training STOPPED:
 import argparse
 
 from openrct2_gym.envs.api_controller import APIController
+from openrct2_gym.envs.footprint import classify_family
 from openrct2_gym.envs.warm_start import (
-    LoopLibrary, LoopRecord, generate_p5_candidates, generate_p6_candidates)
+    LoopLibrary, LoopRecord, generate_p5_candidates, generate_p6_candidates,
+    generate_serpentine_candidates)
 from build_loop_library import replay
 from probe_measurements import poll_stats
 
 
-def main():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Seed live-tested P5 quality exemplars")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--library", type=str, default="logs/loop_library.jsonl")
@@ -31,12 +33,22 @@ def main():
     parser.add_argument("--only-longer-than", type=int, default=0,
                         help="Skip skeletons at or under this length (re-runs test only "
                              "the new bigger families)")
-    parser.add_argument("--family", choices=("p5", "p6"), default="p5",
-                        help="Candidate family: p5 quality rectangles or p6 winding style")
+    parser.add_argument("--family", choices=("p5", "p6", "serpentine"), default="p5",
+                        help="Candidate family: p5 quality rectangles, p6 winding style, "
+                             "or serpentine (thin family 4 -- see footprint.FAMILIES)")
     parser.add_argument("--min-single-drop", type=float, default=0.0,
                         help="Skip skeletons whose static max single drop is below this "
                              "(isolates a new hill family on incremental rounds)")
-    args = parser.parse_args()
+    parser.add_argument("--footprint-family", type=int, default=None,
+                        help="Skip any candidate whose REPLAYED, verified action list "
+                             "does not classify into this footprint family index "
+                             "(footprint.FAMILIES) -- applied to what was actually "
+                             "placed, not the pre-replay skeleton")
+    return parser.parse_args(argv)
+
+
+def main():
+    args = parse_args()
 
     api = APIController("localhost", args.port, verbose=0)
     if not api.connect():
@@ -49,7 +61,8 @@ def main():
 
     tested = added = 0
     best_seen = 0.0
-    generator = generate_p6_candidates if args.family == "p6" else generate_p5_candidates
+    generators = {"p6": generate_p6_candidates, "serpentine": generate_serpentine_candidates}
+    generator = generators.get(args.family, generate_p5_candidates)
     for skeleton in generator():
         if len(skeleton) <= args.only_longer_than:
             continue
@@ -60,6 +73,12 @@ def main():
             continue
         placed2, closed2, gain2 = replay(api, placed)          # reproducibility contract
         if not (closed2 and placed2 == placed):
+            continue
+        # Filter on what was actually PLACED (the replayed, verified sequence) -- the
+        # seeder records `placed` into the library, so filtering the pre-replay skeleton
+        # would filter the wrong thing.
+        if (args.footprint_family is not None
+                and classify_family(placed) != args.footprint_family):
             continue
         api.place_entrance_exit()
         api.start_ride_test()

@@ -441,6 +441,40 @@ def test_generate_p6_candidates_wind_both_ways():
         assert runs >= 2
 
 
+def test_generate_serpentine_candidates_are_serpentine_shaped():
+    """Family 4 (serpentine: 14+ turns, 6+ switches -- footprint.FAMILIES) had 63 measured
+    exemplars against oval's ~148k: thin enough that P6's winding fix (family 3, two jog
+    pairs) does not carry it, and no other generator ever emits the shape. Three/four
+    canceling jog-pairs (P6's own construction, extended) push turns/switches past P6's
+    12-turn/4-switch ceiling and into the serpentine bands.
+
+    The `straights < 8` guard is the documented failure mode here: if the piece budgets
+    were too tight for the extra jogs, every candidate would be filtered out and the
+    generator would silently return []/near-empty -- which would pass every test below
+    except the explicit non-emptiness assertion, so that assertion comes first."""
+    from openrct2_gym.envs.footprint import switch_count
+    from openrct2_gym.envs.track_pieces import TURN_ACTIONS
+    from openrct2_gym.envs.warm_start import generate_serpentine_candidates
+
+    cands = generate_serpentine_candidates()
+    assert len(cands) >= 8, f"generator returned only {len(cands)} candidates"
+
+    for c in cands:
+        assert classify_family(c) == 4, c            # every candidate, not "most"
+
+    # Spot-check turns/switches directly against the real bands (footprint.FAMILIES[4]
+    # is (14, None, 6, None)) so a future change to the band definitions fails loudly
+    # here rather than only inside classify_family.
+    sample = cands[0]
+    turns = sum(1 for a in sample if a in TURN_ACTIONS)
+    switches = switch_count(sample)
+    assert turns >= 14
+    assert switches >= 6
+
+    lengths = {len(c) for c in cands}
+    assert len(lengths) >= 2                          # more than one shape bin
+
+
 def test_loop_record_turn_and_sbend_properties():
     rec = LoopRecord.from_actions([4, 4, 0, 3, 29, 30, 0, 4, 4], "scripted")
     assert rec.turn_count == 5                               # 4,4,3,4,4 (S-bends excluded)
@@ -2331,3 +2365,34 @@ def test_family_hit_lands_in_the_drawn_familys_bucket_only(monkeypatch, tmp_path
     assert info['target_family'] == 1
     assert info['family_n_1'] == 1
     assert info['family_n_0'] == 1                      # untouched by the second episode
+
+
+# ---------------------------------------------- seed_p5_exemplars.py CLI (task 8, Fix 2)
+
+def test_seed_p5_exemplars_cli_exposes_family_and_footprint_flags(monkeypatch):
+    """--family already existed (choices p5/p6); this only adds "serpentine" to it and
+    introduces a SEPARATE --footprint-family int flag (default None) that filters the
+    seeder's output by footprint shape. Follows run_model.py's add_argument-spy pattern
+    (test_run_model.py::test_cli_exposes_showcase_flags) since this script has none of
+    its own CLI-surface tests yet."""
+    import argparse
+    import seed_p5_exemplars as S
+
+    seen = []
+    real_add = argparse.ArgumentParser.add_argument
+
+    def spy(self, *a, **kw):
+        seen.append((a, kw))
+        return real_add(self, *a, **kw)
+
+    monkeypatch.setattr(argparse.ArgumentParser, "add_argument", spy)
+    args = S.parse_args(["--port", "8080"])
+
+    by_flag = {a[0]: kw for a, kw in seen if a and isinstance(a[0], str)}
+    assert "serpentine" in by_flag["--family"]["choices"]
+    assert "p5" in by_flag["--family"]["choices"] and "p6" in by_flag["--family"]["choices"]
+    assert by_flag["--footprint-family"]["type"] is int
+    assert by_flag["--footprint-family"]["default"] is None
+
+    assert args.family == "p5"                          # unchanged default
+    assert args.footprint_family is None

@@ -703,6 +703,68 @@ def generate_p6_candidates():
     return out
 
 
+def generate_serpentine_candidates():
+    """Serpentine exemplars for the pool: the same P6 cap-passing hill core carried by
+    the same canceling jog-pairs (``jog_out``/``jog_back``), but THREE or FOUR out-back
+    pairs instead of P6's two.
+
+    Family 4 (serpentine: 14+ turns, 6+ direction switches -- footprint.FAMILIES) had
+    only 63 measured exemplars against oval's ~148k in the live 196,058-record archive
+    -- thin enough that P6's winding fix (family 3, two jog pairs) does not carry it,
+    and no other generator ever emits the shape. Two out-back pairs top out at 12 turns
+    / 4 switches (P6's own ceiling, one short of serpentine's bar on both axes); a THIRD
+    pair lands at 16 turns / 6 switches (clears both, exactly at the switch floor); a
+    FOURTH lands at 20 turns / 8 switches (comfortable margin). Each extra out-back pair
+    costs 2*JOG_X more straight-tile budget than P6's fixed two pairs, so the piece
+    ladder is raised accordingly -- otherwise every candidate is eaten by the
+    `straights < 8` guard and the generator silently returns nothing.
+
+    Same hill core, same JOG_X lateral budget per jog, same east/block/straights
+    arithmetic and the same guards as generate_p6_candidates -- only the jog-pair count
+    and the piece budgets differ. Live closure-scan verification via the seeding script
+    remains the geometry authority, as for every earlier family.
+    """
+    out = []
+    climb = [10, 9, 9, 9, 9, 9, 9, 13]
+    main_drop = [12, 27, 28, 6, 6, 14]
+    reclimb, drop2 = [11, 5, 13], [12, 6, 14]
+    hop = [11, 5, 13, 12, 6, 14]
+    jog_out, jog_back = [4, 0, 3], [3, 0, 4]        # right-out / left-back (canceling)
+    JOG_X = 5                                        # approx x-tiles per jog (live-verified)
+    for n_pairs in (3, 4):
+        # p6's 2 pairs use straights = p - 4*JOG_X; each extra pair adds 2*JOG_X more.
+        for p in (40, 44, 48, 52, 56, 60, 64, 68, 72):
+            east = 7 + p
+            for hops in (0, 1, 2):
+                block = (len(climb) + len(main_drop) + len(hop) * hops
+                         + len(reclimb) + len(drop2))
+                if block > east:
+                    continue
+                for s_pairs in (0, 1):
+                    straights = p - 2 * n_pairs * JOG_X - 4 * s_pairs
+                    if straights < 8:
+                        continue
+                    gaps = 2 * n_pairs - 1           # slots between the jog segments
+                    a = straights // gaps
+                    b = max(0, straights - a * (gaps - 1) - 2)
+                    approach = [0, 0]
+                    for i in range(2 * n_pairs):
+                        approach += jog_out if i % 2 == 0 else jog_back
+                        if i < 2 * n_pairs - 1:
+                            approach += [0] * a
+                    approach += [29, 30] * s_pairs + [0] * b
+                    for mid in sorted({0, east - block}):
+                        rest = east - block - mid
+                        if rest < 0 or mid < 0:
+                            continue
+                        out.append(approach + [4, 4]
+                                   + climb + [0] * mid + main_drop
+                                   + hop * hops
+                                   + reclimb + drop2 + [0] * rest
+                                   + [4, 4])
+    return out
+
+
 def generate_hill_candidates():
     """Racetrack skeletons with a balanced chain climb on the east leg for the Phase-2 pool.
 
