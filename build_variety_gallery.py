@@ -106,9 +106,14 @@ def format_summary_table(rows):
     for r in rows:
         status = "closed" if r["closed"] else "did not close"
         match = "HIT" if r["hit"] else "MISS"
+        # POSITIVE ratings only: the unrated sentinel (-0.01) is returned by the API when
+        # a ride closes but the post-test rating poll times out. Only positive excitement
+        # values are real measured ratings; non-positive values must render as 'unrated'
+        # to avoid misleading the user (the project convention per openrct2_env.py:550).
+        excitement_str = f"{r['excitement']:>6.2f}" if r['excitement'] > 0 else "unrated"
         lines.append(
             f"{r['requested']:<12}{r['built']:<12}{match:<6}{status:<14}"
-            f"{r['excitement']:>6.2f}  {r['pieces']:>6d}")
+            f"{excitement_str:>6s}  {r['pieces']:>6d}")
     return "\n".join(lines)
 
 

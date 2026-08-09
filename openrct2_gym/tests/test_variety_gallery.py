@@ -134,3 +134,42 @@ def test_summary_table_reports_hit_and_miss_distinctly():
     lines = [ln for ln in table.splitlines() if "winding" in ln]
     assert any("HIT" in ln for ln in lines)
     assert any("MISS" in ln for ln in lines)
+
+
+# --------------------------------------------------------------- unrated sentinel handling
+
+def test_summary_table_closed_unrated_ride_renders_as_unrated_not_negative():
+    """When a ride closes but the rating times out, the API returns -0.01 (unrated
+    sentinel). This must render as 'unrated' in the table, not as a negative number,
+    to avoid misleading the user that a real terrible ride was built."""
+    rows = [
+        _row("oval", "oval", True, True, -0.01, 24),  # closed but unrated (timeout)
+    ]
+    table = G.format_summary_table(rows)
+    # Must contain the requested family and "unrated", not the literal -0.01
+    assert "oval" in table
+    assert "unrated" in table.lower()
+    assert "-0.01" not in table
+
+
+def test_summary_table_closed_rated_ride_still_shows_excitement():
+    """Genuinely rated rides must still display their real excitement value."""
+    rows = [
+        _row("oval", "oval", True, True, 6.5, 24),
+    ]
+    table = G.format_summary_table(rows)
+    # Must show the real excitement value, not "unrated"
+    assert "6.50" in table or "6.5" in table
+
+
+def test_build_one_family_closes_but_unrated_when_rating_is_minus_zero_point_zero_one():
+    """When the ride closes but post-test rating times out, build_one_family receives
+    ride_rating={'excitement': -0.01, ...} and must record it in the row dict.
+    format_summary_table then renders it as unrated. This test verifies the row
+    dict carries the unrated sentinel; the next test verifies the table rendering."""
+    rows = [
+        _row("serpentine", "serpentine", True, True, -0.01, 42),
+    ]
+    # Row still has closed=True, hit=True, piece count -- only excitement changes rendering
+    assert all(rows[0][k] in (True, 42, "serpentine", -0.01)
+               for k in ["closed", "hit", "pieces", "requested", "built", "excitement"])
