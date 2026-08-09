@@ -20,6 +20,7 @@ from dataclasses import dataclass
 
 CHAIN_ACTIONS = (9, 10)          # matches openrct2_env / api_track_builder chain-lift actions
 STEEP_ACTIONS = (8, 27, 28)      # 60-degree family (matches env._steep_drop_z / P4's gate leg)
+from openrct2_gym.envs.footprint import classify_family
 from openrct2_gym.envs.track_pieces import SBEND_ACTIONS, TURN_ACTIONS  # noqa: F401
 
 # Static per-action z geometry (live-verified via the base-z offset probes): descents drop
@@ -102,6 +103,12 @@ class LoopRecord:
     @property
     def sbend_count(self):
         return sum(1 for a in self.actions if a in SBEND_ACTIONS)
+
+    @property
+    def family(self):
+        """Footprint family index, or None when the shape fits no family. Derived, so
+        every legacy record gets it on load with no schema migration."""
+        return classify_family(self.actions)
 
 
 class LoopLibrary:
@@ -224,7 +231,7 @@ class LoopLibrary:
         return (min(record.turn_count // 6, 2), record.sbend_count > 0)
 
     def pool(self, phase, max_len, min_chains=1, min_len=0, min_drop_z=0, min_steep_z=0,
-             min_single_drop_z=0, min_excitement=0.0, min_turns=0):
+             min_single_drop_z=0, min_excitement=0.0, min_turns=0, family=None):
         """Loops usable this episode: must fit the track budget with margin for the suffix
         search. Phase >= 2 prefers loops matching ALL the phase's structure criteria
         (chains, length, drop height, steep-dropped height, single-drop depth, measured
@@ -232,8 +239,20 @@ class LoopLibrary:
         enough chains -> any hill -> everything) so the scaffold never silently turns off.
         The any-steep tier exists because steepness is the rarest structural skill in the
         pool; the any-excited tier is its P5 analogue -- excitement-TAGGED loops are the
-        exemplars the quality ratchet climbs, so they dominate the moment any exist."""
+        exemplars the quality ratchet climbs, so they dominate the moment any exist.
+
+        `family` (Aug-9): when given, narrows the candidate set to records whose OWN
+        footprint classifies into that family BEFORE any structural degrade tier runs --
+        a spiral seed must be scaffolded by spiral exemplars, not whatever the structural
+        criteria happen to prefer. Narrowing happens only if the family actually has an
+        exemplar fitting the track budget; otherwise `fits` is left untouched so a thin
+        family (or one with no exemplar at all) still falls through every existing
+        degrade tier instead of silently emptying the pool."""
         fits = [r for r in self._records.values() if r.length <= max_len - 2]
+        if family is not None:
+            same_family = [r for r in fits if r.family == family]
+            if same_family:
+                fits = same_family
         if phase >= 2:
             best = [r for r in fits if (r.chain_count >= min_chains
                                         and r.length >= min_len
@@ -371,7 +390,7 @@ class WarmStartAnnealer:
 
     def sample_plan(self, library, phase, max_track_length, min_chains=1, min_len=0,
                     min_drop_z=0, min_steep_z=0, min_single_drop_z=0, min_excitement=0.0,
-                    min_turns=0):
+                    min_turns=0, family=None):
         """The episode's warm-start plan. Cold when the die says so, the pool is empty,
         or the sampled k has annealed past the loop length (natural end of the scaffold)."""
         pool = (library.pool(phase, max_track_length, min_chains=min_chains,
@@ -379,7 +398,7 @@ class WarmStartAnnealer:
                              min_steep_z=min_steep_z,
                              min_single_drop_z=min_single_drop_z,
                              min_excitement=min_excitement,
-                             min_turns=min_turns)
+                             min_turns=min_turns, family=family)
                 if library is not None else [])
         if not pool or self._rng.random() < self.p_cold:
             return self._cold_plan()

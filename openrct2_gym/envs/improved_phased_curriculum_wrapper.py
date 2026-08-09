@@ -960,26 +960,37 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
             # exemplar the harvest tags. No persistent state; recomputed per episode.
             min_chains, min_len, min_drop_z, min_single_drop_z = 1, 40, 12, 12
             min_excitement = 0.8 * self._loop_library.best_excitement(budget)
+        # Family-filtered scaffold (Aug-9): gated generically on PHASE_FAMILIES rather
+        # than a per-branch flag, so it activates automatically for every phase whose
+        # family reward is armed and stays exactly None (unchanged) for phases 1-2,
+        # where PHASE_FAMILIES is empty. target_family must already be THIS episode's
+        # draw by the time we read it here -- see reset()'s ordering.
+        family = int(getattr(base_env, "target_family", 0)) \
+            if self.PHASE_FAMILIES.get(self.current_phase) else None
         return self._annealer.sample_plan(
             self._loop_library, self.current_phase, budget,
             min_chains=min_chains, min_len=min_len, min_drop_z=min_drop_z,
             min_steep_z=min_steep_z, min_single_drop_z=min_single_drop_z,
-            min_excitement=min_excitement, min_turns=min_turns)
+            min_excitement=min_excitement, min_turns=min_turns, family=family)
 
     def reset(self, **kwargs):
         """Reset environment and check for phase advancement"""
         self._check_phase_advancement()
 
+        # The episode's seed (footprint family) is drawn FIRST and set on the base env
+        # (which does NOT reset it in reset() -- see PHASE_FAMILIES / _sample_target_family)
+        # so that _sample_warm_start below reads THIS episode's family, not the previous
+        # one's (Aug-9 fix: the two calls used to run in the opposite order, which meant
+        # every episode's scaffold pool was filtered by last episode's seed).
+        base_env = self._get_base_env()
+        base_env.target_family = self._sample_target_family()
+
         # Stage this episode's warm-start prefix on the base env AFTER the advancement
         # check (so phase/max_length are current); the env replays it one-shot inside
         # reset(), before Phi seeding. The suffix k sizes the tight scaffolded budget.
         self._current_plan = self._sample_warm_start()
-        base_env = self._get_base_env()
         base_env.warm_start_actions = list(self._current_plan.prefix) or None
         base_env.warm_start_suffix_k = self._current_plan.k or None
-        # The episode's seed (footprint family). Set on the base env, which does NOT
-        # reset it in reset() -- see PHASE_FAMILIES / _sample_target_family.
-        base_env.target_family = self._sample_target_family()
 
         obs, info = self.env.reset(**kwargs)
 

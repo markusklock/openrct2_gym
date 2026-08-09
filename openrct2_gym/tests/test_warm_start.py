@@ -407,6 +407,41 @@ def test_loop_record_turn_and_sbend_properties():
     assert LoopRecord.from_actions([0, 0, 6], "scripted").turn_count == 0
 
 
+# --------------------------------------------- family-aware pool (Aug-9 gap fix, task 6)
+# A spiral seed must be scaffolded by spiral exemplars, or the seed means nothing during
+# the phases where its reward is still off. Note: the brief's original winding fixture
+# ([4,4,0,3,3,0,4,4,0,3,3,0]) is 8 turns / 3 switches -- the straights between jog pairs
+# drop it out of the 10-13 turn winding band entirely (classify_family returns None).
+# [4,4,3,3]*3 is 12 turns / 5 switches, genuinely winding.
+
+def test_loop_record_exposes_its_family():
+    oval = LoopRecord.from_actions([4, 0, 4, 0, 4, 0, 4], "scripted")
+    winding = LoopRecord.from_actions([4, 4, 3, 3] * 3, "scripted")
+    assert oval.family == 0
+    assert winding.family == 3
+
+
+def test_pool_filters_by_requested_family(tmp_path):
+    """A spiral seed must be scaffolded by spiral exemplars, or the seed means nothing
+    during the phases where its reward is still off."""
+    lib = _lib(tmp_path)
+    oval = [4, 0, 4, 0, 4, 0, 4] + [0] * 20
+    winding = [4, 4, 3, 3] * 3 + [0] * 20
+    lib.add(LoopRecord.from_actions(oval, "scripted"))
+    lib.add(LoopRecord.from_actions(winding, "scripted"))
+    got = lib.pool(phase=1, max_len=120, min_chains=0, family=3)
+    assert [r.actions for r in got] == [tuple(winding)]
+
+
+def test_pool_family_filter_degrades_when_no_exemplar_exists(tmp_path):
+    """Thin families (serpentine has 61 archive examples) must not empty the pool --
+    the scaffold going silent is worse than an off-family exemplar."""
+    lib = _lib(tmp_path)
+    lib.add(LoopRecord.from_actions([4, 0, 4, 0, 4, 0, 4] + [0] * 20, "scripted"))
+    got = lib.pool(phase=1, max_len=120, min_chains=0, family=4)
+    assert got, "empty pool would silently disable the scaffold"
+
+
 def test_pool_p6_min_turns_and_shape_bin_diversity(tmp_path):
     """P6 pools must sustain MULTIPLE styles: the best tier caps each shape bin so a
     high-excitement rectangle monoculture cannot crowd out winding newcomers."""
@@ -467,6 +502,29 @@ def test_wrapper_p6_scaffold_requests_turny_pool(monkeypatch, tmp_path):
     assert kw['min_excitement'] >= 0.0                       # ratchet still applies
     wrapper.current_phase = 7                                # past-curriculum guard moved
     assert wrapper._sample_warm_start().cold is True
+
+
+def test_wrapper_requests_the_current_episodes_family_not_the_previous_ones(
+        monkeypatch, tmp_path):
+    """reset() must draw target_family BEFORE sampling the warm-start pool: sampling
+    first (the pre-fix ordering) hands _sample_warm_start last episode's family, so
+    the scaffold is always one episode behind what the seed actually asked for."""
+    wrapper, base = _wrapped(monkeypatch, tmp_path, p_cold=0.0)
+    wrapper.current_phase = 3                                # PHASE_FAMILIES[3] active
+    wrapper._update_phase_settings()
+    seen = []
+    orig = wrapper._annealer.sample_plan
+
+    def spy(library, phase, max_len, **kw):
+        seen.append(kw.get('family'))
+        return orig(library, phase, max_len, **kw)
+
+    wrapper._annealer.sample_plan = spy
+    draws = iter([2, 0, 1])
+    wrapper._family_rng.choice = lambda seq: next(draws)
+    for _ in range(3):
+        wrapper.reset()
+        assert seen[-1] == base.target_family
 
 
 def test_library_add_upgrades_excitement_on_dup(tmp_path):
@@ -1121,23 +1179,28 @@ def test_wrapper_warm_starts_all_phases_with_p5_exc_ratchet(monkeypatch, tmp_pat
     wrapper._update_phase_settings()
     wrapper.reset()
     assert wrapper._current_plan.cold is False                      # P3 scaffolds now
-    assert seen[-1] == (3, {'min_chains': 2, 'min_len': 20, 'min_drop_z': 4,
-                            'min_steep_z': 0, 'min_single_drop_z': 0,
-                            'min_excitement': 0.0, 'min_turns': 0})
+    phase3, kw3 = seen[-1]
+    assert kw3.pop('family') in wrapper.PHASE_FAMILIES[3]           # Aug-9: family now armed
+    assert (phase3, kw3) == (3, {'min_chains': 2, 'min_len': 20, 'min_drop_z': 4,
+                                 'min_steep_z': 0, 'min_single_drop_z': 0,
+                                 'min_excitement': 0.0, 'min_turns': 0})
     wrapper.current_phase = 4
     wrapper._update_phase_settings()
     wrapper.reset()
     # Jul-8: P4 criteria raised to the gate itself (len 40, steep 8) so scaffold
     # prefixes are qualifying-shaped instead of recycled P3 material.
-    assert seen[-1] == (4, {'min_chains': 3, 'min_len': 40, 'min_drop_z': 8,
-                            'min_steep_z': 8, 'min_single_drop_z': 0,
-                            'min_excitement': 0.0, 'min_turns': 0})
+    phase4, kw4 = seen[-1]
+    assert kw4.pop('family') in wrapper.PHASE_FAMILIES[4]
+    assert (phase4, kw4) == (4, {'min_chains': 3, 'min_len': 40, 'min_drop_z': 8,
+                                 'min_steep_z': 8, 'min_single_drop_z': 0,
+                                 'min_excitement': 0.0, 'min_turns': 0})
     wrapper.current_phase = 5
     wrapper._update_phase_settings()
     wrapper.reset()
     assert wrapper._current_plan.cold is False                      # P5 scaffolds now
     phase, kw = seen[-1]
     assert phase == 5
+    assert kw['family'] in wrapper.PHASE_FAMILIES[5]
     assert (kw['min_chains'], kw['min_len'], kw['min_drop_z'],
             kw['min_single_drop_z']) == (1, 40, 12, 12)
     assert kw['min_excitement'] == 0.0                              # legacy-only pool -> bar 0
