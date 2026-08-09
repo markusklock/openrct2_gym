@@ -934,6 +934,18 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
         self._loop_library.maybe_refresh()   # pick up other workers' harvested loops
         base_env = self._get_base_env()
         budget = getattr(base_env, 'max_track_length', 40)
+        # Family-filtered scaffold (Aug-9): gated generically on PHASE_FAMILIES rather
+        # than a per-branch flag, so it activates automatically for every phase whose
+        # family reward is armed and stays exactly None (unchanged) for phases 1-2,
+        # where PHASE_FAMILIES is empty. target_family must already be THIS episode's
+        # draw by the time we read it here -- see reset()'s ordering. Computed BEFORE
+        # the excitement-ratchet branches below (fix pass, Aug-9 review) so the P5/P6
+        # best_excitement() calls can be scoped to the same family the pool will draw
+        # from -- otherwise the ratchet bar comes from the whole library while the pool
+        # is narrowed to one family, and any family lacking the library's top exemplar
+        # gets an unreachable bar by construction.
+        family = int(getattr(base_env, "target_family", 0)) \
+            if self.PHASE_FAMILIES.get(self.current_phase) else None
         min_chains, min_len, min_drop_z, min_steep_z = 1, 0, 0, 0
         min_single_drop_z, min_excitement, min_turns = 0, 0.0, 0
         if self.current_phase == 2 and self.phase2_stage >= 3:
@@ -951,7 +963,7 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
             # scarce; the pool's per-bin cap keeps multiple styles in every draw.
             min_chains, min_len, min_drop_z, min_single_drop_z = 1, 40, 12, 12
             min_turns = 8
-            min_excitement = 0.8 * self._loop_library.best_excitement(budget)
+            min_excitement = 0.8 * self._loop_library.best_excitement(budget, family=family)
         elif self.current_phase >= 5:
             # P5 (Jul-9): scaffold from excitement exemplars. Shape criteria mirror the
             # rating caps (>=12z single drop on a >=40 piece loop); the excitement bar
@@ -959,14 +971,7 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
             # legacy-only pool (everything qualifies), then rising behind every better
             # exemplar the harvest tags. No persistent state; recomputed per episode.
             min_chains, min_len, min_drop_z, min_single_drop_z = 1, 40, 12, 12
-            min_excitement = 0.8 * self._loop_library.best_excitement(budget)
-        # Family-filtered scaffold (Aug-9): gated generically on PHASE_FAMILIES rather
-        # than a per-branch flag, so it activates automatically for every phase whose
-        # family reward is armed and stays exactly None (unchanged) for phases 1-2,
-        # where PHASE_FAMILIES is empty. target_family must already be THIS episode's
-        # draw by the time we read it here -- see reset()'s ordering.
-        family = int(getattr(base_env, "target_family", 0)) \
-            if self.PHASE_FAMILIES.get(self.current_phase) else None
+            min_excitement = 0.8 * self._loop_library.best_excitement(budget, family=family)
         return self._annealer.sample_plan(
             self._loop_library, self.current_phase, budget,
             min_chains=min_chains, min_len=min_len, min_drop_z=min_drop_z,
@@ -1192,6 +1197,12 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
             info['warm_k_max'] = self._annealer.k_max
             info['warm_min_prefix'] = self._annealer.min_prefix
             info['loop_library_size'] = len(self._loop_library)
+            # Fix pass (Aug-9 review): pool()'s family-narrowing decision, read straight
+            # off the library the same way library_best_excitement is below -- was a
+            # family requested this episode, and did the narrowing apply or fall back to
+            # the phase's structural criteria (Fix 1)? None means no family was active.
+            info['warm_family_requested'] = self._loop_library.last_family_requested
+            info['warm_family_narrowed'] = self._loop_library.last_family_narrowed
             frontier_rate = self._annealer.frontier_rate
             if frontier_rate is not None:
                 info['warm_frontier_rate'] = frontier_rate

@@ -17,11 +17,12 @@ import random
 from collections import deque
 from dataclasses import dataclass
 
+from openrct2_gym.envs.footprint import classify_family
+from openrct2_gym.envs.track_pieces import SBEND_ACTIONS, TURN_ACTIONS  # noqa: F401
+
 
 CHAIN_ACTIONS = (9, 10)          # matches openrct2_env / api_track_builder chain-lift actions
 STEEP_ACTIONS = (8, 27, 28)      # 60-degree family (matches env._steep_drop_z / P4's gate leg)
-from openrct2_gym.envs.footprint import classify_family
-from openrct2_gym.envs.track_pieces import SBEND_ACTIONS, TURN_ACTIONS  # noqa: F401
 
 # Static per-action z geometry (live-verified via the base-z offset probes): descents drop
 # by their span, ascents climb by theirs. Lets the pool grade loops by real drop height and
@@ -131,6 +132,12 @@ class LoopLibrary:
         self.path = path
         self._records = {}                 # actions tuple -> LoopRecord
         self._calls_since_refresh = 0
+        # Fix pass (Aug-9 review): pool() has no TB access, so the family-narrowing
+        # decision it makes is recorded here as plain instance state -- the wrapper
+        # reads it straight off the library, the same way it already reads
+        # best_excitement(), so Fix 1's fallback is diagnosable instead of inferred.
+        self.last_family_requested = None
+        self.last_family_narrowed = False
         self.load()
 
     def __len__(self):
@@ -230,6 +237,21 @@ class LoopLibrary:
     def _shape_bin(record):
         return (min(record.turn_count // 6, 2), record.sbend_count > 0)
 
+    @staticmethod
+    def _meets_structural(r, min_chains, min_len, min_drop_z, min_steep_z,
+                          min_single_drop_z, min_excitement, min_turns):
+        """The phase's structural bar -- the exact predicate the 'best' degrade tier
+        gates on. Extracted (fix pass, Aug-9 review) so the family-narrowing check below
+        and the best tier read the SAME condition; a second hand-copied condition is
+        exactly the kind of duplication that drifts."""
+        return (r.chain_count >= min_chains
+                and r.length >= min_len
+                and r.drop_z >= min_drop_z
+                and r.steep_drop_z >= min_steep_z
+                and r.max_single_drop_z >= min_single_drop_z
+                and r.excitement >= min_excitement
+                and r.turn_count >= min_turns)
+
     def pool(self, phase, max_len, min_chains=1, min_len=0, min_drop_z=0, min_steep_z=0,
              min_single_drop_z=0, min_excitement=0.0, min_turns=0, family=None):
         """Loops usable this episode: must fit the track budget with margin for the suffix
@@ -241,26 +263,35 @@ class LoopLibrary:
         pool; the any-excited tier is its P5 analogue -- excitement-TAGGED loops are the
         exemplars the quality ratchet climbs, so they dominate the moment any exist.
 
-        `family` (Aug-9): when given, narrows the candidate set to records whose OWN
-        footprint classifies into that family BEFORE any structural degrade tier runs --
-        a spiral seed must be scaffolded by spiral exemplars, not whatever the structural
-        criteria happen to prefer. Narrowing happens only if the family actually has an
-        exemplar fitting the track budget; otherwise `fits` is left untouched so a thin
-        family (or one with no exemplar at all) still falls through every existing
-        degrade tier instead of silently emptying the pool."""
+        `family` (Aug-9, fix pass Aug-9 review): narrows the candidate set to records
+        whose OWN footprint classifies into that family BEFORE any structural degrade
+        tier runs -- a spiral seed must be scaffolded by spiral exemplars, not whatever
+        the structural criteria happen to prefer. Narrowing wins ONLY if the narrowed
+        set still contains at least one record clearing the phase's OWN structural bar
+        (`_meets_structural`, the same predicate the best tier below uses); otherwise
+        `fits` is left untouched so the phase's real teaching signal (e.g. the P4 steep
+        scaffold) is never traded away for an off-family exemplar that can't teach it
+        anyway. An off-family prefix costs part of one episode's family gate and the
+        agent can still steer its suffix toward the requested shape; a structurally weak
+        prefix costs the thing the reverse curriculum exists to provide. `last_family_*`
+        record the decision as instance state (pool() has no TB access) so the fallback
+        is diagnosable rather than inferred -- see the wrapper's warm_family_requested /
+        warm_family_narrowed info keys."""
         fits = [r for r in self._records.values() if r.length <= max_len - 2]
+        self.last_family_requested = family
+        self.last_family_narrowed = False
         if family is not None:
             same_family = [r for r in fits if r.family == family]
-            if same_family:
+            if any(self._meets_structural(r, min_chains, min_len, min_drop_z, min_steep_z,
+                                          min_single_drop_z, min_excitement, min_turns)
+                   for r in same_family):
                 fits = same_family
+                self.last_family_narrowed = True
         if phase >= 2:
-            best = [r for r in fits if (r.chain_count >= min_chains
-                                        and r.length >= min_len
-                                        and r.drop_z >= min_drop_z
-                                        and r.steep_drop_z >= min_steep_z
-                                        and r.max_single_drop_z >= min_single_drop_z
-                                        and r.excitement >= min_excitement
-                                        and r.turn_count >= min_turns)]
+            best = [r for r in fits
+                    if self._meets_structural(r, min_chains, min_len, min_drop_z,
+                                              min_steep_z, min_single_drop_z,
+                                              min_excitement, min_turns)]
             if best:
                 if phase >= 6:
                     by_bin = {}
@@ -287,11 +318,19 @@ class LoopLibrary:
                 return hills
         return fits
 
-    def best_excitement(self, max_len):
+    def best_excitement(self, max_len, family=None):
         """Highest measured excitement among records fitting the track budget (0.0 for a
-        legacy/untagged pool). Drives the P5 self-imitation ratchet: the scaffold bar is
-        a fraction of this, so every better exemplar drags the whole pool up behind it."""
-        fits = [r.excitement for r in self._records.values() if r.length <= max_len - 2]
+        legacy/untagged pool). Drives the P5/P6 self-imitation ratchet: the scaffold bar
+        is a fraction of this, so every better exemplar drags the whole pool up behind
+        it. `family` (fix pass, Aug-9 review): restricts the scan to that family's own
+        records, so the ratchet bar comes from the SAME set pool() will draw from --
+        without this, a family lacking the library's cross-family top exemplar gets an
+        unreachable bar by construction and its best/excited tiers go empty every time.
+        A family with no rated records yet correctly falls to 0.0 (no ratchet yet for
+        that family), matching how the ratchet already bootstraps from a legacy-only
+        library."""
+        fits = [r.excitement for r in self._records.values()
+                if r.length <= max_len - 2 and (family is None or r.family == family)]
         return max(fits, default=0.0)
 
     @staticmethod

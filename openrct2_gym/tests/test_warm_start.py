@@ -442,6 +442,100 @@ def test_pool_family_filter_degrades_when_no_exemplar_exists(tmp_path):
     assert got, "empty pool would silently disable the scaffold"
 
 
+# ---------------------------------------- fix pass: family yields to structure (task 6 review)
+# The reviewer's traced case: the 24 seeded steep P4 exemplars are single-handedness
+# skeletons (4 turns, 0 switches -> family 0); short chainless cold harvests wind (12
+# turns, 5 switches -> family 3). Every fixture below is verified against the real
+# classify_family()/LoopRecord properties inline, not asserted by name -- this plan has
+# shipped a mis-specified footprint fixture three times already.
+
+def test_pool_family_narrowing_yields_to_structural_criteria(tmp_path):
+    """Fix 1: narrowing to an off-family-preferred but structurally weak subset must not
+    black out a structurally-qualifying exemplar sitting one filter away. A family=3 draw
+    at P4 criteria (min_chains=3, min_len=40, min_drop_z=8, min_steep_z=8) must still
+    surface the qualifying steep (family-0) record, not the weak (chainless) winding one."""
+    steep_family0 = generate_p4_candidates()[0] + [0] * 3       # padded to the P4 length bar
+    assert classify_family(steep_family0) == 0
+    steep_rec = LoopRecord.from_actions(steep_family0, "scripted")
+    assert (steep_rec.chain_count, steep_rec.length, steep_rec.drop_z, steep_rec.steep_drop_z) \
+        == (5, 40, 10.0, 8.0)
+
+    winding_weak = [4, 4, 3, 3] * 3 + [0] * 20                  # no chains, well under the bar
+    assert classify_family(winding_weak) == 3
+    weak_rec = LoopRecord.from_actions(winding_weak, "scripted")
+    assert weak_rec.chain_count == 0
+
+    lib = _lib(tmp_path)
+    lib.add(steep_rec)
+    lib.add(weak_rec)
+    got = lib.pool(phase=4, max_len=120, min_chains=3, min_len=40, min_drop_z=8,
+                   min_steep_z=8, family=3)
+    assert [r.actions for r in got] == [tuple(steep_family0)]
+
+
+def test_pool_narrows_to_family_when_it_has_a_qualifying_record(tmp_path):
+    """Family preference is not simply disabled by Fix 1 -- when the requested family DOES
+    contain a record clearing the phase's structural bar, narrowing still happens and an
+    off-family competitor (even a structurally-qualifying one) is excluded."""
+    steep_family0 = generate_p4_candidates()[0] + [0] * 3
+    assert classify_family(steep_family0) == 0
+
+    winding_qualifying = [4, 4, 3, 3] * 3 + [10, 9, 9, 9, 9, 13] + [0] * 20 + [12, 27, 28, 14]
+    assert classify_family(winding_qualifying) == 3
+    qual_rec = LoopRecord.from_actions(winding_qualifying, "scripted")
+    assert (qual_rec.chain_count, qual_rec.length, qual_rec.drop_z, qual_rec.steep_drop_z) \
+        == (5, 42, 10.0, 8.0)
+
+    lib = _lib(tmp_path)
+    lib.add(LoopRecord.from_actions(steep_family0, "scripted"))
+    lib.add(qual_rec)
+    got = lib.pool(phase=4, max_len=120, min_chains=3, min_len=40, min_drop_z=8,
+                   min_steep_z=8, family=3)
+    assert [r.actions for r in got] == [tuple(winding_qualifying)]
+
+
+def test_best_excitement_restricts_to_family(tmp_path):
+    """Fix 2: the P5/P6 excitement ratchet bar must come from the SAME set the pool draws
+    from. An unreachable bar (best exemplar in a different family) would empty the best
+    and excited tiers every time for any family lacking the library's top scorer."""
+    oval = [4, 0, 4, 0, 4, 0, 4] + [0] * 20
+    assert classify_family(oval) == 0
+    winding = [4, 4, 3, 3] * 3 + [0] * 20
+    assert classify_family(winding) == 3
+
+    lib = _lib(tmp_path)
+    lib.add(LoopRecord.from_actions(oval, "harvest", excitement=9.0))
+    lib.add(LoopRecord.from_actions(winding, "harvest", excitement=3.0))
+    assert lib.best_excitement(120) == pytest.approx(9.0)                 # unrestricted: the oval
+    assert lib.best_excitement(120, family=3) == pytest.approx(3.0)       # family 3's own best
+    assert lib.best_excitement(120, family=4) == 0.0                      # no rated family-4 record
+
+
+def test_pool_records_family_narrowing_state_for_diagnostics(tmp_path):
+    """Fix 3.1: pool() is a plain library method with no TB access, so the narrowing
+    decision must be recorded as instance state the wrapper can read per call -- a
+    consumer must be able to tell, per episode, whether a family was requested and
+    whether the narrowing applied or fell back."""
+    steep_family0 = generate_p4_candidates()[0] + [0] * 3
+    winding_weak = [4, 4, 3, 3] * 3 + [0] * 20
+    lib = _lib(tmp_path)
+    lib.add(LoopRecord.from_actions(steep_family0, "scripted"))
+    lib.add(LoopRecord.from_actions(winding_weak, "scripted"))
+
+    lib.pool(phase=4, max_len=120, min_chains=3, min_len=40, min_drop_z=8,
+             min_steep_z=8, family=3)                    # requested family can't meet the bar
+    assert lib.last_family_requested == 3
+    assert lib.last_family_narrowed is False
+
+    lib.pool(phase=1, max_len=120, min_chains=0, family=3)  # trivially-met bar -> narrows
+    assert lib.last_family_requested == 3
+    assert lib.last_family_narrowed is True
+
+    lib.pool(phase=1, max_len=120)                        # no family requested at all
+    assert lib.last_family_requested is None
+    assert lib.last_family_narrowed is False
+
+
 def test_pool_p6_min_turns_and_shape_bin_diversity(tmp_path):
     """P6 pools must sustain MULTIPLE styles: the best tier caps each shape bin so a
     high-excitement rectangle monoculture cannot crowd out winding newcomers."""
@@ -1180,6 +1274,7 @@ def test_wrapper_warm_starts_all_phases_with_p5_exc_ratchet(monkeypatch, tmp_pat
     wrapper.reset()
     assert wrapper._current_plan.cold is False                      # P3 scaffolds now
     phase3, kw3 = seen[-1]
+    kw3 = dict(kw3)                       # copy: kw3 IS the dict captured in `seen`, don't mutate it
     assert kw3.pop('family') in wrapper.PHASE_FAMILIES[3]           # Aug-9: family now armed
     assert (phase3, kw3) == (3, {'min_chains': 2, 'min_len': 20, 'min_drop_z': 4,
                                  'min_steep_z': 0, 'min_single_drop_z': 0,
@@ -1190,6 +1285,7 @@ def test_wrapper_warm_starts_all_phases_with_p5_exc_ratchet(monkeypatch, tmp_pat
     # Jul-8: P4 criteria raised to the gate itself (len 40, steep 8) so scaffold
     # prefixes are qualifying-shaped instead of recycled P3 material.
     phase4, kw4 = seen[-1]
+    kw4 = dict(kw4)                       # copy: same captured-dict-mutation hazard as kw3 above
     assert kw4.pop('family') in wrapper.PHASE_FAMILIES[4]
     assert (phase4, kw4) == (4, {'min_chains': 3, 'min_len': 40, 'min_drop_z': 8,
                                  'min_steep_z': 8, 'min_single_drop_z': 0,
@@ -1204,10 +1300,16 @@ def test_wrapper_warm_starts_all_phases_with_p5_exc_ratchet(monkeypatch, tmp_pat
     assert (kw['min_chains'], kw['min_len'], kw['min_drop_z'],
             kw['min_single_drop_z']) == (1, 40, 12, 12)
     assert kw['min_excitement'] == 0.0                              # legacy-only pool -> bar 0
-    # the ratchet: a tagged exemplar raises the bar to 0.8 x best-within-budget
+    # the ratchet: a tagged exemplar raises the bar to 0.8 x best-within-budget.
+    # Fix pass (Aug-9 review): the bar is now scoped to the EPISODE'S family (Fix 2),
+    # so pin the draw to BIG_EXCITING's own family (0, verified below) -- otherwise the
+    # random draw would land off-family 4/5 of the time and see bar 0.0 by construction.
+    assert classify_family(BIG_EXCITING) == 0
+    wrapper._family_rng.choice = lambda seq: 0
     wrapper._loop_library.add(
         LoopRecord.from_actions(BIG_EXCITING, "harvest", excitement=5.0))
     wrapper.reset()
+    assert seen[-1][1]['family'] == 0
     assert seen[-1][1]['min_excitement'] == pytest.approx(4.0)
     # phases past the curriculum build cold (P6 now scaffolds -- see
     # test_wrapper_p6_scaffold_requests_turny_pool; the guard sits at > 6)
@@ -1275,6 +1377,33 @@ def test_wrapper_info_exposes_warm_start_diagnostics(monkeypatch, tmp_path):
         assert info['warm_frontier_rate'] == pytest.approx(wrapper._annealer.frontier_rate)
     assert info['cold_fraction'] == pytest.approx(0.0)              # p_cold=0 -> all scaffolded
     assert info['scaffold_success_rate'] == pytest.approx(1.0)
+
+
+def test_wrapper_step_info_exposes_family_narrowing_diagnostics(monkeypatch, tmp_path):
+    """Fix 3.1: a consumer must be able to tell, per episode, whether a family was
+    requested and whether the pool's narrowing applied or fell back -- following the
+    same 'read straight off self._loop_library' pattern as library_best_excitement."""
+    family0_p3_qualifier = HILL + [0] * 10             # family 0; chain 2, len 22, drop_z 4
+    assert classify_family(family0_p3_qualifier) == 0
+    wrapper, base = _wrapped(monkeypatch, tmp_path, api_cls=CompletingAPI, p_cold=0.0,
+                             seed_loops=(family0_p3_qualifier,))
+    wrapper.current_phase = 3                           # PHASE_FAMILIES[3] active
+    wrapper._update_phase_settings()
+
+    wrapper._family_rng.choice = lambda seq: 0          # draw the family the pool can satisfy
+    info = _run_episode(wrapper)
+    assert info['warm_family_requested'] == 0
+    assert info['warm_family_narrowed'] is True
+
+    wrapper._family_rng.choice = lambda seq: 1          # a family with no exemplar in the pool
+    info2 = _run_episode(wrapper)
+    assert info2['warm_family_requested'] == 1
+    assert info2['warm_family_narrowed'] is False
+
+    wrapper.current_phase = 1                            # PHASE_FAMILIES[1] is empty
+    wrapper._update_phase_settings()
+    info3 = _run_episode(wrapper)
+    assert info3['warm_family_requested'] is None
 
 
 def test_wrapper_phase_change_reinitializes_annealer(monkeypatch, tmp_path):
