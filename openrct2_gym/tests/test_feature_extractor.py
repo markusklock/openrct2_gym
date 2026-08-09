@@ -16,6 +16,7 @@ from openrct2_gym.envs.obs_config import (
     HIST_FEAT_DIM,
     NUM_ACTIONS,
     SCALARS_DIM,
+    TARGET_FAMILY_N,
 )
 from openrct2_gym.envs.feature_extractor import BuildHistoryExtractor
 
@@ -50,6 +51,8 @@ def _make_batch(batch=2, lengths=(5, 5), corrupt_pad=False):
         # Discrete keys arrive one-hot (float) after SB3 preprocessing
         "current_direction": th.as_tensor(np.eye(4, dtype=np.float32)[rng.integers(0, 4, batch)]),
         "last_piece_type": th.as_tensor(np.eye(33, dtype=np.float32)[rng.integers(0, 33, batch)]),
+        "target_family": th.as_tensor(
+            np.eye(TARGET_FAMILY_N, dtype=np.float32)[rng.integers(0, TARGET_FAMILY_N, batch)]),
     }
     if corrupt_pad:
         # Garbage in the padded region only, drawn from a SEPARATE rng so the shared

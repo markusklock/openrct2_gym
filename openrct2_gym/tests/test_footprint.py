@@ -63,3 +63,39 @@ def test_family_match_penalises_the_wrong_family():
     """The core inversion: with an oval requested, a winding build must score worse."""
     assert family_match(OVAL, 0) > family_match(WINDING, 0)
     assert family_match(WINDING, 3) > family_match(OVAL, 3)
+
+
+# --------------------------------------------- the seed as an observation input
+# The agent must SEE which family it was asked for, or it cannot condition on it.
+# Discrete is used because SB3 one-hot-encodes it automatically, exactly like the
+# existing current_direction / last_piece_type fields.
+
+def test_observation_space_exposes_the_target_family():
+    from openrct2_gym.envs.obs_config import TARGET_FAMILY_N, make_observation_space
+    space = make_observation_space()
+    assert TARGET_FAMILY_N == FAMILY_N
+    assert "target_family" in space.spaces
+    assert space["target_family"].n == FAMILY_N
+
+
+def test_env_reports_the_target_family_in_its_observation(monkeypatch):
+    import openrct2_gym.envs.openrct2_env as oe_mod
+    from openrct2_gym.envs.openrct2_env import OpenRCT2Env
+    from openrct2_gym.tests.test_env_smoke import FakeAPI
+
+    monkeypatch.setattr(oe_mod, "APIController", FakeAPI)
+    env = OpenRCT2Env(verbose=0)
+    assert env.target_family == 0                      # inert default
+    env.target_family = 3                              # wrapper sets this before reset
+    obs, _ = env.reset()
+    assert obs["target_family"] == 3
+    assert env.observation_space.contains(obs)
+
+
+def test_feature_extractor_consumes_the_target_family():
+    """A Discrete field the extractor does not read is dead weight -- the policy
+    would never see the seed."""
+    from openrct2_gym.envs.feature_extractor import BuildHistoryExtractor
+    from openrct2_gym.envs.obs_config import make_observation_space
+    ex = BuildHistoryExtractor(make_observation_space())
+    assert "target_family" in ex._cat_keys

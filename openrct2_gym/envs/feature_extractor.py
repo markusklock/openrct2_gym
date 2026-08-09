@@ -81,7 +81,7 @@ class BuildHistoryExtractor(BaseFeaturesExtractor):
         self.scalar_mlp = nn.Sequential(nn.Linear(scalar_in, scalar_hidden), nn.ReLU())
 
         # --- Branch D: categoricals (SB3 one-hots Discrete to n floats) -------------
-        self._cat_keys = ["current_direction", "last_piece_type"]
+        self._cat_keys = ["current_direction", "last_piece_type", "target_family"]
         cat_in = sum(int(observation_space[k].n) for k in self._cat_keys)
         self.cat_mlp = nn.Sequential(nn.Linear(cat_in, cat_hidden), nn.ReLU())
 

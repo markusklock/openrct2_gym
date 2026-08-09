@@ -32,6 +32,13 @@ SCALARS_DIM = 12         # 8 legacy + [along/16, perp/8, heading_cos, route_prog
 DIRECTION_N = 4          # current_direction (cardinal)
 LAST_PIECE_N = NUM_ACTIONS + 1   # last_piece_type, +1 shifted (0 = none yet)
 
+# --- seed / requested footprint family -------------------------------------------
+# The episode's requested family (see envs/footprint.py). Discrete so SB3 one-hots it
+# like the other categoricals. Present from Phase 1 even while the family reward is
+# off: an input that predicts nothing gets zeroed out by the network and has to be
+# unlearned later, so the warm-start scaffold keys off it from the start.
+from openrct2_gym.envs.footprint import FAMILY_N as TARGET_FAMILY_N  # noqa: E402
+
 
 def make_observation_space() -> gym.spaces.Dict:
     """Construct the redesigned Dict observation space.
@@ -50,4 +57,5 @@ def make_observation_space() -> gym.spaces.Dict:
         "scalars": gym.spaces.Box(low=-10.0, high=10.0, shape=(SCALARS_DIM,), dtype=np.float32),
         "current_direction": gym.spaces.Discrete(DIRECTION_N),
         "last_piece_type": gym.spaces.Discrete(LAST_PIECE_N),
+        "target_family": gym.spaces.Discrete(TARGET_FAMILY_N),
     })

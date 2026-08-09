@@ -62,6 +62,7 @@ def _bare_env(current_position=(61, 70, 14), current_direction=1,
     env.position_history = deque([list(current_position)], maxlen=OpenRCT2Env.POSITION_HISTORY_MAXLEN)
     env.observation_space = make_observation_space()
     env.reward_params = RewardParams()
+    env.target_family = 0
     return env
 
 

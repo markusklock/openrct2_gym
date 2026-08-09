@@ -257,6 +257,11 @@ class OpenRCT2Env(gym.Env):
         self.warm_start_actions = None
         self.warm_start_suffix_k = None  # planned agent-built suffix length (sizes the budget)
         self._warm_prefix_len = 0
+
+        # Requested footprint family for this episode (the "seed"). The curriculum
+        # wrapper sets it before reset(); a bare env leaves it at 0, and the family
+        # reward weights default to inert, so nothing changes for phases 1-2.
+        self.target_family = 0
         self._warm_cold = True
         self._warm_aborted = False       # prefix replay failed mid-way (infrastructure event)
         self._warm_track_cap = None      # scaffolded-episode piece budget (None = full budget)
@@ -1790,6 +1795,7 @@ class OpenRCT2Env(gym.Env):
             'scalars': scalars,
             'current_direction': int(self.current_direction),
             'last_piece_type': int(last_piece),
+            'target_family': int(self.target_family),
         }
 
     def evaluate_ride(self):
