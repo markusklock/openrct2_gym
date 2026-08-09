@@ -473,7 +473,7 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                 # gate itself as a discrete event.
                 completion_length_floor=0.25,
                 # Family reward, armed (Aug-9 gap fix): PHASE_FAMILIES already varies the
-                # seed from P3 onward (oval/spiral/out-and-back), but until now nothing in
+                # seed from P3 onward (oval/out-and-back), but until now nothing in
                 # the reward read it, so the observation carried a one-hot that predicted
                 # nothing -- the "pure noise" PHASE_FAMILIES' own docstring says P1-2 must
                 # avoid. The spec's Phase-3 early read (non-zero, rising per-family hit
@@ -486,10 +486,11 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                 #   R_family:                 0.0 (P3) -> 75.0 (P4) -> 125.0 (P5) -> 200 (P6)
                 # R_family joined the ramp at P4 (Aug-9 final review): below P6 the
                 # multiplicative gate was the ONLY family incentive, and at these floors it
-                # forfeits too little on the NEAR bands to pay for the shape -- a spiral
-                # seed cost the default oval just 30 (P3) / 50 (P4) / 80 (P5) points, well
-                # under the 4-10 extra pieces a spiral costs at this project's recorded
-                # ~-10/piece gamma discount. P3 stays at 0: ride testing is off there, so
+                # forfeits too little on the NEAR bands to pay for the shape -- an out-and-back
+                # seed diverges structurally from the default oval in P3, requiring a dedicated
+                # shape reward to make the cost visible; at P5/P6 where spiral and winding join,
+                # R_family ramps to 125+ points to cover their documented higher piece counts.
+                # P3 stays at 0: ride testing is off there, so
                 # R_family (paid only inside the completion-AND-tested branch) could never
                 # fire. qualify_requires_family stays False below P6 -- each of P3/4/5 has
                 # its own tuned advancement predicate that a family leg would change the
@@ -1196,7 +1197,7 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
             # where the seed is pinned to 0 and family_hit is reward-inert noise; bool()
             # collapses that to False rather than letting a bare None poison the window.
             z = int(base_env.target_family)
-            # NOTE: this is env._family_hit() (openrct2_env.py:1568-1571) ANDed with
+            # NOTE: this is env._family_hit() (openrct2_env.py:1583) ANDed with
             # loop_completed -- not the suffix-only variant _is_qualified uses for P6's
             # gate -- so a truncated build that happens to classify into the seed's
             # family reads 0 here, not a false hit. On a warm episode this reports the

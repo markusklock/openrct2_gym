@@ -90,9 +90,9 @@ when shape matters:
 | phase | budget | families active |
 |---|---|---|
 | 1–2 | 40 | none (too tight to express shape) |
-| 3 | 60 | 0–2 (oval, spiral, out-and-back) |
-| 4 | 80 | + winding |
-| 5–6 | 80–120 | all five; P6 terminal, advancement judged per family |
+| 3 | 60 | 0, 2 (oval, out-and-back) |
+| 4 | 80 | + 3 (winding) |
+| 5–6 | 80–120 | + 1, 4 (spiral, serpentine); P6 terminal, advancement judged per family |
 
 The seed is in the observation from step one and **means something from step one even while
 the family reward is off**: it selects which exemplar the warm-start scaffold replays. A
@@ -142,8 +142,12 @@ count, and **hit rate per family**.
    rate = (unaided episodes drawn with seed `z` that both land in family `z` **and** test at
    E ≥ 4.5) / (all unaided episodes drawn with seed `z`). Both conditions are required: a
    correctly-shaped ride that fails its test is not a hit.
-3. **Early read** — at Phase 3 (~1 day), the three active families show non-zero and rising
-   hit rates. Go/no-go before committing the full 3–5 days.
+3. **Early read** — at Phase 3 (~1 day), the two active families (oval and out-and-back) show
+   non-zero and rising hit rates. Go/no-go before committing the full 3–5 days. Spiral was
+   measured as a ~100-piece shape (median of 102 pieces across 894 library records) and cannot
+   fit in Phase 3's 60-piece budget; consequently it appears only at Phase 5 onward, where the
+   120-piece ceiling accommodates it. This adjustment allows Phase 3 to focus on shapes
+   geometrically feasible within its constraints.
 
 **Measurement rule:** the reward may score the whole track, but **every success claim is
 judged on unaided builds only**. Three times a number has flattered us because the scaffold,
