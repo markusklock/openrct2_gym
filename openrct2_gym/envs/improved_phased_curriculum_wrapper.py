@@ -958,11 +958,21 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
             # while the 60-degree leg went unpracticed (Jul-8 run: 12h, zero own steep).
             min_chains, min_len, min_drop_z, min_steep_z = 3, 40, 8, 8
         elif self.current_phase >= 6:
-            # P6 (Style): exemplar-shaped AND turny. min_turns=8 sits under the 12-piece
-            # gate so the excited/steep fallbacks still fire while turny exemplars are
-            # scarce; the pool's per-bin cap keeps multiple styles in every draw.
+            # P6 (Style): exemplar-shaped. min_turns=8 (removed task 6b, Aug-9 review) was
+            # a leftover proxy for "not another rectangle" from before family seeding
+            # existed, and it was silently unsatisfiable for two of the five families:
+            # oval is <=5 turns BY DEFINITION (footprint.py FAMILIES), so no oval record
+            # could ever clear an 8-turn bar -- measured against the live 196,058-record
+            # library, 0 of 148,511 oval records met it (out_and_back was only partly
+            # hit: 21,470 of 29,235). That made the family-narrowing check in
+            # LoopLibrary.pool() (which requires a same-family record to clear the FULL
+            # structural bar before it narrows) unable to ever narrow to those two
+            # families, so an oval- or out_and_back-seeded episode fell back to the
+            # unnarrowed pool and got scaffolded with an off-family exemplar before the
+            # agent placed a piece. Shape is now the family filter's job (`family` above);
+            # left at the default 0. The pool's per-bin cap still keeps multiple styles
+            # in every draw.
             min_chains, min_len, min_drop_z, min_single_drop_z = 1, 40, 12, 12
-            min_turns = 8
             min_excitement = 0.8 * self._loop_library.best_excitement(budget, family=family)
         elif self.current_phase >= 5:
             # P5 (Jul-9): scaffold from excitement exemplars. Shape criteria mirror the

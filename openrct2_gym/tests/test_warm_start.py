@@ -601,6 +601,68 @@ def test_pool_p6_min_turns_and_shape_bin_diversity(tmp_path):
     assert [r.actions for r in pool_turny] == [tuple(winding)]
 
 
+# ------------------------------------------- task 6b: P6's min_turns=8 was unsatisfiable
+# for the oval band (<=5 turns by definition -- footprint.py FAMILIES), so an oval seed's
+# narrowing could never fire and the phase's own structural "best" tier would surface
+# whatever off-family exemplar happened to clear the turns>=8 bar instead. Fix: P6 no
+# longer sets min_turns (stays at LoopLibrary.pool's default 0); shape is the family
+# filter's job. Every fixture's family below is computed via classify_family(), not
+# assumed from its shape or variable name -- this plan has shipped a mis-specified
+# footprint fixture three times already.
+
+def test_wrapper_p6_scaffold_narrows_to_oval_family_for_oval_seed(monkeypatch, tmp_path):
+    """Regression: with an oval-seeded P6 episode, a library holding (a) an oval record
+    clearing every P6 criterion EXCEPT the old turns>=8 bar and (b) an off-family record
+    clearing ALL of them including turns>=8, the scaffold must offer the oval record --
+    not the off-family one. Before the fix, the oval record fails the old turns check, so
+    narrowing to family 0 never fires and the unnarrowed 'best' tier hands over the
+    off-family record instead."""
+    oval_seq = ([0] * 15 + [4, 4] + [10, 9, 9, 9, 9, 9, 13]
+                + [12, 27, 28, 6, 14] + [0] * 10 + [4, 4])
+    assert classify_family(oval_seq) == 0
+    # Shape suggests "winding" but it classifies as out_and_back (family 2) -- verified,
+    # not assumed. It clears the OLD P6 bar in full, including turns>=8 (turn_count 8).
+    competitor = ([0] * 10 + [4, 0, 3] + [0] * 4 + [3, 0, 4] + [0] * 8 + [29, 30]
+                  + [4, 4] + [10, 9, 9, 9, 9, 9, 9, 13] + [12, 27, 28, 6, 6, 14]
+                  + [11, 5, 13] + [12, 6, 14] + [0] * 6 + [4, 4])
+    assert classify_family(competitor) == 2
+
+    wrapper, base = _wrapped(monkeypatch, tmp_path, seed_loops=(oval_seq, competitor),
+                             p_cold=0.0)
+    wrapper.current_phase = 6
+    wrapper._update_phase_settings()
+    base.target_family = 0                      # this episode's seed: oval
+
+    plan = wrapper._sample_warm_start()
+
+    assert wrapper._loop_library.last_family_requested == 0
+    assert wrapper._loop_library.last_family_narrowed is True
+    assert plan.cold is False
+    assert plan.loop_len == len(oval_seq)
+
+
+def test_pool_p6_still_enforces_length_and_chain_bars_without_min_turns(tmp_path):
+    """Guard against the null fix (dropping min_turns by gutting the whole P6 bar): with
+    min_turns no longer part of the P6 criteria, a same-family record failing min_len (or
+    min_chains) must still miss the 'best' tier. Two oval records each fail exactly one
+    of the OTHER bars; only the fully-qualifying one may come back."""
+    good = ([0] * 15 + [4, 4] + [10, 9, 9, 9, 9, 9, 13]
+            + [12, 27, 28, 6, 14] + [0] * 10 + [4, 4])
+    fail_len = ([0] * 8 + [4, 4] + [10, 9, 9, 9, 9, 9, 13]
+                + [12, 27, 28, 6, 14] + [0] * 3 + [4, 4])
+    fail_chains = [0] * 15 + [4, 4] + [12, 27, 28, 6, 14] + [0] * 20 + [4, 4]
+    for seq in (good, fail_len, fail_chains):
+        assert classify_family(seq) == 0
+    assert len(good) >= 40 and len(fail_len) < 40 and len(fail_chains) >= 40
+    assert LoopRecord.from_actions(fail_chains, "scripted").chain_count == 0
+    assert LoopRecord.from_actions(fail_len, "scripted").chain_count >= 1
+
+    lib = _lib(tmp_path, sequences=(good, fail_len, fail_chains))
+    pool = lib.pool(phase=6, max_len=120, min_chains=1, min_len=40, min_drop_z=12,
+                    min_single_drop_z=12, min_excitement=0.0, min_turns=0, family=0)
+    assert [r.actions for r in pool] == [tuple(good)]
+
+
 def test_wrapper_initial_phase_starts_deep(monkeypatch, tmp_path):
     """Jul-19: a deep-P6 policy CANNOT re-walk Phase 1 (its committed 90+ piece builds
     truncate inside the 40-piece budget; live: cold completion 0.00, active unlearning).
@@ -617,7 +679,9 @@ def test_wrapper_initial_phase_starts_deep(monkeypatch, tmp_path):
     assert w1.current_phase == 1
 
 
-def test_wrapper_p6_scaffold_requests_turny_pool(monkeypatch, tmp_path):
+def test_wrapper_p6_scaffold_requests_exemplar_shaped_pool(monkeypatch, tmp_path):
+    """min_turns is NOT among P6's criteria (task 6b: an 8-turn floor is unsatisfiable
+    for the oval band, so shape is the family filter's job, not a turn-count bar)."""
     wrapper, base = _wrapped(monkeypatch, tmp_path, p_cold=0.0)
     seen = []
     orig = wrapper._annealer.sample_plan
@@ -633,7 +697,7 @@ def test_wrapper_p6_scaffold_requests_turny_pool(monkeypatch, tmp_path):
     phase, kw = seen[-1]
     assert phase == 6
     assert (kw['min_chains'], kw['min_len'], kw['min_drop_z'],
-            kw['min_single_drop_z'], kw['min_turns']) == (1, 40, 12, 12, 8)
+            kw['min_single_drop_z'], kw['min_turns']) == (1, 40, 12, 12, 0)
     assert kw['min_excitement'] >= 0.0                       # ratchet still applies
     wrapper.current_phase = 7                                # past-curriculum guard moved
     assert wrapper._sample_warm_start().cold is True
