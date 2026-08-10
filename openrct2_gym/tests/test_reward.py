@@ -18,6 +18,7 @@ from openrct2_gym.envs import openrct2_env as oe_mod
 from openrct2_gym.envs.openrct2_env import OpenRCT2Env, RewardParams
 from openrct2_gym.envs.obs_config import make_observation_space, SCALE, H_SCALE
 from openrct2_gym.envs.footprint import classify_family, switch_count, FAMILY_N
+from openrct2_gym.envs.track_pieces import RIGHT_TURN_ACTIONS
 from openrct2_gym.tests.test_env_smoke import FakeAPI
 
 DIRS = [(-1, 0), (0, 1), (1, 0), (0, -1)]  # API encoding: 0=W, 1=N, 2=E, 3=S (matches env.direction_vectors)
@@ -748,7 +749,9 @@ def test_discovery_potential_off_in_phase1_and_5_on_in_phase2():
     p5 = W._phase_reward_params(5)
     route = W._phase_reward_params(1).w_route * env._route_progress()
     exc_feat = p5.w_exc_feat * env._exc_feature_quality(p5)
-    family = p5.w_family * env._family_match(p5)
+    # _potential's w_family term reads _family_phi_match (its own wide falloffs), not
+    # _family_match -- see the phi-falloff-fix.
+    family = p5.w_family * env._family_phi_match(p5)
     assert phi_p5 == pytest.approx(phi_p1 - route + exc_feat + family)
 
 
@@ -3705,8 +3708,10 @@ def test_family_potential_streams_its_own_diagnostic(monkeypatch):
     _, _, terminated, _, info = _drive_to_terminal(env)
     assert terminated
     m = info['episode_metrics']
+    # The diagnostic mirrors what _potential actually adds: _family_phi_match, not the
+    # gate's _family_match -- see the phi-falloff-fix.
     assert m['family_potential'] == pytest.approx(
-        env.reward_params.w_family * env._family_match(env.reward_params))
+        env.reward_params.w_family * env._family_phi_match(env.reward_params))
 
 
 def test_p6_reward_params_enable_family_potential():
@@ -4108,16 +4113,18 @@ def test_adding_a_switch_on_an_oval_seed_is_net_negative_in_phi():
     """THE cancellation, asserted with its arithmetic so it cannot silently return.
 
     On an oval seed (0 switches by band) the switch must cost, and cost the FULL family
-    loss: w_family * 0.5 * (1 / family_switch_falloff) = 6 * 0.5 * 0.5 = 1.5, with the
-    exc-feature balance leg contributing exactly nothing. Before the fix the balance leg
-    handed back w_exc_feat / 6 = 1.0 of that, leaving -0.5."""
+    loss. Aug-10: the dense w_family term in _potential now reads its OWN wide falloff
+    (family_phi_switch_falloff=6.0), not the gate's family_switch_falloff=2.0 -- see the
+    phi-falloff-fix. So the loss is w_family * 0.5 * (1 / family_phi_switch_falloff) =
+    6 * 0.5 * (1/6) = 0.5, with the exc-feature balance leg contributing exactly nothing
+    (Fix 5 retired its target)."""
     W = ImprovedPhasedCurriculumWrapper
     for phase in (5, 6):
         p = W._phase_reward_params(phase)
         a, b = _switch_axis_pair()
         a.target_family = b.target_family = 0
-        expected_family_loss = p.w_family * 0.5 * (1.0 / p.family_switch_falloff)
-        assert expected_family_loss == pytest.approx(1.5)
+        expected_family_loss = p.w_family * 0.5 * (1.0 / p.family_phi_switch_falloff)
+        assert expected_family_loss == pytest.approx(0.5)
         d_phi = b._potential(p) - a._potential(p)
         assert d_phi < 0.0
         assert d_phi == pytest.approx(-expected_family_loss), f"phase {phase}"
@@ -4184,3 +4191,108 @@ def test_phases_1_and_2_reward_is_bit_identical_under_every_seed():
             rewards.add(round(env._calculate_reward(True, 0), 10))
         assert len(rewards) == 1, f"phase {phase}.{stage} reward varies with the seed"
         assert len(phis) == 1, f"phase {phase}.{stage} potential varies with the seed"
+
+
+# ------------------------------------------------- phi-falloff fix (Aug-10): the dense
+# family potential (w_family term) shared its falloffs with the completion gate. Fix 1A
+# correctly narrowed the gate's falloffs (2.0/2.0) so the bands became distinguishable,
+# but the SAME constants also drove the dense potential, which then went flat at exactly
+# 0.000 over most of the discovery range (measured: 0-6 turns toward winding, 0-13 toward
+# serpentine) -- no per-step gradient at all from a standing start. _family_phi_match now
+# grades the potential with its own, wider falloffs (family_phi_turn_falloff=12.0,
+# family_phi_switch_falloff=6.0); _family_match (the gate) is untouched.
+
+def test_family_phi_potential_rises_from_a_standing_start_toward_winding():
+    """THE regression. At the gate falloffs (2.0/2.0), Phi_family for a winding-target
+    build stayed at exactly 0.000 from 0 to 6 turns -- no gradient at all until the agent
+    stumbled into the band by chance. Under the repaired falloffs it must be strictly
+    positive at 0 turns and rise monotonically (non-decreasing) through 0->10 turns."""
+    W = ImprovedPhasedCurriculumWrapper
+    right = RIGHT_TURN_ACTIONS[0]
+    for phase in (4, 5):
+        p = W._phase_reward_params(phase)
+        assert (p.family_phi_turn_falloff, p.family_phi_switch_falloff) == (12.0, 6.0)
+        phis = []
+        for n in range(11):
+            env = _bare_env(history=_env_hist([(right, 14, 14)] * n))
+            env.target_family = 3   # winding: 10-13 turns, 3-5 switches
+            phis.append(env._family_phi_match(p))
+        assert phis[0] > 0.0, (
+            f"phase {phase}: Phi_family must not be flat at 0 from a standing start, got {phis}")
+        assert all(a <= b + 1e-9 for a, b in zip(phis, phis[1:])), (
+            f"phase {phase}: Phi_family must rise monotonically 0->10 turns, got {phis}")
+
+
+def test_family_phi_potential_rises_well_before_the_serpentine_band():
+    """Same defect, the serpentine band (14+ turns, unbounded above): at the gate
+    falloffs Phi_family stayed at 0.000 until turn 13. Under the repaired falloffs it
+    must already be positive and rising well before the band (at turn 6, 8 turns short)."""
+    W = ImprovedPhasedCurriculumWrapper
+    right = RIGHT_TURN_ACTIONS[0]
+    for phase in (4, 5):
+        p = W._phase_reward_params(phase)
+
+        def phi_at(n, p=p):
+            env = _bare_env(history=_env_hist([(right, 14, 14)] * n))
+            env.target_family = 4   # serpentine: 14+ turns, 6+ switches
+            return env._family_phi_match(p)
+
+        phi6, phi10, phi13 = phi_at(6), phi_at(10), phi_at(13)
+        assert phi6 > 0.0, (
+            f"phase {phase}: Phi_family must be positive well before the 14-turn band, got {phi6}")
+        assert phi10 > phi6, f"phase {phase}"
+        assert phi13 > phi10, f"phase {phase}"
+
+
+def test_gate_family_match_unchanged_by_the_phi_falloff_fix():
+    """The completion gate (_family_match) must be untouched: same narrow falloffs, same
+    values. These are the exact numbers that motivated narrowing the falloffs in the
+    first place (Fix 1A) -- an oval build against a spiral seed and against an
+    out_and_back seed."""
+    p = RewardParams()
+    assert (p.family_turn_falloff, p.family_switch_falloff) == (2.0, 2.0)
+    oval_env = _bare_env(history=_env_hist(_family_fixture(0)))
+    oval_env.target_family = 1   # spiral: 6-9 turns, 0 switches
+    assert oval_env._family_match(p) == pytest.approx(0.500)
+    oval_env.target_family = 2   # out_and_back: 6-9 turns, 1-2 switches
+    assert oval_env._family_match(p) == pytest.approx(0.250)
+
+
+def test_family_phi_potential_telescopes_toward_winding():
+    """PBRS hygiene under the REPAIRED (wide) falloffs and a non-oval target: a
+    place-then-remove cycle must return Phi to its prior value exactly, and the placed
+    piece must genuinely move Phi in between (else this would pass for an implementation
+    that ignores the family term entirely)."""
+    W = ImprovedPhasedCurriculumWrapper
+    p = W._phase_reward_params(5)
+    right = RIGHT_TURN_ACTIONS[0]
+    env = _bare_env(history=_env_hist([(right, 14, 14)] * 3))
+    env.target_family = 3   # winding
+    before = env._potential(p)
+    env.track_builder.history.append(
+        {"action": right, "position": [9, 0, 14], "next_position": [10, 0, 14]})
+    after = env._potential(p)
+    assert after != pytest.approx(before)
+    env.track_builder.history.pop()
+    assert env._potential(p) == pytest.approx(before)
+
+
+def test_family_phi_falloff_fields_default_wide_and_gate_falloffs_stay_narrow():
+    """The two pairs are independent RewardParams fields: the gate's stay narrow
+    (discrimination), the potential's default wide (guidance range)."""
+    p = RewardParams()
+    assert p.family_phi_turn_falloff == 12.0
+    assert p.family_phi_switch_falloff == 6.0
+    assert (p.family_turn_falloff, p.family_switch_falloff) == (2.0, 2.0)
+
+
+def test_family_phi_falloffs_inert_in_phases_1_and_2():
+    """w_family is 0 in P1/P2 (PHASE_FAMILIES pins the seed to family 0 there with
+    nothing reading it), so _family_phi_match is never called from _potential and the
+    new falloffs cannot affect those phases -- inherited defaults only, no per-phase
+    override exists for them."""
+    W = ImprovedPhasedCurriculumWrapper
+    for phase, stage in [(1, 1), (2, 1), (2, 2), (2, 3)]:
+        p = W._phase_reward_params(phase, phase2_stage=stage)
+        assert p.w_family == 0.0
+        assert (p.family_phi_turn_falloff, p.family_phi_switch_falloff) == (12.0, 6.0)

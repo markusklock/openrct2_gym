@@ -205,6 +205,21 @@ class RewardParams:
     # and this codebase's house rule is that a leg with no ramp is never discovered.
     family_turn_falloff: float = 2.0         # turns outside the band before credit hits 0
     family_switch_falloff: float = 2.0       # switches outside the band before credit hits 0
+    # Separate falloffs for the DENSE POTENTIAL (Aug-10 regression fix). family_turn_falloff/
+    # family_switch_falloff above are tuned for the completion gate's job -- DISCRIMINATE
+    # between families, which is why they must stay narrow (see the comment above). But
+    # _potential's w_family term reuses the exact same _family_match, and narrow falloffs
+    # make it flat at 0 over most of the reachable range: measured, a build progressing
+    # toward winding (10-13 turns) scored Phi_family == 0.000 from 0 to 6 turns at 2.0/2.0
+    # (and 0.000 from 0 to 13 turns for serpentine) -- no per-step gradient at all until the
+    # agent stumbles into the band by chance, which is exactly the discovery problem the
+    # dense potential exists to solve. The gate's job (discriminate) and the potential's job
+    # (guide) are incompatible on one constant: discrimination wants a cliff near the band,
+    # guidance wants a slope reaching back to a standing start. 12.0/6.0 are wide enough that
+    # Phi_family is already > 0 at 0 turns for every family (winding: 0.333; serpentine also
+    # rises well before 14 turns) while still reaching 1.0 inside the requested band.
+    family_phi_turn_falloff: float = 12.0    # potential-only: turns falloff (wide, for gradient reach)
+    family_phi_switch_falloff: float = 6.0   # potential-only: switches falloff (wide, ditto)
     # Discrete excitement milestones: R_exc_milestone paid per bar cleared by the measured
     # excitement (post-test). Staged bars make each increment a paid event on the way to
     # the E7-9 band -- the phase2-stage pattern applied to quality.
@@ -638,8 +653,11 @@ class OpenRCT2Env(gym.Env):
                 'exc_feat_potential': float(
                     self.reward_params.w_exc_feat
                     * self._exc_feature_quality(self.reward_params)),
+                # Mirrors the actual w_family term _potential adds (Aug-10: that term now
+                # uses _family_phi_match, its own wide falloffs -- see RewardParams). The
+                # gate/bonus/qualify diagnostics below stay on _family_match unchanged.
                 'family_potential': float(
-                    self.reward_params.w_family * self._family_match(self.reward_params)),
+                    self.reward_params.w_family * self._family_phi_match(self.reward_params)),
                 'max_gain': max((h['next_position'][2] - self.STATION_HEIGHT
                                  for h in self.track_builder.history), default=0.0),
                 'track_length': self.track_length,
@@ -1309,15 +1327,20 @@ class OpenRCT2Env(gym.Env):
         if params.w_exc_feat > 0.0:
             phi += params.w_exc_feat * self._exc_feature_quality(params)
         # Family-match term (P6): dense per-piece gradient toward the seed's requested
-        # footprint family -- the same _family_match the completion gate and R_family
-        # bonus consume, scored on the whole removal-safe history -> telescopes. Unlike
-        # w_h (chain gain, rises from ~0) and w_exc_feat (static features, rises from ~0),
-        # the oval band's [0,5] turn and [0,0] switch bounds mean an empty build already
-        # scores 1.0; potential can only fall. That is coherent (for an oval the gradient
-        # comes from length/drop/completion, not from building "something"), but it works
+        # footprint family, scored on the whole removal-safe history -> telescopes. Uses
+        # _family_phi_match -- its OWN wide falloffs (family_phi_turn_falloff/
+        # family_phi_switch_falloff), not the narrow gate falloffs _family_match uses for
+        # the completion gate / R_family / qualify leg. The narrow falloffs discriminate
+        # correctly at the gate but leave this dense term flat at 0 over most of the
+        # reachable range (measured: 0.000 from 0-6 turns toward winding, 0-13 toward
+        # serpentine) -- see RewardParams for the full regression writeup. Unlike w_h
+        # (chain gain, rises from ~0) and w_exc_feat (static features, rises from ~0), the
+        # oval band's [0,5] turn and [0,0] switch bounds mean an empty build already scores
+        # 1.0; potential can only fall. That is coherent (for an oval the gradient comes
+        # from length/drop/completion, not from building "something"), but it works
         # backward: this term mostly shapes the higher-numbered families that rise normally.
         if params.w_family > 0.0:
-            phi += params.w_family * self._family_match(params)
+            phi += params.w_family * self._family_phi_match(params)
         # Descent/return shaping: 0 at/above the summit (no double-pay), rising on the way home.
         phi += self._return_potential(params)
         # Steep, local near-closure FUNNEL: ramps to w_close only in the final close_range tiles at
@@ -1488,9 +1511,11 @@ class OpenRCT2Env(gym.Env):
             # contradicts the oval band (<= 5 turns), so on an oval seed it pays for turns
             # the seed forbids. It is left because Phi_family dominates it -- one extra
             # turn past the band gains w_exc_feat*(1/6)*(1/8) = 0.125 here and loses
-            # w_family*0.5*(1/family_turn_falloff) = 1.5 -- so the net gradient already
-            # points the right way, and re-aiming it at the seed is a retune of the whole
-            # excitement-feature potential, not a threshold fix. The balance leg below is
+            # w_family*0.5*(1/family_phi_turn_falloff) = 0.25 (Aug-10: the dense potential
+            # now reads its own wider falloff, not the gate's family_turn_falloff -- see
+            # RewardParams) -- so the net gradient still points the right way, and
+            # re-aiming it at the seed is a retune of the whole excitement-feature
+            # potential, not a threshold fix. The balance leg below is
             # different: its TARGET was zeroed (struct_turn_balance_target=0.0 in P5/P6)
             # because its arithmetic cancelled the family potential exactly -- but the
             # comps ENTRY itself is deliberately still here, not deleted. See its comment
@@ -1574,11 +1599,25 @@ class OpenRCT2Env(gym.Env):
         return [h.get("action") for h in hist]
 
     def _family_match(self, params):
-        """How well this build matches the family the seed asked for, in [0, 1]."""
+        """How well this build matches the family the seed asked for, in [0, 1]. Backs
+        the completion gate, R_family, the qualified-gate leg, and every family
+        diagnostic -- always the NARROW (discriminating) falloffs. See _family_phi_match
+        for the dense potential's own (wide, guiding) falloffs."""
         return family_match(self._history_actions(),
                             int(getattr(self, "target_family", 0)),
                             turn_falloff=params.family_turn_falloff,
                             switch_falloff=params.family_switch_falloff)
+
+    def _family_phi_match(self, params):
+        """Same grade as _family_match, but with the potential's own WIDE falloffs so the
+        dense w_family term in _potential has a gradient reaching back to a standing
+        start (see RewardParams.family_phi_turn_falloff). Still a pure function of the
+        removal-safe history -> PBRS-clean. Used ONLY inside _potential's w_family term;
+        every other consumer (gate/R_family/qualify/diagnostics) stays on _family_match."""
+        return family_match(self._history_actions(),
+                            int(getattr(self, "target_family", 0)),
+                            turn_falloff=params.family_phi_turn_falloff,
+                            switch_falloff=params.family_phi_switch_falloff)
 
     def _family_hit(self):
         """True when the build lands exactly in the requested family."""
