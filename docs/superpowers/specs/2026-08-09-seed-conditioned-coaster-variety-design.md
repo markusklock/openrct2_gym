@@ -153,7 +153,8 @@ count, and **hit rate per family**.
    excitement on **unaided** builds ≥ 4.5, tracked as `quality/median_excitement_cold`
    beside its sample count. This is a standalone criterion, not a by-product of criteria 1
    and 2, so quality progress stays visible even while variety is still developing.
-   Baseline at the time of writing: **2.38** (n=1704 cold harvests).
+   Baseline: **1.31** (median of a full 200-episode cold window). Corrected 2026-08-11
+   from an initially-recorded 2.38 — see "a second, smaller conflation" below.
 
 **Measurement rule:** the reward may score the whole track, but **every success claim is
 judged on unaided builds only**. Four times now a number has flattered us because the
@@ -184,6 +185,19 @@ at ~2.4.
 Decision (Markus, 2026-08-11): pursue variety and unaided quality **together**, with quality
 promoted to its own tracked criterion above, so success can never again be declared on
 borrowed numbers. No change to the family design, the reward structure, or criteria 1–3.
+
+### A second, smaller conflation, found the same day
+
+The cold/warm table above is drawn from the harvested **library**, which is not a neutral
+sample: `LoopLibrary.add` uses upgrade-append (`warm_start.py:210-215`), so a repeated action
+sequence only re-enters with a *strictly higher* rating and the library keeps each sequence's
+best. The agent builds the same oval repeatedly, so its library median is biased upward.
+
+`quality/median_excitement_cold`, a median over the last 200 tested unaided episodes with no
+filtering or dedup, reads **1.31** — and that is the number criterion 4 is judged on. The
+library figures (cold 2.38 / warm 5.58) remain useful for the *relative* comparison that
+exposed the original conflation, but both are optimistic in absolute terms. Criterion 4's
+baseline is therefore 1.31, not 2.38.
 
 ## Risks
 
