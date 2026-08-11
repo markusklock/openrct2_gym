@@ -149,9 +149,41 @@ count, and **hit rate per family**.
    120-piece ceiling accommodates it. This adjustment allows Phase 3 to focus on shapes
    geometrically feasible within its constraints.
 
+4. **Unaided quality** (added 2026-08-11, see the amendment below) — median measured
+   excitement on **unaided** builds ≥ 4.5, tracked as `quality/median_excitement_cold`
+   beside its sample count. This is a standalone criterion, not a by-product of criteria 1
+   and 2, so quality progress stays visible even while variety is still developing.
+   Baseline at the time of writing: **2.38** (n=1704 cold harvests).
+
 **Measurement rule:** the reward may score the whole track, but **every success claim is
-judged on unaided builds only**. Three times a number has flattered us because the scaffold,
-not the agent, supplied the structure.
+judged on unaided builds only**. Four times now a number has flattered us because the
+scaffold, not the agent, supplied the structure.
+
+## Amendment, 2026-08-11: unaided quality was never demonstrated
+
+This design was written on the premise "the agent builds a good coaster; now make it
+varied." That premise was false, and the error was in the instrument rather than the policy.
+
+`quality/median_excitement` pooled every tested episode. A *warm* episode replays a prefix of
+a library exemplar (library best E 6.45), so its rating largely reflects the exemplar, not
+the policy. With the cold-episode fraction at 0.25–0.35, warm rides dominated the window.
+Split by source over 3,000 recent harvests:
+
+| source | n | median | mean | max |
+|---|---|---|---|---|
+| cold — the agent placed every piece | 1704 | **2.38** | 1.95 | 5.81 |
+| warm — a replayed exemplar | 1296 | **5.58** | 5.35 | 6.21 |
+
+The predecessor run's headline "median excitement 5.58 at 22.5M steps" was measured the same
+pooled way, so **v1's ride quality was also substantially the scaffold's**; its archive
+README carries a correction. The same conflation was breaking training, not merely
+reporting: the Phase-5 exploration floor releases when median excitement clears 4.0, which
+warm replays cleared on their own, withdrawing exploration while the policy's own rides sat
+at ~2.4.
+
+Decision (Markus, 2026-08-11): pursue variety and unaided quality **together**, with quality
+promoted to its own tracked criterion above, so success can never again be declared on
+borrowed numbers. No change to the family design, the reward structure, or criteria 1–3.
 
 ## Risks
 
