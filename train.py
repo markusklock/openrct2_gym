@@ -243,9 +243,15 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
         self._cold_window = deque(maxlen=COLD_RATE_WINDOW)  # cold episodes (TB tag + gates readout)
         self._ent_mode_calls = 0       # _maybe_update_ent_mode invocations (one per rollout end)
         self._ent_mode_last_flip = 0   # call index of the last mode flip (min-hold anchor)
-        # Phase-4+ ride-test telemetry: tested-episode excitement (drives the P5 quality
-        # floor) and test-success outcomes, pooled across envs.
+        # Phase-4+ ride-test telemetry: tested-episode excitement and test-success outcomes,
+        # pooled across envs. `_exc_window` pools warm (scaffold-replayed) episodes with
+        # cold (agent-built) ones -- a warm episode largely rates the library exemplar it
+        # replayed, not the policy, so this window is a dashboard/history number only and
+        # must not drive any decision about the agent's own quality (measured live: warm
+        # median 5.58 vs. cold median 2.37 -- see cold-quality-fix-report.md). `_exc_cold_window`
+        # holds cold-only excitement and is what any success/exploration decision must read.
         self._exc_window = deque(maxlen=QUALITY_WINDOW)
+        self._exc_cold_window = deque(maxlen=QUALITY_WINDOW)
         self._test_window = deque(maxlen=QUALITY_WINDOW)
 
     def _note_env_phase(self, env_idx, info):
@@ -281,18 +287,39 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
         print(f"🛡️ Phase 2 reached: armed guard {OPT_GUARDED}")
 
     def _median_excitement(self):
-        """Median excitement over pooled TESTED episodes, or None until enough samples."""
+        """Median excitement over pooled TESTED episodes (warm scaffold replays included), or
+        None until enough samples. This pools scaffold-supplied quality with the agent's own
+        builds -- a warm episode replays a prefix of a library exemplar, so its rating largely
+        reflects the exemplar, not the policy (measured live: warm median 5.58 vs. cold median
+        2.37). Dashboard/history number only; NOT a measure of the policy's own quality and
+        must not drive any decision -- use `_median_excitement_cold()` for that."""
         if len(self._exc_window) < QUALITY_MIN_SAMPLES:
             return None
         return float(np.median(self._exc_window))
 
+    def _median_excitement_cold(self):
+        """Median excitement over pooled COLD (agent-built, unaided) TESTED episodes, or None
+        until enough cold samples exist. This is the policy's own quality, per the project's
+        standing rule that success claims are judged on unaided builds only."""
+        if len(self._exc_cold_window) < QUALITY_MIN_SAMPLES:
+            return None
+        return float(np.median(self._exc_cold_window))
+
     def _p5_quality_boost_active(self):
-        """Whether the Phase-5 exploration floor is held: fleet in phase 5 and median tested
-        excitement below the floor target (or unknown -- entering P5 holds exploration until
-        the telemetry says quality is climbing)."""
+        """Whether the Phase-5 exploration floor is held: fleet in phase 5 and median COLD
+        (unaided) tested excitement below the floor target (or unknown -- entering P5 holds
+        exploration until the telemetry says the agent's OWN quality is climbing).
+
+        Deliberately keyed to the cold-only median, not the pooled one: warm (scaffold-
+        replayed) episodes clear QUALITY_EXC_TARGET_FLOOR by themselves (measured live: warm
+        median 5.58 vs. cold median 2.37), so the pooled median released this floor on the
+        scaffold's quality while the policy's own rides were still ~2.4 -- withdrawing
+        exploration exactly when the agent still needed it. `None` (too few cold samples)
+        still holds exploration, same as before -- the conservative direction, and more load-
+        bearing now since the cold window fills more slowly than the pooled one."""
         if self._phase < 5:
             return False
-        med = self._median_excitement()
+        med = self._median_excitement_cold()
         return med is None or med < QUALITY_EXC_TARGET_FLOOR
 
     def _phase_base_ent_coef(self):
@@ -432,6 +459,13 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
         median_exc = self._median_excitement()
         if median_exc is not None:
             self.logger.record('quality/median_excitement', median_exc)
+        median_exc_cold = self._median_excitement_cold()
+        if median_exc_cold is not None:
+            self.logger.record('quality/median_excitement_cold', median_exc_cold)
+        # Fill counter so a reader can tell an early small-sample cold median from a settled
+        # one (a median over 3 samples must not look like a median over 300). Emitted
+        # unconditionally, unlike the median itself, which is withheld below QUALITY_MIN_SAMPLES.
+        self.logger.record('quality/excitement_cold_n', len(self._exc_cold_window))
 
     def _on_step(self) -> bool:
         # Track total steps for throughput calculation
@@ -493,7 +527,10 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
                                   or rr.get('nausea', 0) > 0)
                     self._test_window.append(tested)
                     if tested:
-                        self._exc_window.append(float(rr.get('excitement', 0.0)))
+                        exc = float(rr.get('excitement', 0.0))
+                        self._exc_window.append(exc)
+                        if _info_q.get('cold_start', False):
+                            self._exc_cold_window.append(exc)
                         self.logger.record('quality/excitement', float(rr.get('excitement', 0.0)))
                         self.logger.record('quality/intensity', float(rr.get('intensity', 0.0)))
                         self.logger.record('quality/nausea', float(rr.get('nausea', 0.0)))

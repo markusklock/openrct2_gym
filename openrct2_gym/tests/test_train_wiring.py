@@ -980,7 +980,12 @@ def test_p5_quality_floor_holds_exploration_while_excitement_low():
     bigger coasters even with a reward gradient. While the fleet is in P5 and median
     excitement is below the floor target, the resting ent_coef is raised and the collapse
     band uses the raised (bootstrap) thresholds; once excitement clears the bar, the
-    proven exploit config returns."""
+    proven exploit config returns.
+
+    Drives the COLD-only window: the decision must track the agent's own unaided quality,
+    not the pooled (warm-inclusive) median -- see the cold-quality-fix report. Manipulating
+    the pooled `_exc_window` here instead would silently re-encode the fixed defect (warm
+    replays clearing the floor on the scaffold's quality)."""
     from types import SimpleNamespace
     cb = T.ParallelCurriculumMaskableCallback(n_envs=1)
     cb.model = SimpleNamespace(target_kl=0.04, ent_coef=0.015)
@@ -991,11 +996,11 @@ def test_p5_quality_floor_holds_exploration_while_excitement_low():
     assert cb._phase_base_ent_coef() == T.P5_QUALITY_ENT_COEF
     assert cb._ent_band() == (T.BOOT_ENT_LO, T.BOOT_ENT_HI, T.BOOT_ENT_BOOST)
     for _ in range(T.QUALITY_MIN_SAMPLES):
-        cb._exc_window.append(2.0)                          # stuck below the bar
+        cb._exc_cold_window.append(2.0)                     # stuck below the bar
     assert cb._p5_quality_boost_active() is True
-    cb._exc_window.clear()
+    cb._exc_cold_window.clear()
     for _ in range(T.QUALITY_MIN_SAMPLES):
-        cb._exc_window.append(5.5)                          # quality climbing -> hand back
+        cb._exc_cold_window.append(5.5)                     # quality climbing -> hand back
     assert cb._p5_quality_boost_active() is False
     assert cb._phase_base_ent_coef() == T.OPT_GUARDED['ent_coef']
     assert cb._ent_band() == (T.ENT_COLLAPSE_LO, T.ENT_COLLAPSE_HI, T.ENT_COLLAPSE_BOOST)
@@ -1010,6 +1015,104 @@ def test_p5_quality_floor_inactive_below_phase5():
     cb._phase = 3
     assert cb._p5_quality_boost_active() is False
     assert cb._phase_base_ent_coef() == T.OPT_GUARDED['ent_coef']
+
+
+def _quality_step_cold(cb, env_idx, phase, excitement, cold_start, tested=True):
+    """Like _quality_step but stamps cold_start on the info dict, mirroring how the real
+    warm-start wrapper marks scaffolded vs. agent-built episodes."""
+    from types import SimpleNamespace
+    logger_store = {}
+    cb.model.logger = SimpleNamespace(
+        name_to_value={}, record=lambda k, v, *a, **kw: logger_store.__setitem__(k, v))
+    rr = ({'excitement': excitement, 'intensity': 3.0, 'nausea': 1.0}
+          if tested else {'excitement': 0, 'intensity': 0, 'nausea': 0})
+    cb.locals = {
+        'dones': [True],
+        'infos': [{'loop_completed': True, 'cold_start': cold_start, 'learning_phase': phase,
+                   'ride_rating': rr, 'track_length': 30, 'current_distance': 0.0,
+                   'collision_count': 0,
+                   'episode_metrics': {'track_length': 30, 'drop_z': 8.0, 'chain_height': 6.0,
+                                       'test_ok': tested, 'min_distance': 0.0}}],
+    }
+    cb._on_step()
+    return logger_store
+
+
+def test_cold_excitement_window_excludes_warm_episodes():
+    """The library's best-known loop rates E 6.45; a warm episode replays a prefix of it, so
+    its ride rating reflects the exemplar, not the policy. Pooling warm into the quality
+    telemetry inflates the dashboard with scaffold-supplied quality (measured live: warm
+    median 5.58 vs. cold median 2.37). The cold-only window must contain only cold-episode
+    excitement, clearly separated values so a leak is unmistakable."""
+    from types import SimpleNamespace
+    cb = T.ParallelCurriculumMaskableCallback(n_envs=1)
+    cb.model = SimpleNamespace(target_kl=None, ent_coef=0.01, get_env=lambda: None)
+    _quality_step_cold(cb, 0, phase=5, excitement=2.0, cold_start=True)
+    _quality_step_cold(cb, 0, phase=5, excitement=6.0, cold_start=False)
+    _quality_step_cold(cb, 0, phase=5, excitement=2.5, cold_start=True)
+    assert list(cb._exc_cold_window) == [pytest.approx(2.0), pytest.approx(2.5)]
+    assert cb._median_excitement_cold() is None  # below QUALITY_MIN_SAMPLES, correctly unknown
+
+
+def test_pooled_excitement_metric_unchanged_by_cold_split():
+    """quality/median_excitement (the pooled metric) must keep pooling warm + cold exactly
+    as before -- dashboards and history depend on it not shifting silently."""
+    from types import SimpleNamespace
+    cb = T.ParallelCurriculumMaskableCallback(n_envs=1)
+    cb.model = SimpleNamespace(target_kl=None, ent_coef=0.01, get_env=lambda: None)
+    _quality_step_cold(cb, 0, phase=5, excitement=2.0, cold_start=True)
+    _quality_step_cold(cb, 0, phase=5, excitement=6.0, cold_start=False)
+    _quality_step_cold(cb, 0, phase=5, excitement=2.5, cold_start=True)
+    assert list(cb._exc_window) == [pytest.approx(2.0), pytest.approx(6.0), pytest.approx(2.5)]
+
+
+def test_p5_decision_follows_cold_not_pooled_quality():
+    """The defect: warm replays clear QUALITY_EXC_TARGET_FLOOR by themselves, so the pooled
+    median released the P5 exploration floor while the agent's own (cold) rides were still
+    well below it. The decision must be keyed to the cold-only median: with warm ratings
+    above the floor and cold ratings below it, exploration must stay held (True)."""
+    from types import SimpleNamespace
+    cb = T.ParallelCurriculumMaskableCallback(n_envs=1)
+    cb.model = SimpleNamespace(target_kl=None, ent_coef=0.01, get_env=lambda: None)
+    cb._phase = 5
+    for _ in range(T.QUALITY_MIN_SAMPLES):
+        _quality_step_cold(cb, 0, phase=5, excitement=6.0, cold_start=False)  # warm: clears floor
+    for _ in range(T.QUALITY_MIN_SAMPLES):
+        _quality_step_cold(cb, 0, phase=5, excitement=2.0, cold_start=True)   # cold: below floor
+    # pooled median would be well above the floor (mix of 6.0s and 2.0s) -- but the P5
+    # decision must hold exploration because the agent's OWN (cold) builds are still low.
+    assert cb._median_excitement() >= T.QUALITY_EXC_TARGET_FLOOR
+    assert cb._p5_quality_boost_active() is True
+
+
+def test_p5_decision_holds_on_none_cold_median():
+    """Preserve the conservative 'unknown holds exploration' behaviour: with too few cold
+    samples (even if the pooled window is well-stocked with warm data), the boost must stay
+    active."""
+    from types import SimpleNamespace
+    cb = T.ParallelCurriculumMaskableCallback(n_envs=1)
+    cb.model = SimpleNamespace(target_kl=None, ent_coef=0.01, get_env=lambda: None)
+    cb._phase = 5
+    for _ in range(T.QUALITY_MIN_SAMPLES):
+        _quality_step_cold(cb, 0, phase=5, excitement=6.0, cold_start=False)  # warm only
+    assert cb._median_excitement_cold() is None
+    assert cb._p5_quality_boost_active() is True
+
+
+def test_cold_excitement_fill_counter_matches_window_length():
+    """quality/excitement_cold_n lets a reader tell an early small-sample median from a
+    settled one -- a median over 3 samples must not look like a median over 300."""
+    from types import SimpleNamespace
+    cb = T.ParallelCurriculumMaskableCallback(n_envs=1)
+    cb.model = SimpleNamespace(target_kl=None, ent_coef=0.01, get_env=lambda: None)
+    _quality_step_cold(cb, 0, phase=5, excitement=2.0, cold_start=True)
+    _quality_step_cold(cb, 0, phase=5, excitement=2.5, cold_start=True)
+    _quality_step_cold(cb, 0, phase=5, excitement=6.0, cold_start=False)
+    cb.model.logger = SimpleNamespace(name_to_value={}, record=lambda *a, **k: None)
+    logged = {}
+    cb.model.logger.record = lambda k, v, *a, **kw: logged.__setitem__(k, v)
+    cb._on_rollout_end()
+    assert logged['quality/excitement_cold_n'] == len(cb._exc_cold_window) == 2
 
 
 def test_env_factory_requests_game_speed_best_effort(monkeypatch, tmp_path):
