@@ -24,7 +24,7 @@ def test_make_inference_env_is_cold_and_phase_aware(monkeypatch, tmp_path):
     base = w
     while hasattr(base, "env"):
         base = base.env
-    assert base.max_track_length == 120           # P6 budget, not Phase 1's 40
+    assert base.max_track_length == 90             # P6 budget, not Phase 1's 40
     env.close()
 
 

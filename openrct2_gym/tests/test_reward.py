@@ -3075,7 +3075,7 @@ def test_p5_advances_to_p6_when_ladder_done_and_quality_holds(monkeypatch):
     w.episode_qualified_results.extend([True] * 20 + [False] * 30)   # 40% >= E4 cold
     assert w._check_phase_advancement() is True
     assert w.current_phase == 6
-    assert base.max_track_length == w.phase6_max_length == 120
+    assert base.max_track_length == w.phase6_max_length == 90
     assert base.skip_ride_testing is False
     # below the entry bar: no advancement
     w2 = ImprovedPhasedCurriculumWrapper(OpenRCT2Env(verbose=0), verbose=0)

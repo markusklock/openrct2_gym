@@ -711,13 +711,46 @@ def test_wrapper_initial_phase_starts_deep(monkeypatch, tmp_path):
     P5 ladder marked complete, and the annealer in its P5+ (+4) mode."""
     wrapper, base = _wrapped(monkeypatch, tmp_path, initial_phase=6)
     assert wrapper.current_phase == 6
-    assert base.max_track_length == wrapper.phase6_max_length == 120
+    assert base.max_track_length == wrapper.phase6_max_length == 90
     assert base.skip_ride_testing is False
     assert wrapper.phase5_current_length == wrapper.phase5_target_length
     assert getattr(wrapper._annealer, "k_step", 2) == 4
     # default stays a cold start at phase 1
     w1, _ = _wrapped(monkeypatch, tmp_path.joinpath("d"), p_cold=0.0)
     assert w1.current_phase == 1
+
+
+def test_phase_track_budgets_are_non_decreasing(monkeypatch, tmp_path):
+    """Aug-12: phase5_target_length and phase6_max_length were lowered 120 -> 90 (see
+    phase5_target_length's constructor comment for why). The invariant that motivated
+    stopping to ask before that change -- no phase's track-length budget may drop below
+    the previous phase's -- must keep holding for whatever the current numbers are, so
+    this reads the wrapper's own attributes instead of restating the literals: a future
+    retune of any one phase's budget breaks this if it opens a gap."""
+    wrapper, _ = _wrapped(monkeypatch, tmp_path)
+    budgets = [
+        wrapper.phase1_max_length,
+        wrapper.phase2_max_length,
+        wrapper.phase3_max_length,
+        wrapper.phase4_max_length,
+        wrapper.phase5_target_length,   # the ramp's ceiling -- every policy that reaches
+                                         # P6 has topped it out (see phase5>=6 entry gate)
+        wrapper.phase6_max_length,
+    ]
+    for earlier, later in zip(budgets, budgets[1:]):
+        assert later >= earlier, f"track budget regressed: {budgets}"
+
+
+def test_phase6_budget_keeps_headroom_over_struct_length_target(monkeypatch, tmp_path):
+    """Phase 6's structural length credit ramps toward struct_length_target (the
+    ~370m/5.5-m-per-piece rating-cap proxy, shared with P5 -- see _phase_reward_params).
+    The track budget must still leave room past that target, or a build that maxes out
+    length credit can't do anything else with its remaining pieces."""
+    wrapper, _ = _wrapped(monkeypatch, tmp_path)
+    target = ImprovedPhasedCurriculumWrapper._phase_reward_params(6).struct_length_target
+    assert wrapper.phase6_max_length > target
+    assert (wrapper.phase6_max_length - target) >= 0.1 * target, (
+        "P6 budget barely clears struct_length_target -- not real headroom")
 
 
 def test_wrapper_p6_scaffold_requests_exemplar_shaped_pool(monkeypatch, tmp_path):
