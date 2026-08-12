@@ -17,7 +17,7 @@ import pytest
 from openrct2_gym.envs import openrct2_env as oe_mod
 from openrct2_gym.envs.openrct2_env import OpenRCT2Env, RewardParams
 from openrct2_gym.envs.obs_config import make_observation_space, SCALE, H_SCALE
-from openrct2_gym.envs.footprint import classify_family, switch_count, FAMILY_N
+from openrct2_gym.envs.footprint import classify_family, family_match, switch_count, FAMILY_N
 from openrct2_gym.envs.track_pieces import RIGHT_TURN_ACTIONS
 from openrct2_gym.tests.test_env_smoke import FakeAPI
 
@@ -3302,7 +3302,9 @@ def test_p6_retires_the_style_gate_for_the_family_gate():
     (default-inert) so earlier phases and its own tests are untouched."""
     p6 = ImprovedPhasedCurriculumWrapper._phase_reward_params(6)
     assert p6.completion_style_floor == 1.0
-    assert p6.completion_family_floor == 0.5
+    assert p6.completion_family_floor == 0.4   # Aug-12: 0.5 -> 0.4, see the wrapper's
+                                                # per-phase block for the quality-unlock
+                                                # provenance
 
 
 def _p6_payout(params, rows, excitement, intensity=6.0, nausea=2.5, family=0):
@@ -3594,7 +3596,7 @@ def test_p6_params_switch_off_the_fixed_turn_target_and_balance_leg():
     assert p6.struct_w_turns == 0.0
     assert p6.struct_w_turn_balance == 0.0
     assert p6.completion_style_floor == 1.0
-    assert p6.completion_family_floor == 0.5
+    assert p6.completion_family_floor == 0.4   # Aug-12: 0.5 -> 0.4
     assert p6.R_family == 200.0
     assert p6.qualify_requires_family is True
     # the fixed variety legs are gone from the qualified predicate too -- with them on,
@@ -3764,9 +3766,12 @@ def test_family_ramp_phases_3_4_5_match_the_table():
 
 def test_family_ramp_p6_unchanged():
     """Explicit values, not a delta -- so this task cannot silently retune the phase the
-    earlier family tasks already tuned."""
+    earlier family tasks already tuned. completion_family_floor is 0.4 (Aug-12: lowered
+    from 0.5 once unaided quality made R_family/R_qualify payable -- see
+    test_p6_family_economics_matching_shape_beats_oval_under_family_seed for the
+    provenance)."""
     p6 = ImprovedPhasedCurriculumWrapper._phase_reward_params(6)
-    assert p6.completion_family_floor == 0.5
+    assert p6.completion_family_floor == 0.4
     assert p6.w_family == 6.0
     assert p6.R_family == 200.0
     assert p6.qualify_requires_family is True
@@ -4296,3 +4301,104 @@ def test_family_phi_falloffs_inert_in_phases_1_and_2():
         p = W._phase_reward_params(phase, phase2_stage=stage)
         assert p.w_family == 0.0
         assert (p.family_phi_turn_falloff, p.family_phi_switch_falloff) == (12.0, 6.0)
+
+
+# ------------------------------- P6 family floor lowered 0.5 -> 0.4 (Aug-12)
+# Each episode draws a seed naming a target shape family; the completion gate is
+# floor + (1-floor)*family_match, so a build that ignores its seed forfeits part of the
+# payout while a matching build gets the full amount. Unaided builds ignored the seed on
+# ~99% of episodes -- RATIONAL at 0.5, because R_family/R_qualify (both gated on tested
+# excitement >= qualify_min_excitement=4.5) were structurally unpayable while unaided
+# quality sat at ~2.6. Quality has since reached ~5.5 (cold-only window + recent cold
+# harvests, two independent measurements), making both bonuses payable, so the floor is
+# cut further to make the requested shape's expected value win outright. See the wrapper's
+# per-phase P6 block for the full economics table.
+
+def test_p6_completion_family_floor_is_040_and_other_phases_unchanged():
+    """Assert the WHOLE per-phase completion_family_floor set, not just P6, so a stray
+    edit to another phase's floor (or a P2 sub-stage) surfaces here too."""
+    W = ImprovedPhasedCurriculumWrapper
+    assert W._phase_reward_params(1).completion_family_floor == 1.0
+    assert W._phase_reward_params(2, phase2_stage=1).completion_family_floor == 1.0
+    assert W._phase_reward_params(2, phase2_stage=2).completion_family_floor == 1.0
+    assert W._phase_reward_params(2, phase2_stage=3).completion_family_floor == 1.0
+    assert W._phase_reward_params(3).completion_family_floor == 0.85
+    assert W._phase_reward_params(4).completion_family_floor == 0.75
+    assert W._phase_reward_params(5).completion_family_floor == 0.60
+    assert W._phase_reward_params(6).completion_family_floor == 0.40
+
+
+def test_p6_family_economics_matching_shape_beats_oval_under_family_seed():
+    """THE point of the Aug-12 change: under an out-and-back seed, the matching build's
+    expected value must beat the default oval's. Computed from the LIVE params
+    (R_complete/completion_family_floor/R_family/R_qualify) and the REAL
+    footprint.family_match for each build -- not restated constants -- so this test
+    tracks the parameters instead of the arithmetic that once justified them. Closure
+    probabilities (0.90 oval / 0.40 matching) are the measured, external inputs (10
+    unaided episodes/seed at the P6 120-piece budget) and are NOT derived from the
+    reward params. Must fail at completion_family_floor=0.50 (the pre-Aug-12 value):
+    oval's 0.90 x 1000 x 0.625 = 562.5 edges the matching build's
+    0.40 x (1000 + 200 + 200) = 560."""
+    P6 = ImprovedPhasedCurriculumWrapper._phase_reward_params(6)
+    OUT_AND_BACK = 2   # footprint.FAMILIES index; PHASE_FAMILIES uses the same indices
+
+    oval_actions = [4] * 4          # 4 same-direction turns, 0 switches
+    matching_actions = [4] * 6 + [3]  # 7 turns, 1 switch
+    # Verify the fixtures against the REAL bands (this branch has shipped a
+    # mis-specified footprint fixture four times) rather than assuming the shape.
+    assert classify_family(oval_actions) == 0                    # a genuine oval
+    assert classify_family(matching_actions) == OUT_AND_BACK     # a genuine out-and-back
+
+    oval_match = family_match(oval_actions, OUT_AND_BACK,
+                               P6.family_turn_falloff, P6.family_switch_falloff)
+    matching_match = family_match(matching_actions, OUT_AND_BACK,
+                                   P6.family_turn_falloff, P6.family_switch_falloff)
+    assert matching_match == pytest.approx(1.0)   # full credit: this IS the requested shape
+
+    def gate(match):
+        return P6.completion_family_floor + (1.0 - P6.completion_family_floor) * match
+
+    P_CLOSE_OVAL = 0.90       # measured, unaided, oval seed, P6 budget
+    P_CLOSE_MATCHING = 0.40   # measured, unaided, out-and-back seed, P6 budget
+
+    ev_oval = P_CLOSE_OVAL * P6.R_complete * gate(oval_match)
+    # The matching build clears the family AND excitement gate, so it collects
+    # R_family + R_qualify on top of the (fully-released, since match==1.0) completion.
+    ev_matching = P_CLOSE_MATCHING * (P6.R_complete * gate(matching_match)
+                                       + P6.R_family + P6.R_qualify)
+
+    assert ev_matching > ev_oval
+
+
+def test_p6_family_gate_is_exactly_one_for_a_matched_build_at_any_floor():
+    """The matched-build invariant: a build whose family_match is 1.0 must gate to
+    exactly 1.0 regardless of the floor, so lowering the floor can never penalise a
+    correct build -- only mismatched builds forfeit more. Exercised through the real
+    _calculate_reward code path (env._last_family_gate), not just the arithmetic
+    identity, across several floor values including the old (0.50) and new (0.40)."""
+    matching_actions = [4] * 6 + [3]   # 7 turns, 1 switch -> a genuine out-and-back
+    assert classify_family(matching_actions) == 2
+    rows = [(a, 14, 14) for a in matching_actions]
+    # floor==1.0 is the pre-existing "gate disabled" case (test_family_reward_fields_
+    # default_inert): the code skips computing a gate at all there since the multiplier
+    # is trivially 1, so _last_family_gate stays unpopulated -- not a meaningful point
+    # for THIS invariant, which is about the gate math itself.
+    for floor in (0.0, 0.10, 0.25, 0.40, 0.50, 0.75, 0.90):
+        params = replace(RewardParams(), completion_family_floor=floor, roundtrip_gain=0.0)
+        env = _family_env(rows, 2, params)
+        env._calculate_reward(True, 0)
+        assert env._last_family_gate == pytest.approx(1.0)
+
+
+def test_validate_completion_first_still_holds_at_p6_lowered_family_floor():
+    """Lowering a multiplicative floor TIGHTENS the completion-first invariant's flat-
+    floor product (see _validate_completion_first's docstring), so a config that passed
+    at 0.50 is not guaranteed to pass at 0.40 -- confirm rather than assume. P6 has
+    completion_hill_floor==0.0 (the second check is a no-op there), but
+    _phase_reward_params(6) already runs the invariant on construction; this test pins
+    that down explicitly so a future edit that raises P6's milestones cannot silently
+    slip past it."""
+    W = ImprovedPhasedCurriculumWrapper
+    p6 = W._phase_reward_params(6)   # raises AssertionError on construction if it fails
+    assert p6.completion_family_floor == 0.40
+    W._validate_completion_first(p6, "phase 6")   # must not raise a second time either

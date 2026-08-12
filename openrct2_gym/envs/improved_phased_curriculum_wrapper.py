@@ -298,12 +298,37 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                 completion_style_floor=1.0,      # superseded by the family gate: the
                                                   # fixed turns+balance ramp fought the
                                                   # seed on every non-winding family
-                completion_family_floor=0.5,     # ignore your seed -> forfeit half of
-                                                  # the completion payout, from step one
-                                                  # (0.5, not 0.6: milestones/viable/
-                                                  # quality are shape-blind, so the
-                                                  # gate must cut deeper to clear a
-                                                  # decisive step-one edge)
+                completion_family_floor=0.4,     # ignore your seed -> forfeit 60% of
+                                                  # the completion payout, from step one.
+                                                  # Lowered 0.5 -> 0.4 (Aug-12): R_family
+                                                  # (200) and R_qualify (200) are both
+                                                  # gated on tested excitement >=
+                                                  # qualify_min_excitement=4.5, so while
+                                                  # unaided quality sat at ~2.6 both bonuses
+                                                  # were structurally unpayable and the
+                                                  # shape choice lost to the reliable oval
+                                                  # even at this floor -- unaided builds
+                                                  # ignored the seed on ~99% of episodes,
+                                                  # which was RATIONAL: at the P6 120-piece
+                                                  # budget the requested shapes close less
+                                                  # often (measured, 10 unaided episodes/
+                                                  # seed: oval 90%, out-and-back 40%,
+                                                  # winding 60%), and at floor=0.5 an
+                                                  # out-and-back seed's EV was
+                                                  # 0.90*1000*0.625=562 for an oval build
+                                                  # vs 0.40*(1000+200+200)=560 for the
+                                                  # requested shape -- a virtual tie the
+                                                  # oval edged. Unaided quality has since
+                                                  # reached ~5.5 (cold-only episode window
+                                                  # + recent cold harvests, two independent
+                                                  # measurements), making R_family/
+                                                  # R_qualify payable, so at 0.4 the same
+                                                  # comparison becomes 495 vs 560 -- the
+                                                  # requested shape wins by ~13%. A matched
+                                                  # build is unaffected either way (its
+                                                  # family_match is 1.0, so the gate is 1.0
+                                                  # at any floor); only mismatched builds
+                                                  # forfeit more.
                 R_family=200.0,
                 qualify_requires_family=True,
                 exc_gate_target=6.0,
