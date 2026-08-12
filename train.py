@@ -913,11 +913,8 @@ def create_curriculum_masked_env(port: int, verbose: int = 0,
         phase3_max_length=60,   # Drop & turn
         phase4_max_length=80,   # Circuit mastery
         phase5_initial_length=80,
-        phase5_target_length=90,   # Aug-12: 120->90, together with phase6_max_length
-                                    # (see the wrapper constructor default's comment for
-                                    # the shape-feasibility probe and quality cost)
+        phase5_target_length=120,
         phase5_increase_step=10,
-        phase6_max_length=90,      # Aug-12: matches phase5_target_length's ceiling
         verbose=verbose,
         warm_start_enabled=warm_start_enabled,
         initial_phase=start_phase,
@@ -1024,7 +1021,7 @@ def train(
     print("  Phase 2: Lift Hill Building (40 pieces) - staged chain roundtrip/completion gates")
     print("  Phase 3: Drop & Turn (60 pieces) - Learn drops & turnarounds")
     print("  Phase 4: Circuit Mastery (80 pieces) - Full integration")
-    print("  Phase 5: Quality Optimization (80-90 pieces) - E=7-9, I=4.5-6.5, N<4.5")
+    print("  Phase 5: Quality Optimization (80-120 pieces) - E=7-9, I=4.5-6.5, N<4.5")
     print("  + Energy estimation, pattern detection, approach guidance")
     print("Using MaskablePPO to prevent invalid actions")
     print("="*60 + "\n")
@@ -1148,7 +1145,7 @@ def train(
     try:
         print(f"\n🚂 Starting parallel training on {n_envs} environments...")
         print("Features enabled:")
-        print("  ✓ Curriculum learning (50 → 90 pieces)")
+        print("  ✓ Curriculum learning (50 → 120 pieces)")
         print("  ✓ True action masking (invalid actions prevented)")
         print("  ✓ Stronger return rewards")
         print("  ✓ Distance checkpoints")

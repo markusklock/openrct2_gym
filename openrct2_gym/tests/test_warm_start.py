@@ -711,7 +711,7 @@ def test_wrapper_initial_phase_starts_deep(monkeypatch, tmp_path):
     P5 ladder marked complete, and the annealer in its P5+ (+4) mode."""
     wrapper, base = _wrapped(monkeypatch, tmp_path, initial_phase=6)
     assert wrapper.current_phase == 6
-    assert base.max_track_length == wrapper.phase6_max_length == 90
+    assert base.max_track_length == wrapper.phase6_max_length == 120
     assert base.skip_ride_testing is False
     assert wrapper.phase5_current_length == wrapper.phase5_target_length
     assert getattr(wrapper._annealer, "k_step", 2) == 4
@@ -721,12 +721,14 @@ def test_wrapper_initial_phase_starts_deep(monkeypatch, tmp_path):
 
 
 def test_phase_track_budgets_are_non_decreasing(monkeypatch, tmp_path):
-    """Aug-12: phase5_target_length and phase6_max_length were lowered 120 -> 90 (see
-    phase5_target_length's constructor comment for why). The invariant that motivated
-    stopping to ask before that change -- no phase's track-length budget may drop below
-    the previous phase's -- must keep holding for whatever the current numbers are, so
-    this reads the wrapper's own attributes instead of restating the literals: a future
-    retune of any one phase's budget breaks this if it opens a gap."""
+    """Aug-12: phase5_target_length and phase6_max_length were briefly lowered 120 -> 90
+    on a shape-feasibility hypothesis that didn't replicate under a policy actually
+    trained at the shorter budget (see phase5_target_length's constructor comment) and
+    were reverted. The invariant that motivated stopping to ask before that change --
+    no phase's track-length budget may drop below the previous phase's -- must keep
+    holding for whatever the current numbers are, so this reads the wrapper's own
+    attributes instead of restating the literals: a future retune of any one phase's
+    budget breaks this if it opens a gap."""
     wrapper, _ = _wrapped(monkeypatch, tmp_path)
     budgets = [
         wrapper.phase1_max_length,

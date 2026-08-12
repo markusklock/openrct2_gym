@@ -23,8 +23,8 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
     Phase 2: "Lift Hill Building" (40 pieces) - Learn chain lifts and energy
     Phase 3: "Drop & Turn" (60 pieces) - Learn drops and turnarounds
     Phase 4: "Circuit Mastery" (80 pieces) - Full integration
-    Phase 5: "Quality Optimization" (80-90 pieces) - Optimize ride ratings
-    Phase 6: "Style / Variety" (90 pieces) - Winding layouts at held quality
+    Phase 5: "Quality Optimization" (80-120 pieces) - Optimize ride ratings
+    Phase 6: "Style / Variety" (120 pieces) - Winding layouts at held quality
     """
 
     def __init__(self, env,
@@ -41,42 +41,34 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                  phase3_max_length=60,
                  phase4_max_length=80,
                  phase5_initial_length=80,
-                 phase5_target_length=90,      # Aug-12: lowered 120->90 together with
-                                                # phase6_max_length, after a same-policy,
-                                                # 10-unaided-episode probe of three seed
-                                                # families at both budgets: oval closed
-                                                # 90%@120 / 50%@80, out-and-back 40%@120 /
-                                                # 90%@80, winding 60%@120 / 70%@80 -- shape
-                                                # feasibility flips with the budget (long
-                                                # straights fill 120 easily for an oval but
-                                                # cramp a winding loop; the reverse at 80).
-                                                # Under P6's family gate (0.5+0.5*match),
-                                                # that let an oval closed under an
-                                                # out-and-back SEED outscore the requested
-                                                # shape (0.90*0.625=0.56 vs 0.40*1.00=0.40 at
-                                                # 120) -- the agent was optimally ignoring
-                                                # the seed. At a shorter budget that flips
-                                                # the other way (0.31 vs 0.90), so 90 was
-                                                # picked as the shortest budget where all
-                                                # three probed families close well enough
-                                                # for the gate to reward the requested shape
-                                                # over a wrong-but-easier one. Cost, stated
-                                                # honestly: quality keeps rising past 90 --
-                                                # over the rated library median excitement is
-                                                # 5.54 in the 75-89 band, 5.93 @ 90-104, 6.34
-                                                # @ 105-119, and the top-200 rated records
-                                                # median 104 pieces. This trades ~0.4 of
-                                                # attainable E for making variety possible at
-                                                # all; acceptable because the success bar is
-                                                # E>=4.5, not maximal E, and 75-89 already
-                                                # medians 5.54.
+                 phase5_target_length=120,     # Aug-12: a same-policy, 10-episode probe
+                                                # (oval/out-and-back/winding at 120
+                                                # vs. 80 pieces) read a feasibility inversion
+                                                # -- shorter budgets closing the requested
+                                                # shape better than the default oval -- and
+                                                # briefly lowered this to 90 on that basis.
+                                                # It did not replicate: measured on a policy
+                                                # actually TRAINED at 90 (~600k steps, 10
+                                                # unaided episodes/seed), everything closed
+                                                # worse (oval 40%, out-and-back 20%, winding
+                                                # 30%) and the oval was still best -- no
+                                                # inversion. The original reading came from a
+                                                # policy trained at 120 under a different
+                                                # phase configuration, on a single n=10
+                                                # sample, which is why it misled. Meanwhile
+                                                # unaided completion fell 0.72->0.48 and the
+                                                # cold shape distribution didn't move at all
+                                                # (99.6% oval, n=768). Conclusion: track
+                                                # budget is not the lever for shape variety;
+                                                # reverted to 120. Do not re-run this
+                                                # experiment without a different lever.
                  phase5_increase_step=10,
                  phase6_entry_threshold=0.30,   # cold tested-E>=4 rate that opens P6
-                 phase6_max_length=90,          # Aug-12: matches phase5_target_length's
+                 phase6_max_length=120,         # Aug-12: matches phase5_target_length's
                                                 # topped-out ceiling (non-decreasing budget
                                                 # ordering across phases); see that param's
-                                                # comment for the shape-feasibility probe and
-                                                # the quality cost it accepts.
+                                                # comment -- the 90-piece experiment it once
+                                                # matched did not replicate and was reverted.
                  # Verbosity
                  verbose=1,
                  # Phase 2 sub-stage thresholds (kept at the end for positional compatibility)
