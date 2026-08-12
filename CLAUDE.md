@@ -214,6 +214,63 @@ This is a Gymnasium environment for training RL agents to build roller coasters 
      25↔60=4). Before this offset every descent placement failed silently — drops were effectively
      removed from the action space in all earlier runs.
 
+### Measurement rules (Aug-2026 variety campaign — five metrics lied before these existed)
+
+The project's signature failure is a metric that measures something other than its name. It
+has now happened five times. These rules are the distilled cost:
+
+1. **Split every quality/structure metric by warm vs cold.** A *warm* (scaffolded) episode
+   replays a prefix of a library exemplar, so its rating and its shape are the exemplar's,
+   not the policy's. `quality/median_excitement` pooled both and read ~5.5 while the agent's
+   own rides rated **2.4** — and v1's headline "median excitement 5.58" was conflated the
+   same way (its archive README carries a correction). Cold-only variants now exist
+   (`quality/median_excitement_cold`, `structure/family_hit_cold`); prefer them for any
+   claim, and always emit the sample count beside a median.
+2. **A conflated metric can drive training, not just reporting.** That same pooled median
+   gated the P5 exploration floor, so exploration was withdrawn on the *scaffold's* quality
+   while the policy's own rides were still at 2.4.
+3. **A metric only WRITTEN in some states must only be READ in those states.**
+   `family_gate`/`family_match` are set on completion and reset to 0.0 otherwise, so a plain
+   mean reports `completion_rate x value`. Same trap for a phase-scoped tag read in a later
+   phase (`phase2_threshold` looks like a live gate at P3+).
+4. **The library is not a neutral sample.** `LoopLibrary.add` is upgrade-append, so a
+   repeated sequence keeps only its BEST rating. Any library-derived median is biased
+   upward — measure populations from the episode windows, not the archive.
+5. **Workers advance the curriculum independently** and every worker writes `curriculum/*`
+   last-write-wins, so a single sample is one arbitrary worker and the fleet can span three
+   phases at once. Read spreads and trends, never a point.
+
+### Shape feasibility is a function of the piece budget (Aug-12)
+
+Measured on one policy, 10 unaided episodes per seed, budget the only variable:
+
+| seed | closes @120 pieces | closes @80 |
+|---|---|---|
+| oval | 90% | 50% |
+| out-and-back | 40% | 90% |
+| winding | 60% | 70% |
+
+At 120 an oval is easy (long straights fill the length) and a winding loop is hard; at 80 it
+**inverts**. This made the agent's monoculture *rational*: under P6's gate an oval was worth
+0.90 x 0.625 = 0.56 of the completion payout against 0.40 x 1.00 = 0.40 for the shape it was
+asked for, so no reward tuning or extra training could move it. `phase5_target_length` and
+`phase6_max_length` were cut 120 -> 90 for this reason (8a89ab7). **Before concluding a
+policy "won't" do something, check whether it is already optimal given its abilities.**
+Cost, stated honestly: quality keeps improving past 90 (library median E 5.54 at 75-89
+pieces, 6.34 at 105-119), so the cut trades ~0.4 of attainable excitement for variety being
+possible at all — acceptable only because the criteria ask for E >= 4.5, not maximal E.
+
+### The warm-start frontier is not a competence proxy (Aug-11)
+
+`warm_k_max` stalled at 8-13 for millions of steps while cold completion sat at 0.72-0.85:
+the agent completes a whole loop unaided more reliably than it finishes the last 13 pieces
+of someone else's, because a replayed prefix leaves it in states from another coaster's
+geometry that are off-distribution for a policy trained on its own trajectories. Two
+consequences: `p_cold`'s competence ramp keys on `k_max` and therefore cannot fire; and warm
+episodes at low k teach docking, not composition (measured: the agent placed **9.6%** of the
+turns and zero turns in 352 of 525 builds). Do not read a stalled frontier as a stalled
+policy.
+
 ## Important Notes
 
 - The OpenRCT2 game must have the API plugin installed and running (default port 8080)
