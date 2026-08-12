@@ -374,11 +374,31 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                                                   # observed farm (8) stays blocked.
                 qualify_requires_test=True,
                 w_exc_feat=6.0,
-                w_family=6.0,  # dense per-piece pull toward the seed's requested family
+                w_family=12.0,  # dense per-piece pull toward the seed's requested family
                                # (Aug-9): the completion gate + R_family bonus are both
                                # terminal-only, and terminal-only shaping has repeatedly
                                # been too slow here (this style gate itself ran ~900k
                                # steps without reaching cold builds).
+                               # Doubled 6.0 -> 12.0 (Aug-12(2)): the floor commit just
+                               # above fixed what a finished non-oval build is WORTH
+                               # (0.50->0.40), and it measurably did not change behaviour
+                               # -- unaided cold builds are still ~99.7% oval, so a
+                               # non-oval seed's better payoff is sampled on ~0.4% of
+                               # episodes, maybe twenty builds spread across four non-oval
+                               # seeds. A payoff you almost never experience cannot teach
+                               # you; improving it further would not have helped. w_family
+                               # is the only family term that acts on ACTION SELECTION
+                               # (the completion gate and R_family are terminal-only), so
+                               # it is the lever that actually shifts which piece gets
+                               # placed next. At 6.0 it tied w_exc_feat (also 6.0), the
+                               # quality-feature potential it competes against every step;
+                               # quality now has margin to give (unaided ride quality
+                               # measures ~5.6 against a 4.5 success bar), so doubling is
+                               # affordable. Not pushed higher: the potential's family
+                               # contribution is bounded in [0, w_family] (family_phi_match
+                               # in [0,1]), so at 12.0 it is 0-12 against a 1000-point
+                               # completion payout -- still a guide, not something the
+                               # agent could profitably chase in place of finishing.
                 w_route=3.0,   # Jul-27: wound layouts fail closure on the RETURN ROUTE
                                # (cold winding attempts truncate; rectangles never do).
                                # The P1-4 angular-progress potential taught exactly that

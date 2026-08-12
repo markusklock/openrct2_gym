@@ -17,7 +17,8 @@ import pytest
 from openrct2_gym.envs import openrct2_env as oe_mod
 from openrct2_gym.envs.openrct2_env import OpenRCT2Env, RewardParams
 from openrct2_gym.envs.obs_config import make_observation_space, SCALE, H_SCALE
-from openrct2_gym.envs.footprint import classify_family, family_match, switch_count, FAMILY_N
+from openrct2_gym.envs.footprint import (
+    classify_family, family_match, switch_count, FAMILIES, FAMILY_N)
 from openrct2_gym.envs.track_pieces import RIGHT_TURN_ACTIONS
 from openrct2_gym.tests.test_env_smoke import FakeAPI
 
@@ -3718,9 +3719,11 @@ def test_family_potential_streams_its_own_diagnostic(monkeypatch):
 
 def test_p6_reward_params_enable_family_potential():
     """P6 consumes the dense family potential at its full ramped-to weight (task 5b arms
-    the same potential, at a lower weight, in P3-5 -- see the ramp tests below)."""
+    the same potential, at a lower weight, in P3-5 -- see the ramp tests below). Aug-12(2):
+    that weight is 12.0, not P5's 6.0 -- see test_family_ramp_p6_unchanged for the
+    provenance (the sampling-probability fix)."""
     params = ImprovedPhasedCurriculumWrapper._phase_reward_params(6)
-    assert params.w_family == 6.0
+    assert params.w_family == 12.0
 
 
 # ------------------------------- family ramp, phases 3-5 (task 5b, Aug-9)
@@ -3769,10 +3772,14 @@ def test_family_ramp_p6_unchanged():
     earlier family tasks already tuned. completion_family_floor is 0.4 (Aug-12: lowered
     from 0.5 once unaided quality made R_family/R_qualify payable -- see
     test_p6_family_economics_matching_shape_beats_oval_under_family_seed for the
-    provenance)."""
+    provenance). w_family is 12.0, not that commit's 6.0 (Aug-12(2)): the terminal
+    economics fixed in the floor commit only pay if the agent EVER samples a non-oval
+    seed, and unaided cold builds were ~99.7% oval -- doubling the dense per-piece
+    potential is what shifts sampling, not another terminal retune. See the wrapper's P6
+    block comment for the full sampling-probability provenance."""
     p6 = ImprovedPhasedCurriculumWrapper._phase_reward_params(6)
     assert p6.completion_family_floor == 0.4
-    assert p6.w_family == 6.0
+    assert p6.w_family == 12.0
     assert p6.R_family == 200.0
     assert p6.qualify_requires_family is True
 
@@ -4120,16 +4127,20 @@ def test_adding_a_switch_on_an_oval_seed_is_net_negative_in_phi():
     On an oval seed (0 switches by band) the switch must cost, and cost the FULL family
     loss. Aug-10: the dense w_family term in _potential now reads its OWN wide falloff
     (family_phi_switch_falloff=6.0), not the gate's family_switch_falloff=2.0 -- see the
-    phi-falloff-fix. So the loss is w_family * 0.5 * (1 / family_phi_switch_falloff) =
-    6 * 0.5 * (1/6) = 0.5, with the exc-feature balance leg contributing exactly nothing
-    (Fix 5 retired its target)."""
+    phi-falloff-fix. So the loss is w_family * 0.5 * (1 / family_phi_switch_falloff):
+    6 * 0.5 * (1/6) = 0.5 in P5, and (Aug-12(2): P6's w_family doubled 6.0 -> 12.0 to
+    raise the sampling probability of a non-oval build, not to retune this cancellation)
+    12 * 0.5 * (1/6) = 1.0 in P6 -- the loss doubles right along with the weight, since
+    the term is linear in it. Either way the exc-feature balance leg contributes exactly
+    nothing (Fix 5 retired its target)."""
     W = ImprovedPhasedCurriculumWrapper
+    expected_loss = {5: 0.5, 6: 1.0}
     for phase in (5, 6):
         p = W._phase_reward_params(phase)
         a, b = _switch_axis_pair()
         a.target_family = b.target_family = 0
         expected_family_loss = p.w_family * 0.5 * (1.0 / p.family_phi_switch_falloff)
-        assert expected_family_loss == pytest.approx(0.5)
+        assert expected_family_loss == pytest.approx(expected_loss[phase])
         d_phi = b._potential(p) - a._potential(p)
         assert d_phi < 0.0
         assert d_phi == pytest.approx(-expected_family_loss), f"phase {phase}"
@@ -4402,3 +4413,127 @@ def test_validate_completion_first_still_holds_at_p6_lowered_family_floor():
     p6 = W._phase_reward_params(6)   # raises AssertionError on construction if it fails
     assert p6.completion_family_floor == 0.40
     W._validate_completion_first(p6, "phase 6")   # must not raise a second time either
+
+
+# ------------------------------------------- w_family 6.0 -> 12.0 in P6 (Aug-12(2)):
+# the sampling-probability fix.
+#
+# The Aug-12 commit (test_p6_family_economics_matching_shape_beats_oval_under_family_seed)
+# fixed what a finished non-oval build is WORTH (completion_family_floor 0.50 -> 0.40).
+# It measurably did not change behaviour: unaided cold builds are still ~99.7% oval, so a
+# non-oval seed's better terminal payoff is sampled on roughly 0.4% of episodes -- a payoff
+# an agent almost never experiences cannot be learned from. w_family is the only P6
+# parameter that acts on ACTION SELECTION rather than terminal value: it is the dense
+# per-piece PBRS potential over family_match (_potential's w_family term, armed only for
+# phase >= 6 among these tests), so raising it raises the per-step advantage of a
+# family-improving piece regardless of whether the episode ever reaches completion.
+# Doubled rather than pushed further: at 12.0 the potential's family contribution still
+# tops out at 12 (family_phi_match in [0,1]) against a 1000-point completion payout, so it
+# stays a guide the agent is pulled by, not a reward pool large enough to be worth farming
+# instead of finishing (see _validate_completion_first below, which is agnostic to
+# w_family but must still hold).
+
+def test_w_family_full_per_phase_table():
+    """The whole per-phase set, not just P6 -- a stray edit to any other phase's
+    w_family must surface here. Only P6 changes (6.0 -> 12.0); P1/P2 stay inert (0.0,
+    PHASE_FAMILIES pins the seed there) and P3/P4/P5 stay at their Aug-9 ramp values."""
+    W = ImprovedPhasedCurriculumWrapper
+    assert W._phase_reward_params(1).w_family == 0.0
+    assert W._phase_reward_params(2, phase2_stage=1).w_family == 0.0
+    assert W._phase_reward_params(2, phase2_stage=2).w_family == 0.0
+    assert W._phase_reward_params(2, phase2_stage=3).w_family == 0.0
+    assert W._phase_reward_params(3).w_family == 3.0
+    assert W._phase_reward_params(4).w_family == 4.0
+    assert W._phase_reward_params(5).w_family == 6.0
+    assert W._phase_reward_params(6).w_family == 12.0
+
+
+def test_p6_w_family_increases_the_per_step_family_gradient():
+    """THE point of the change: the per-step increase in the dense potential from placing
+    a piece that improves family_match must be strictly larger at P6's live weight than it
+    was at the old 6.0 -- that per-piece advantage, not the terminal payout, is what
+    actually shifts action selection (a payoff you never sample cannot teach you).
+
+    Computed from the live params and the real footprint bands (family_match's bands are
+    the four-times-mis-specified fixture risk this branch has hit before), not hardcoded:
+    for the 'winding' family, a build one turn short of the turn band (lo-1 turns) versus
+    one exactly at the band's low edge (lo turns). The two builds are constructed to hold
+    the SWITCH count constant across the pair (R,R,R,L,L,L,R,R,R... never alternates on
+    its last piece), so only the turn axis of family_match moves and the comparison is not
+    confounded by the switch axis."""
+    lo, hi, slo, shi = FAMILIES[3][1:5]                # 'winding' band
+    assert lo >= 7                                      # the construction below needs this
+
+    def turn_build(n):
+        assert n >= 6
+        return [4, 4, 4, 3, 3, 3] + [4] * (n - 6)        # RIGHT_TURN=4, LEFT_TURN=3
+
+    short, in_band = turn_build(lo - 1), turn_build(lo)
+    # verify the fixture against the real bands/switch math rather than assuming it
+    assert switch_count(short) == switch_count(in_band) == 2
+    assert len(short) == lo - 1 < lo == len(in_band)      # short is one turn below the band
+    assert lo <= len(in_band) <= (hi if hi is not None else len(in_band))   # in_band is in it
+
+    def family_step(weight):
+        params = replace(ImprovedPhasedCurriculumWrapper._phase_reward_params(6),
+                          w_family=weight)
+        env_short = _bare_env(history=_env_hist([(a, 14, 14) for a in short]))
+        env_in = _bare_env(history=_env_hist([(a, 14, 14) for a in in_band]))
+        env_short.target_family = env_in.target_family = 3
+        return (params.w_family * env_in._family_phi_match(params)
+                - params.w_family * env_short._family_phi_match(params))
+
+    p6 = ImprovedPhasedCurriculumWrapper._phase_reward_params(6)
+    assert p6.w_family == 12.0
+    step_new = family_step(p6.w_family)
+    step_old = family_step(6.0)
+    assert step_new > 0.0
+    assert step_new > step_old
+    # linear in the weight, so the ratio tracks the parameter exactly
+    assert step_new == pytest.approx(step_old * (p6.w_family / 6.0))
+
+
+def test_p6_family_potential_telescopes_at_the_higher_weight():
+    """PBRS hygiene at w_family=12.0: the family term stays a pure function of the
+    (removal-safe) history, so place-then-remove returns Phi exactly to its prior value,
+    and the intermediate (placed) step genuinely moves it -- doubling the weight must not
+    turn a clean potential into a leak."""
+    p6 = ImprovedPhasedCurriculumWrapper._phase_reward_params(6)
+    assert p6.w_family == 12.0
+    env = _bare_env(history=_env_hist([(4, 14, 14)] * 3))
+    env.target_family = 0
+    before = env._potential(p6)
+    env.track_builder.history.append(
+        {"action": 1, "position": [9, 0, 14], "next_position": [10, 0, 14]})
+    after = env._potential(p6)
+    assert after != pytest.approx(before)                # the step genuinely moves Phi
+    env.track_builder.history.pop()
+    assert env._potential(p6) == pytest.approx(before)    # place-then-remove telescopes exactly
+
+
+def test_p6_w_family_change_leaves_phases_1_and_2_bit_identical():
+    """w_family is 0 in phases 1-2 (PHASE_FAMILIES pins the seed there precisely because
+    nothing may read it), so the P6-only bump leaves the term structurally ABSENT, not
+    merely small: the potential must be identical across every possible seed."""
+    W = ImprovedPhasedCurriculumWrapper
+    rows = _p6_mix(fill=[4, 4, 3, 3] * 3)                 # a non-oval shape: a live family
+                                                           # term would visibly move Phi here
+    for phase, stage in [(1, 1), (2, 1), (2, 2), (2, 3)]:
+        p = W._phase_reward_params(phase, phase2_stage=stage)
+        assert p.w_family == 0.0
+        phis = {round(_family_env(rows, seed, p)._potential(p), 10) for seed in range(FAMILY_N)}
+        assert len(phis) == 1, f"phase {phase}.{stage} potential varies with the seed"
+
+
+def test_validate_completion_first_holds_for_every_phase_after_w_family_doubled():
+    """w_family does not enter the completion-first invariant (it is a dense per-piece
+    potential, not a completion-time floor/milestone), but _phase_reward_params already
+    raises AssertionError on construction if the invariant fails -- so successfully
+    building every phase's params here (plus every Phase-2 sub-stage) IS the test, backed
+    by an explicit re-check on P6 specifically."""
+    W = ImprovedPhasedCurriculumWrapper
+    for phase, stage in [(1, 1), (2, 1), (2, 2), (2, 3), (3, 1), (4, 1), (5, 1), (6, 1)]:
+        p = W._phase_reward_params(phase, phase2_stage=stage)  # would raise if violated
+        W._validate_completion_first(p, f"phase {phase}.{stage}")   # must not raise
+    p6 = W._phase_reward_params(6)
+    assert p6.w_family == 12.0
