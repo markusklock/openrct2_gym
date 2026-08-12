@@ -550,8 +550,8 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                 # Ramps with the track budget across P3/P4/P5 rather than switching on at
                 # full P6 strength, because P3/P4 are solved/tuned and a large completion
                 # share must not shift onto a skill they aren't teaching yet:
-                #   completion_family_floor: 0.85 (P3) -> 0.75 (P4) -> 0.60 (P5) -> 0.50 (P6)
-                #   w_family:                 3.0 (P3) ->  4.0 (P4) ->  6.0 (P5) ->  6.0 (P6)
+                #   completion_family_floor: 0.85 (P3) -> 0.75 (P4) -> 0.60 (P5) -> 0.40 (P6)
+                #   w_family:                 3.0 (P3) ->  4.0 (P4) ->  6.0 (P5) -> 12.0 (P6)
                 #   R_family:                 0.0 (P3) -> 75.0 (P4) -> 125.0 (P5) -> 200 (P6)
                 # R_family joined the ramp at P4 (Aug-9 final review): below P6 the
                 # multiplicative gate was the ONLY family incentive, and at these floors it
