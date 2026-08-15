@@ -619,6 +619,8 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
                     # diagnostic per the house rule.
                     'primed_rate',
                     'primed_family_hit',
+                    'primed_prefix_len',
+                    'primed_skip_rate',
                 ):
                     if key in _info:
                         self.logger.record(f'curriculum/{key}', _info[key])
@@ -1350,14 +1352,24 @@ def parse_args(argv=None):
                              "still corrects an overshoot honestly.")
     parser.add_argument("--prime-frac", type=float, default=0.0,
                         help="Fraction of otherwise-cold episodes to PRIME with a "
-                             "family-correct opening (the first --warm-min-prefix pieces "
-                             "of a matching library exemplar), forcing the policy to "
-                             "actually attempt non-oval shapes often enough to learn "
-                             "their payoff. Default 0.0 (off, bit-identical to before). "
-                             "Only applies in phases where families are active (3-6); "
-                             "primed episodes are a third class, excluded from every "
-                             "cold gate AND the warm-scaffold's own bookkeeping.")
-    return parser.parse_args(argv)
+                             "family-correct opening (the shortest prefix of a matching "
+                             "library exemplar that already commits to the family's own "
+                             "turn/switch bounds, floored at --warm-min-prefix and capped "
+                             "at 40%% of the phase's track budget -- see footprint.FAMILIES "
+                             "and _sample_prime), forcing the policy to actually attempt "
+                             "non-oval shapes often enough to learn their payoff. Priming "
+                             "only fires on episodes the annealer's own draw already sent "
+                             "cold, so the REALISED primed share of all episodes is "
+                             "prime_frac x p_cold, not prime_frac itself -- read "
+                             "curriculum/primed_rate, not this flag, for the true share. "
+                             "Must be in [0.0, 1.0]. Default 0.0 (off, bit-identical to "
+                             "before). Only applies in phases where families are active "
+                             "(3-6); primed episodes are a third class, excluded from "
+                             "every cold gate AND the warm-scaffold's own bookkeeping.")
+    args = parser.parse_args(argv)
+    if not (0.0 <= args.prime_frac <= 1.0):
+        parser.error(f"--prime-frac must be in [0.0, 1.0], got {args.prime_frac}")
+    return args
 
 
 def main():

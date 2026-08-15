@@ -512,6 +512,13 @@ class OpenRCT2Env(gym.Env):
             # cold (true-task) episodes from scaffolded ones; aborted prefixes are
             # infrastructure events excluded from annealer accounting.
             'cold_start': self._warm_cold,
+            # Fix 4 (Aug-15 review): this now ALSO carries the realised opening length on
+            # a PRIMED episode (`_apply_warm_start` replays any staged prefix identically,
+            # scaffold or primed) -- read together with the wrapper's `primed` flag if
+            # you need to tell a scaffold-provenance prefix apart from a forced-
+            # exploration opening; `curriculum/primed_prefix_len` already isolates the
+            # primed-only value (0 when not primed) for TB, so this key was left as-is
+            # rather than gated, to avoid changing what every existing consumer reads.
             'warm_prefix_len': self._warm_prefix_len,
             'warm_aborted': self._warm_aborted,
         }
@@ -671,6 +678,8 @@ class OpenRCT2Env(gym.Env):
                 'phase_rewards': dict(self.phase_rewards),
                 'collision_count': self.collision_count,
                 'loop_completed': self.loop_completed,
+                # Also carries the primed opening length on a primed episode -- see the
+                # step() info dict's comment on this same field.
                 'warm_prefix_len': self._warm_prefix_len,
                 # scale/viability diagnostics (P3-5 redesign)
                 'drop_z': self._total_drop_z(),

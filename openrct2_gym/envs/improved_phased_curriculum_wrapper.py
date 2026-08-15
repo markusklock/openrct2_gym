@@ -12,7 +12,9 @@ from typing import Dict, Any, Tuple
 from openrct2_gym.envs.openrct2_env import OpenRCT2Env, RewardParams
 from openrct2_gym.envs.warm_start import LoopLibrary, WarmStartAnnealer, WarmStartPlan
 from openrct2_gym.envs.track_pieces import SBEND_ACTIONS, TURN_ACTIONS
-from openrct2_gym.envs.footprint import classify_family, FAMILY_N
+from openrct2_gym.envs.footprint import (
+    classify_family, FAMILIES, FAMILY_N, switch_count, turn_directions,
+)
 
 
 class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
@@ -154,6 +156,10 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
         # mechanism streams its own diagnostic).
         self._primed_flags = deque(maxlen=window_size)
         self._primed_family_hit_flags = deque(maxlen=window_size)
+        # Fix 2 (Aug-15 review): distinct from primed_rate -- a priming ATTEMPT (the
+        # prime_frac roll fired) that found no exemplar it could commit to a family
+        # within the budget cap. True = skipped, False = primed successfully.
+        self._primed_skip_flags = deque(maxlen=window_size)
         self.episode_qualified_results = deque(maxlen=window_size)
         # Per-phase family seed sampling (Aug-9) and its own cold-only measurement
         # window, one per family index (see PHASE_FAMILIES / _sample_target_family).
@@ -984,6 +990,7 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
         self._cold_flags.clear()
         self._primed_flags.clear()
         self._primed_family_hit_flags.clear()
+        self._primed_skip_flags.clear()
         self.episode_qualified_results.clear()
         self.phase2_summit_results.clear()
         self.phase2_roundtrip_results.clear()
@@ -1144,37 +1151,87 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                 and self._prime_rng.random() < self.prime_frac:
             primed_plan = self._sample_prime(family, budget)
             if primed_plan is not None:
+                self._primed_skip_flags.append(False)
                 return primed_plan
-            # No exemplar of the requested family exists yet: fall back to the normal
-            # cold episode rather than priming with the wrong family (which would teach
-            # the wrong seed-to-shape association) -- `plan` below is still `cold`, so
-            # this episode correctly reports NOT primed in every diagnostic.
+            # No exemplar of the requested family could be primed within the cap (either
+            # none exists yet, or none commits to the family's turn/switch bounds within
+            # 40% of the budget -- see _sample_prime): fall back to the normal cold
+            # episode rather than priming with the wrong family or an uninformative
+            # opening. Counted distinctly from primed_rate (Fix 2/review) so a 0% primed
+            # rate is diagnosable -- "families inactive" vs. "every attempt was skipped".
+            self._primed_skip_flags.append(True)
+            # `plan` below is still `cold`, so this episode correctly reports NOT primed
+            # in every diagnostic.
         return plan
 
-    # Opening length for a primed episode -- reuses warm_min_prefix (the --warm-min-prefix
-    # knob) rather than adding a second one; 6 matches the P6 opening-seed constant
-    # (_update_phase_settings) when no override is given.
+    # Floor for a primed opening -- reuses warm_min_prefix (the --warm-min-prefix knob)
+    # rather than adding a second one; 6 matches the P6 opening-seed constant
+    # (_update_phase_settings) when no override is given. Clamped BOTH ends like
+    # _update_phase_settings's own `max(0, min(6, ov))` (Fix 4): an override above the
+    # default must not hand more pieces to the "opening" floor than the constant intends.
     PRIME_DEFAULT_PREFIX = 6
+    # A cap of 40% of the phase's track budget (Fix 2, review Aug-15): beyond that the
+    # agent is no longer meaningfully building the coaster -- the prefix would BE the
+    # build. See _sample_prime.
+    PRIME_MAX_BUDGET_FRACTION = 0.4
 
     def _prime_prefix_len(self):
         ov = self._warm_min_prefix_override
-        return self.PRIME_DEFAULT_PREFIX if ov is None else max(0, int(ov))
+        if ov is None:
+            return self.PRIME_DEFAULT_PREFIX
+        return max(0, min(self.PRIME_DEFAULT_PREFIX, int(ov)))
+
+    def _prime_opening_len(self, actions, family, cap):
+        """Shortest prefix length of `actions`, in [floor, cap], whose OWN turn/switch
+        counts already clear `family`'s FAMILIES lower bounds (turn_lo/switch_lo) --
+        the property review (Aug-15) found a fixed 6-piece opening does NOT carry for
+        out_and_back/winding/serpentine (measured on the 91,639-record library: their
+        first-6-actions-contain-a-switch rate is 0.7% / 99.3% / 100% respectively, i.e.
+        a fixed-length opening is statistically indistinguishable from an oval one for
+        out_and_back). None when no length in [floor, cap] clears the bounds -- the
+        caller must skip this exemplar rather than prime with an uninformative or
+        over-long opening.
+
+        Floor-gated by the caller (`_sample_prime` returns None outright when the floor
+        itself is <=0 -- Fix 1 part 3): a floor of 0 must disarm priming entirely, not
+        silently search from an empty opening.
+        """
+        floor = self._prime_prefix_len()
+        _, turn_lo, _, switch_lo, _ = FAMILIES[family]
+        hi = min(cap, len(actions) - 1)      # >=1 piece must remain for the agent
+        for length in range(floor, hi + 1):
+            prefix = actions[:length]
+            if len(turn_directions(prefix)) >= turn_lo and switch_count(prefix) >= switch_lo:
+                return length
+        return None
 
     def _sample_prime(self, family, budget):
-        """Attempt to prime an otherwise-cold draw: pick an exemplar whose OWN footprint
+        """Attempt to prime an otherwise-cold draw: among exemplars whose OWN footprint
         matches `family` (LoopLibrary.family_pool -- no structural degrade tiers, unlike
-        pool(); priming only needs a family-correct OPENING) and replay its first
-        `_prime_prefix_len()` pieces, handing the rest of the episode to the agent (k=0:
-        no scaffold track/step cap, so the agent gets the FULL phase budget to close the
-        loop however it likes -- this is not the annealer's tight suffix practice).
-        Returns None when the pool holds no matching exemplar; the caller must fall back
-        to a normal cold episode."""
-        prefix_len = self._prime_prefix_len()
-        candidates = [r for r in self._loop_library.family_pool(family, budget)
-                     if r.length > prefix_len]
-        if not candidates:
+        pool(); priming only needs a family-correct OPENING), pick one that can be primed
+        with the shortest prefix committing to `family`'s bounds within the budget cap
+        (`_prime_opening_len`), and replay exactly that many pieces, handing the rest of
+        the episode to the agent (k=0: no scaffold track/step cap, so the agent gets the
+        FULL phase budget to close the loop however it likes -- this is not the
+        annealer's tight suffix practice). Returns None when no candidate can be primed
+        within the cap (including an empty pool); the caller must fall back to a normal
+        cold episode and count the skip.
+        """
+        if self._prime_prefix_len() <= 0:
+            # The floor's own documented 0 ("fully annealed / cold context") must disarm
+            # priming outright (Fix 1 part 3) -- otherwise a family with trivial bounds
+            # (oval: turn_lo=switch_lo=0) would silently prime with an EMPTY prefix,
+            # making the episode bit-identical to cold while still reporting primed=True.
             return None
-        rec = candidates[self._prime_rng.randrange(len(candidates))]
+        cap = int(self.PRIME_MAX_BUDGET_FRACTION * budget)
+        usable = []
+        for r in self._loop_library.family_pool(family, budget):
+            length = self._prime_opening_len(r.actions, family, cap)
+            if length is not None:
+                usable.append((r, length))
+        if not usable:
+            return None
+        rec, prefix_len = usable[self._prime_rng.randrange(len(usable))]
         return WarmStartPlan(prefix=list(rec.actions[:prefix_len]), k=0,
                              loop_len=rec.length, cold=False, primed=True)
 
@@ -1203,9 +1260,22 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
 
         obs, info = self.env.reset(**kwargs)
 
+        # Fix 1 (Aug-15 review): reconcile the env-side primed flag against what reset()
+        # ACTUALLY replayed, not what the plan merely asked for. Two ways they can
+        # disagree: `--warm-min-prefix 0` makes `_sample_prime` hand back an empty prefix
+        # (`_warm_start_actions` collapses to None, and `_apply_warm_start` sets
+        # `_warm_cold=True`); or a primed prefix aborts on its very first piece
+        # (`_apply_warm_start`'s zero-length-abort rule also sets `_warm_cold=True`,
+        # deliberately, so infra hiccups don't starve the cold gate windows). In both
+        # cases the episode is bit-identical to a cold one -- `_warm_primed` must follow,
+        # or a genuinely unaided completion tags harvest_primed and primed_rate reports
+        # unaided behavior as evidence priming works.
+        if base_env._warm_cold:
+            base_env._warm_primed = False
+
         # Add phase info
         info['learning_phase'] = self.current_phase
-        info['primed'] = bool(self._current_plan.primed)
+        info['primed'] = bool(base_env._warm_primed)
         info['phase_name'] = {
             1: "Return Practice",
             2: f"Lift Hill Building {self.phase2_stage_name()}",
@@ -1262,7 +1332,12 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
             # real evidence about the scaffold's own frontier either -- its suffix is
             # freely agent-built, not the record's own closing sequence the annealer is
             # tracking. Both cold-only and warm-scaffold-only windows below exclude it.
-            primed = bool(getattr(self._current_plan, 'primed', False))
+            # Fix 1 (Aug-15 review): read the env-side flag reset() already reconciled
+            # against `_warm_cold`, not `self._current_plan.primed` -- the plan is what
+            # was ASKED for, not what reset() actually replayed (`--warm-min-prefix 0` or
+            # a first-piece prefix abort both make the plan's own `primed` stale). An
+            # episode must never be both cold and primed.
+            primed = bool(getattr(base_env, '_warm_primed', False))
             self._cold_flags.append(cold)
             self._primed_flags.append(primed)
             # Cold-only gating: every phase-gate window (success, qualified, phase-2 chain
@@ -1369,6 +1444,14 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
             info['primed_family_hit'] = (
                 sum(self._primed_family_hit_flags) / len(self._primed_family_hit_flags)
                 if self._primed_family_hit_flags else 0.0)
+            # Fix 2 (Aug-15 review): the realised opening length (0 when not primed) so
+            # the cost of priming -- how much of the build the agent DIDN'T place -- is
+            # visible rather than assumed, plus the skip rate tracked distinctly above.
+            info['primed_prefix_len'] = (
+                len(self._current_plan.prefix) if primed else 0)
+            info['primed_skip_rate'] = (
+                sum(self._primed_skip_flags) / len(self._primed_skip_flags)
+                if self._primed_skip_flags else 0.0)
             # Emit the rate (+ its family_n_ sample count) only for families the current
             # phase actually draws from -- matching qualified_rate's convention (:1113)
             # of gating the KEY itself on applicability, not just its value. 0.0 is kept

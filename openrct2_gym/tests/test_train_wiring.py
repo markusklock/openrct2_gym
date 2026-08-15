@@ -1444,3 +1444,41 @@ def test_callback_logs_primed_diagnostics():
     cb._on_step()
     assert store['curriculum/primed_rate'] == pytest.approx(0.4)
     assert store['curriculum/primed_family_hit'] == pytest.approx(0.6)
+
+
+def test_callback_logs_primed_prefix_len_and_skip_rate():
+    """Fix 2 (Aug-15 review): the realised opening length and the skip rate must be
+    visible in TB too, not just computed and dropped -- the cost of priming (how much of
+    the build the agent didn't place) is exactly the number a reviewer needs to sanity-
+    check the mechanism against the review's measured family table."""
+    from types import SimpleNamespace
+    cb = T.ParallelCurriculumMaskableCallback(n_envs=1)
+    cb.model = SimpleNamespace(target_kl=None, ent_coef=0.01, get_env=lambda: None)
+    store = {}
+    cb.model.logger = SimpleNamespace(
+        name_to_value={}, record=lambda k, v, *a, **kw: store.__setitem__(k, v))
+    cb.locals = {
+        'dones': [True],
+        'infos': [{'loop_completed': True, 'cold_start': False, 'primed': True,
+                   'learning_phase': 3, 'track_length': 12, 'current_distance': 0.0,
+                   'collision_count': 0, 'primed_prefix_len': 10, 'primed_skip_rate': 0.2,
+                   'episode_metrics': {'track_length': 12, 'min_distance': 0.0}}],
+    }
+    cb._on_step()
+    assert store['curriculum/primed_prefix_len'] == 10
+    assert store['curriculum/primed_skip_rate'] == pytest.approx(0.2)
+
+
+def test_cli_rejects_negative_prime_frac():
+    with pytest.raises(SystemExit):
+        T.parse_args(["--ports", "8080", "--prime-frac", "-0.1"])
+
+
+def test_cli_rejects_prime_frac_above_one():
+    with pytest.raises(SystemExit):
+        T.parse_args(["--ports", "8080", "--prime-frac", "1.5"])
+
+
+def test_cli_accepts_prime_frac_boundary_values():
+    assert T.parse_args(["--ports", "8080", "--prime-frac", "0.0"]).prime_frac == 0.0
+    assert T.parse_args(["--ports", "8080", "--prime-frac", "1.0"]).prime_frac == 1.0

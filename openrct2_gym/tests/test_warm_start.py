@@ -13,7 +13,12 @@ import numpy as np
 import pytest
 
 from openrct2_gym.envs import openrct2_env as oe_mod
-from openrct2_gym.envs.footprint import classify_family
+from openrct2_gym.envs.footprint import (
+    classify_family,
+    FAMILIES,
+    switch_count,
+    turn_directions,
+)
 from openrct2_gym.envs.openrct2_env import OpenRCT2Env
 from openrct2_gym.envs.warm_start import (
     ACTION_CLIMB_Z,
@@ -2644,6 +2649,14 @@ def test_warm_start_plan_primed_defaults_false(tmp_path):
     assert cold.primed is False
 
 
+def test_prime_prefix_len_clamps_above_like_min_prefix(monkeypatch, tmp_path):
+    """Fix 4: `_prime_prefix_len` clamped below at 0 but not above -- unlike
+    `_update_phase_settings`'s own `max(0, min(6, ov))` -- so `--warm-min-prefix 20` would
+    hand 20 pieces to the opening floor instead of the intended 6-piece ceiling."""
+    wrapper, base = _wrapped(monkeypatch, tmp_path, seed_loops=(FLAT,), warm_min_prefix=20)
+    assert wrapper._prime_prefix_len() == wrapper.PRIME_DEFAULT_PREFIX
+
+
 def test_prime_frac_zero_never_primes(monkeypatch, tmp_path):
     """--prime-frac 0.0 (the documented default) must never prime, even in a phase where
     families ARE active and the annealer's own draws are forced cold -- the only way a
@@ -2690,6 +2703,32 @@ def test_primed_episode_marks_info_and_replays_family_correct_opening(monkeypatc
     assert plan.cold is False
     assert 1 <= len(plan.prefix) == wrapper._prime_prefix_len()
     assert classify_family(plan.prefix) == 0
+
+
+def test_primed_prefix_is_a_prefix_of_the_requested_familys_own_record(monkeypatch, tmp_path):
+    """Fix 3: `classify_family()` on a short prefix can match by ACCIDENT --
+    `classify_family([0]*6) == 0` for ANY straight opening, no matter which record it was
+    sliced from, which is why the oval-only coverage above cannot fail even for a wrong-
+    family exemplar. The property that actually matters is that the replayed prefix is a
+    prefix OF the record the seed asked for. Non-oval request, so this can't be satisfied
+    by the one family (oval) whose bound the review found trivially satisfiable."""
+    oval = FLAT
+    winding = [4, 4, 3, 3] * 3 + [0] * 20
+    assert classify_family(oval) == 0
+    assert classify_family(winding) == 3
+    wrapper, base = _wrapped(monkeypatch, tmp_path, seed_loops=(oval, winding),
+                             p_cold=1.0, prime_frac=1.0)
+    wrapper.current_phase = 4                        # PHASE_FAMILIES[4] includes family 3
+    wrapper._update_phase_settings()
+    wrapper._family_rng.choice = lambda seq: 3        # this episode's seed: winding
+    info = _run_episode(wrapper, max_steps=100)       # P4's 80-piece budget needs more
+                                                       # straight-line steps to truncate
+    assert info['primed'] is True
+    plan = wrapper._current_plan
+    assert len(plan.prefix) > 0
+    assert tuple(winding[:len(plan.prefix)]) == tuple(plan.prefix)
+    assert tuple(oval[:len(plan.prefix)]) != tuple(plan.prefix), (
+        "test is meaningless if the oval record shares an identical prefix")
 
 
 def _primed_episodes(monkeypatch, tmp_path, n=5, seed_loops=(FLAT,), family=0, phase=3):
@@ -2816,3 +2855,232 @@ def test_primed_family_hit_diagnostic_only_counts_primed_episodes(monkeypatch, t
     history_actions = [h['action'] for h in base.track_builder.history]
     assert classify_family(history_actions) == 0                # whole finished track: oval
     assert info['primed_family_hit'] == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------- Fix 1: class-leak reconciliation
+#
+# `primed` was asserted straight from the sampled PLAN and never reconciled against what
+# reset() actually replayed, so an episode could be BOTH cold (agent placed every piece)
+# AND primed (tagged as forced exploration, excluded from the cold gate, harvested under
+# harvest_primed) at once. Two independent ways in: `--warm-min-prefix 0` (a documented
+# value of that flag) makes the "primed" prefix empty, and a prefix that fails on its very
+# first piece is reclassified cold by the env but the wrapper's primed flag never followed.
+
+def test_warm_min_prefix_zero_never_primes(monkeypatch, tmp_path):
+    """`--warm-min-prefix 0` must disarm priming entirely, not silently produce an
+    episode that is simultaneously cold_start=True and primed=True."""
+    wrapper, base = _wrapped(monkeypatch, tmp_path, api_cls=CompletingAPI,
+                             seed_loops=(FLAT,), p_cold=1.0, prime_frac=1.0,
+                             warm_min_prefix=0)
+    wrapper.current_phase = 3
+    wrapper._update_phase_settings()
+    wrapper._family_rng.choice = lambda seq: 0
+    base.api_controller.complete_after = 2
+    for _ in range(5):
+        info = _run_episode(wrapper)
+        assert not (info['cold_start'] is True and info['primed'] is True), (
+            "an episode reported BOTH cold and primed")
+        assert info['primed'] is False
+        assert info['cold_start'] is True
+    assert info['primed_rate'] == 0.0
+
+
+def test_warm_min_prefix_zero_harvests_as_cold_not_primed(monkeypatch, tmp_path):
+    """The same `--warm-min-prefix 0` scenario, checked at the harvest tag: a genuinely
+    unaided completion must never be filed under harvest_primed (which would remove a real
+    cold sample from the campaign's independent measurement)."""
+    wrapper, base = _wrapped(monkeypatch, tmp_path, api_cls=CompletingAPI,
+                             seed_loops=(FLAT,), p_cold=1.0, prime_frac=1.0,
+                             warm_min_prefix=0)
+    wrapper.current_phase = 3
+    wrapper._update_phase_settings()
+    wrapper._family_rng.choice = lambda seq: 0
+    base.api_controller.complete_after = 2
+    info = _run_episode(wrapper)
+    assert info['loop_completed'] is True
+    assert info['primed'] is False
+    harvested_lib = LoopLibrary(OpenRCT2Env._LOOP_LIBRARY_PATH)
+    recs = list(harvested_lib._records.values())
+    assert len(recs) == 1
+    assert recs[0].source == "harvest_cold"
+
+
+def test_first_piece_prefix_abort_reconciles_primed_flag(monkeypatch, tmp_path):
+    """A primed prefix that fails on its very first piece is reclassified cold by the env
+    (`_warm_cold=True`, `_apply_warm_start`'s zero-length-abort rule) -- the wrapper's
+    `_warm_primed` must follow, not keep reporting a scaffold that never actually replayed
+    anything."""
+    wrapper, base = _wrapped(monkeypatch, tmp_path, api_cls=FirstPieceFailsAPI,
+                             seed_loops=(FLAT,), p_cold=1.0, prime_frac=1.0)
+    wrapper.current_phase = 3
+    wrapper._update_phase_settings()
+    wrapper._family_rng.choice = lambda seq: 0
+    wrapper.reset()
+    base_env = wrapper._get_base_env()
+    assert base_env._warm_aborted is True
+    assert base_env._warm_cold is True
+    assert base_env._warm_primed is False, (
+        "primed flag not reconciled after a first-piece prefix abort")
+
+
+def test_first_piece_prefix_abort_reports_not_primed_end_to_end(monkeypatch, tmp_path):
+    """Same abort scenario, checked through a full episode's step()-time info -- the value
+    that feeds primed_rate / the cold gate / the harvest tag."""
+    wrapper, base = _wrapped(monkeypatch, tmp_path, api_cls=FirstPieceFailsAPI,
+                             seed_loops=(FLAT,), p_cold=1.0, prime_frac=1.0)
+    wrapper.current_phase = 3
+    wrapper._update_phase_settings()
+    wrapper._family_rng.choice = lambda seq: 0
+    info = _run_episode(wrapper)
+    assert info['warm_aborted'] is True
+    assert info['cold_start'] is True
+    assert info['primed'] is False
+    assert info['primed_rate'] == 0.0
+
+
+# ------------------------------------------------------- Fix 2: family-aware opening length
+#
+# A fixed 6-piece opening does not carry family information for every family: measured on
+# the 91,639-record library, a spiral/oval opening's first 6 actions show the shape almost
+# immediately, but out_and_back's defining switch shows up in the first 6 actions only 0.7%
+# of the time, and winding/serpentine need even more. The fix: prime with the SHORTEST
+# prefix of the chosen exemplar that already contains the family's own turn_lo turns and
+# switch_lo switches (footprint.FAMILIES), floored at the configured warm_min_prefix and
+# capped at 40% of the phase's track budget.
+
+def _assert_shortest_family_committing_prefix(prefix, family, floor):
+    """The returned prefix must clear its family's bounds, and -- whenever the family bound
+    (not the floor) is what's binding -- dropping the last piece must no longer clear both
+    bounds at once. This is a generic minimality check: it re-uses footprint's own counting
+    functions on the boundary, rather than hard-coding an independently hand-derived length,
+    so it can't be satisfied by a lucky guess at the expected number."""
+    _, turn_lo, _, switch_lo, _ = FAMILIES[family]
+    assert len(turn_directions(prefix)) >= turn_lo
+    assert switch_count(prefix) >= switch_lo
+    if len(prefix) > floor:
+        shorter = prefix[:-1]
+        assert not (len(turn_directions(shorter)) >= turn_lo
+                    and switch_count(shorter) >= switch_lo), (
+            "prefix is one piece longer than necessary to commit to the family")
+
+
+def test_prime_opening_commits_to_spiral_family_bounds(monkeypatch, tmp_path):
+    spiral = [4] * 6 + [0] * 14
+    assert classify_family(spiral) == 1
+    wrapper, base = _wrapped(monkeypatch, tmp_path, seed_loops=(spiral,))
+    plan = wrapper._sample_prime(1, budget=60)
+    assert plan is not None
+    _assert_shortest_family_committing_prefix(plan.prefix, 1, wrapper._prime_prefix_len())
+    assert len(plan.prefix) <= int(0.4 * 60)
+
+
+def test_prime_opening_commits_to_out_and_back_family_bounds(monkeypatch, tmp_path):
+    # The defining switch sits well past a 6-piece floor -- realistic per the review table
+    # (out_and_back's first-6-has-switch rate measured at 0.7% on the live library).
+    out_and_back = ([0, 0, 0, 4, 4] + [0] * 5 + [4, 4] + [0] * 8 + [3, 3] + [0] * 4)
+    assert classify_family(out_and_back) == 2
+    wrapper, base = _wrapped(monkeypatch, tmp_path, seed_loops=(out_and_back,))
+    plan = wrapper._sample_prime(2, budget=60)
+    assert plan is not None
+    _assert_shortest_family_committing_prefix(plan.prefix, 2, wrapper._prime_prefix_len())
+    assert len(plan.prefix) > wrapper._prime_prefix_len(), (
+        "test is meaningless if the floor alone already carried the family")
+    assert len(plan.prefix) <= int(0.4 * 60)
+
+
+def test_prime_opening_commits_to_winding_family_bounds(monkeypatch, tmp_path):
+    winding = [4, 4, 3, 3] * 3 + [0] * 20
+    assert classify_family(winding) == 3
+    wrapper, base = _wrapped(monkeypatch, tmp_path, seed_loops=(winding,))
+    plan = wrapper._sample_prime(3, budget=60)
+    assert plan is not None
+    _assert_shortest_family_committing_prefix(plan.prefix, 3, wrapper._prime_prefix_len())
+    assert len(plan.prefix) > wrapper._prime_prefix_len(), (
+        "test is meaningless if the floor alone already carried the family")
+    assert len(plan.prefix) <= int(0.4 * 60)
+
+
+def test_prime_opening_commits_to_serpentine_family_bounds(monkeypatch, tmp_path):
+    serpentine = [4, 4, 3, 3] * 4 + [0] * 10
+    assert classify_family(serpentine) == 4
+    wrapper, base = _wrapped(monkeypatch, tmp_path, seed_loops=(serpentine,))
+    plan = wrapper._sample_prime(4, budget=80)
+    assert plan is not None
+    _assert_shortest_family_committing_prefix(plan.prefix, 4, wrapper._prime_prefix_len())
+    assert len(plan.prefix) > wrapper._prime_prefix_len(), (
+        "test is meaningless if the floor alone already carried the family")
+    assert len(plan.prefix) <= int(0.4 * 80)
+
+
+def test_prime_opening_oval_still_primes_at_the_configured_floor(monkeypatch, tmp_path):
+    """Oval's bounds are 0/0 -- trivially satisfied by an EMPTY prefix -- so without the
+    floor the opening would silently become a no-op (Fix 1's failure mode again, this time
+    via the family bound rather than the flag). The floor keeps a real opening."""
+    wrapper, base = _wrapped(monkeypatch, tmp_path, seed_loops=(FLAT,))
+    plan = wrapper._sample_prime(0, budget=60)
+    assert plan is not None
+    assert len(plan.prefix) == wrapper._prime_prefix_len()
+
+
+def test_prime_skips_when_exemplar_cannot_commit_within_the_cap(monkeypatch, tmp_path):
+    """This exemplar's OWN footprint is winding (turns/switches in band), but every one of
+    its turns sits behind 30 leading straights -- the shortest family-committing prefix
+    (measured at 40 pieces) exceeds 40% of a 60-piece budget (24). Priming with a shorter,
+    uninformative prefix would teach nothing; priming with the full 40 would barely leave
+    the agent a build. Neither is acceptable -- this exemplar must be skipped."""
+    winding_block = [4, 4, 3, 3] * 3
+    padded = [0] * 30 + winding_block + [0] * 10
+    assert classify_family(padded) == 3
+    wrapper, base = _wrapped(monkeypatch, tmp_path, seed_loops=(padded,))
+    assert wrapper._sample_prime(3, budget=60) is None
+
+
+def test_prime_realized_opening_length_never_exceeds_the_cap(monkeypatch, tmp_path):
+    winding_block = [4, 4, 3, 3] * 3
+    padded = [0] * 20 + winding_block + [0] * 10   # shortest committing length: 30
+    assert classify_family(padded) == 3
+    wrapper, base = _wrapped(monkeypatch, tmp_path, seed_loops=(padded,))
+    budget = 80
+    plan = wrapper._sample_prime(3, budget)
+    assert plan is not None
+    assert len(plan.prefix) <= int(0.4 * budget)
+
+
+def test_prime_skip_counted_distinctly_from_primed_when_bounds_unreachable(monkeypatch, tmp_path):
+    """The skip diagnostic must be its own signal, not folded into primed_rate (a 0%
+    primed_rate is ambiguous between 'families aren't active' and 'every attempt was
+    skipped for lacking a committing exemplar')."""
+    winding_block = [4, 4, 3, 3] * 3
+    padded = [0] * 30 + winding_block + [0] * 10   # shortest committing length: 40
+    assert classify_family(padded) == 3
+    wrapper, base = _wrapped(monkeypatch, tmp_path, seed_loops=(padded,),
+                             p_cold=1.0, prime_frac=1.0)
+    wrapper.current_phase = 4                        # PHASE_FAMILIES[4] includes family 3
+    wrapper._update_phase_settings()
+    wrapper._family_rng.choice = lambda seq: 3
+    info = _run_episode(wrapper, max_steps=100)
+    assert info['primed'] is False
+    assert info['cold_start'] is True
+    assert info['primed_skip_rate'] == pytest.approx(1.0)
+
+
+def test_primed_prefix_len_diagnostic_reports_the_realized_opening(monkeypatch, tmp_path):
+    wrapper, base = _wrapped(monkeypatch, tmp_path, seed_loops=(FLAT,),
+                             p_cold=1.0, prime_frac=1.0)
+    wrapper.current_phase = 3
+    wrapper._update_phase_settings()
+    wrapper._family_rng.choice = lambda seq: 0
+    info = _run_episode(wrapper)
+    assert info['primed'] is True
+    assert info['primed_prefix_len'] == len(wrapper._current_plan.prefix)
+    assert info['primed_prefix_len'] == wrapper._prime_prefix_len()
+
+
+def test_primed_prefix_len_is_zero_when_not_primed(monkeypatch, tmp_path):
+    wrapper, base = _wrapped(monkeypatch, tmp_path, seed_loops=(FLAT,),
+                             p_cold=1.0, prime_frac=0.0)
+    wrapper.current_phase = 3
+    wrapper._update_phase_settings()
+    info = _run_episode(wrapper)
+    assert info['primed'] is False
+    assert info['primed_prefix_len'] == 0
