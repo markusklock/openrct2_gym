@@ -2596,3 +2596,223 @@ def test_p6_styled_narrowed_branch_can_still_refuse(monkeypatch, tmp_path):
                                                    narrowed=True)
     assert classify_family(history) != 0            # the jogging opening is in the track
     assert styled is False
+
+
+# ===================================================================================
+# Forced exploration (Aug-15): primed episodes as a distinct THIRD episode class.
+#
+# The reward machinery for seed-conditioned family variety is complete and verified, and
+# the agent still builds an oval on ~100% of unaided episodes: the policy tries a non-oval
+# on ~0.4% of episodes, so it essentially never experiences the family payoff. Priming
+# replays a short family-correct OPENING (the first `warm_min_prefix` pieces of a library
+# exemplar matching the episode's seed) on a fraction of otherwise-cold draws, then hands
+# the rest of the build to the agent.
+#
+# THE TRAP: a primed episode is not unaided. It must be a class of its own -- distinct
+# from both cold (unaided) and warm (annealer-scaffolded) -- excluded from every cold gate
+# AND every warm-scaffold bookkeeping window, with its own harvest tag and its own
+# diagnostics. Every fixture's family below is verified via classify_family(), not assumed.
+
+def test_family_pool_returns_only_matching_family_within_budget(tmp_path):
+    """LoopLibrary.family_pool: the plain family-only view priming needs. Unlike pool()
+    it applies no structural degrade tiers (an unstructured, chainless exemplar must still
+    come back if its own footprint matches) and must not touch pool()'s own narrowing
+    diagnostics (last_family_requested/last_family_narrowed describe the SCAFFOLD's own
+    decision; priming's fallback check has to stay independent of it)."""
+    lib = _lib(tmp_path)
+    winding = [4, 4, 3, 3] * 3 + [0] * 20
+    assert classify_family(winding) == 3
+    assert classify_family(FLAT) == 0
+    lib.add(LoopRecord.from_actions(FLAT, "scripted"))              # family 0, len 12
+    lib.add(LoopRecord.from_actions(winding, "scripted"))           # family 3
+    got = lib.family_pool(0, max_len=40)
+    assert [r.actions for r in got] == [tuple(FLAT)]
+    assert lib.family_pool(0, max_len=13) == []                     # 12 > 13 - 2 margin
+    assert len(lib.family_pool(0, max_len=14)) == 1
+    lib.last_family_requested, lib.last_family_narrowed = "sentinel", "sentinel"
+    lib.family_pool(0, max_len=40)
+    assert lib.last_family_requested == "sentinel"                  # untouched
+    assert lib.last_family_narrowed == "sentinel"
+
+
+def test_warm_start_plan_primed_defaults_false(tmp_path):
+    """Every existing WarmStartPlan construction site (positional args, no `primed`
+    kwarg) must keep working -- the field is additive."""
+    plan = WarmStartPlan(prefix=[0], k=1, loop_len=2, cold=False)
+    assert plan.primed is False
+    cold = WarmStartPlan([], 0, 0, True)
+    assert cold.primed is False
+
+
+def test_prime_frac_zero_never_primes(monkeypatch, tmp_path):
+    """--prime-frac 0.0 (the documented default) must never prime, even in a phase where
+    families ARE active and the annealer's own draws are forced cold -- the only way a
+    primed episode could occur here is via the new mechanism, so this isolates it."""
+    wrapper, base = _wrapped(monkeypatch, tmp_path, seed_loops=(FLAT,), p_cold=1.0)
+    assert wrapper.prime_frac == 0.0
+    wrapper.current_phase = 3
+    wrapper._update_phase_settings()
+    wrapper._family_rng.choice = lambda seq: 0
+    for _ in range(10):
+        info = _run_episode(wrapper)
+        assert info['cold_start'] is True
+        assert info.get('primed', False) is False
+    assert wrapper._current_plan.primed is False
+
+
+def test_prime_never_fires_outside_family_active_phases(monkeypatch, tmp_path):
+    """Phases 1-2 pin the seed and PHASE_FAMILIES is empty there -- priming must stay a
+    no-op even at prime_frac=1.0 (phases 1-2 stay bit-identical)."""
+    wrapper, base = _wrapped(monkeypatch, tmp_path, seed_loops=(FLAT,),
+                             p_cold=1.0, prime_frac=1.0)
+    for phase in (1, 2):
+        wrapper.current_phase = phase
+        wrapper._update_phase_settings()
+        info = _run_episode(wrapper)
+        assert info.get('primed', False) is False
+        assert info['cold_start'] is True
+
+
+def test_primed_episode_marks_info_and_replays_family_correct_opening(monkeypatch, tmp_path):
+    """A primed episode: primed=True, cold_start=False, and the replayed opening is
+    drawn from an exemplar of the REQUESTED family -- verified by computing
+    classify_family directly on the replayed prefix, not by trusting the pool."""
+    wrapper, base = _wrapped(monkeypatch, tmp_path, seed_loops=(FLAT,),
+                             p_cold=1.0, prime_frac=1.0)
+    wrapper.current_phase = 3
+    wrapper._update_phase_settings()
+    wrapper._family_rng.choice = lambda seq: 0                      # this episode's seed: oval
+    info = _run_episode(wrapper)
+    assert info['primed'] is True
+    assert info['cold_start'] is False
+    plan = wrapper._current_plan
+    assert plan.primed is True
+    assert plan.cold is False
+    assert 1 <= len(plan.prefix) == wrapper._prime_prefix_len()
+    assert classify_family(plan.prefix) == 0
+
+
+def _primed_episodes(monkeypatch, tmp_path, n=5, seed_loops=(FLAT,), family=0, phase=3):
+    """Run `n` episodes guaranteed to be primed (annealer forced cold, prime_frac=1.0,
+    a family-matching exemplar seeded). Each exclusion test below makes its own
+    assertion against the returned wrapper, so a missing fix fails its own test."""
+    wrapper, base = _wrapped(monkeypatch, tmp_path, seed_loops=seed_loops,
+                             p_cold=1.0, prime_frac=1.0)
+    wrapper.current_phase = phase
+    wrapper._update_phase_settings()
+    wrapper._family_rng.choice = lambda seq: family
+    for _ in range(n):
+        info = _run_episode(wrapper)
+        assert info['primed'] is True, "setup assumption violated: episode was not primed"
+    return wrapper, base
+
+
+def test_primed_episode_excluded_from_episode_results(monkeypatch, tmp_path):
+    wrapper, _ = _primed_episodes(monkeypatch, tmp_path)
+    assert len(wrapper.episode_results) == 0
+
+
+def test_primed_episode_excluded_from_episode_family_results(monkeypatch, tmp_path):
+    wrapper, _ = _primed_episodes(monkeypatch, tmp_path)
+    assert len(wrapper.episode_family_results[0]) == 0
+
+
+def test_primed_episode_excluded_from_scaffold_results(monkeypatch, tmp_path):
+    wrapper, _ = _primed_episodes(monkeypatch, tmp_path)
+    assert len(wrapper.scaffold_results) == 0
+
+
+def test_primed_episode_excluded_from_annealer_frontier(monkeypatch, tmp_path):
+    """A primed plan's k=0 (no scaffold suffix cap) already makes the annealer's OWN
+    `k < k_max - 1` check skip it once k_max >= 2 -- that would make this test pass
+    trivially, for the wrong reason, if the wrapper's `primed` guard were missing. Force
+    k_max down to 1 first (k_max - 1 == 0 == plan.k), so a primed episode's outcome
+    would reach frontier.append(...) if not for the guard -- this is the setup that
+    makes the test able to fail for ITS OWN reason."""
+    wrapper, base = _wrapped(monkeypatch, tmp_path, seed_loops=(FLAT,),
+                             p_cold=1.0, prime_frac=1.0)
+    wrapper.current_phase = 3
+    wrapper._update_phase_settings()
+    wrapper._family_rng.choice = lambda seq: 0
+    wrapper._annealer.k_max = 1
+    for _ in range(5):
+        info = _run_episode(wrapper)
+        assert info['primed'] is True, "setup assumption violated: episode was not primed"
+        assert wrapper._current_plan.k == 0, "setup assumption violated: k != 0"
+    assert len(wrapper._annealer.frontier) == 0
+    assert wrapper._annealer.k_max == 1
+
+
+def test_primed_harvest_tagged_harvest_primed(monkeypatch, tmp_path):
+    """The library split stays honest: a completion whose opening was primed tags
+    'harvest_primed', distinct from both 'harvest' (genuine warm-scaffold) and
+    'harvest_cold' (genuinely unaided)."""
+    wrapper, base = _wrapped(monkeypatch, tmp_path, api_cls=CompletingAPI,
+                             seed_loops=(FLAT,), p_cold=1.0, prime_frac=1.0)
+    wrapper.current_phase = 3
+    wrapper._update_phase_settings()
+    wrapper._family_rng.choice = lambda seq: 0
+    base.api_controller.complete_after = wrapper._prime_prefix_len() + 2
+    info = _run_episode(wrapper)
+    assert info['primed'] is True
+    assert info['loop_completed'] is True
+    # The env harvests to OpenRCT2Env._LOOP_LIBRARY_PATH (the _isolate_env_side_files
+    # fixture's per-test tmp file), which is separate from the wrapper's own read-view
+    # library (`loop_library_path=lib_path` in _wrapped, seeded with "scripted" FLAT) --
+    # reload from the env's actual harvest destination.
+    harvested_lib = LoopLibrary(OpenRCT2Env._LOOP_LIBRARY_PATH)
+    recs = list(harvested_lib._records.values())
+    assert len(recs) == 1
+    assert recs[0].source == "harvest_primed"
+    assert recs[0].length == wrapper._prime_prefix_len() + 2
+
+
+def test_prime_falls_back_to_cold_when_no_family_exemplar(monkeypatch, tmp_path):
+    """The requested family has zero exemplars in the library -- priming must not fire
+    with the wrong family (it would teach the wrong seed-to-shape association). The
+    episode stays cold, and the diagnostic reflects that rather than reporting a prime."""
+    winding = [4, 4, 3, 3] * 3 + [0] * 20
+    assert classify_family(winding) == 3
+    wrapper, base = _wrapped(monkeypatch, tmp_path, seed_loops=(winding,),
+                             p_cold=1.0, prime_frac=1.0)     # only family 3 in the library
+    wrapper.current_phase = 3
+    wrapper._update_phase_settings()
+    wrapper._family_rng.choice = lambda seq: 0               # seed asks for oval (family 0)
+    info = _run_episode(wrapper)
+    assert info['cold_start'] is True
+    assert info.get('primed', False) is False
+    assert info['primed_rate'] == 0.0
+
+
+def test_primed_rate_diagnostic_matches_actual_primed_share(monkeypatch, tmp_path):
+    wrapper, base = _wrapped(monkeypatch, tmp_path, seed_loops=(FLAT,),
+                             p_cold=1.0, prime_frac=0.5)
+    wrapper.current_phase = 3
+    wrapper._update_phase_settings()
+    wrapper._family_rng.choice = lambda seq: 0
+    wrapper._prime_rng = random.Random(7)
+    flags = []
+    info = None
+    for _ in range(30):
+        info = _run_episode(wrapper)
+        flags.append(info['primed'])
+    assert 0 < sum(flags) < len(flags), "test is meaningless if every draw landed the same way"
+    assert info['primed_rate'] == pytest.approx(sum(flags) / len(flags))
+
+
+def test_primed_family_hit_diagnostic_only_counts_primed_episodes(monkeypatch, tmp_path):
+    """The signal that priming is teaching something: share of PRIMED episodes whose
+    finished track lands in the requested family (a primed episode that still reverts to
+    an oval is the failure mode). Verified end-to-end on a real completion."""
+    wrapper, base = _wrapped(monkeypatch, tmp_path, api_cls=CompletingAPI,
+                             seed_loops=(FLAT,), p_cold=1.0, prime_frac=1.0)
+    wrapper.current_phase = 3
+    wrapper._update_phase_settings()
+    wrapper._family_rng.choice = lambda seq: 0
+    base.api_controller.complete_after = wrapper._prime_prefix_len() + 2
+    info = _run_episode(wrapper)
+    assert info['primed'] is True
+    assert info['loop_completed'] is True
+    history_actions = [h['action'] for h in base.track_builder.history]
+    assert classify_family(history_actions) == 0                # whole finished track: oval
+    assert info['primed_family_hit'] == pytest.approx(1.0)

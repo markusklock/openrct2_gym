@@ -40,7 +40,8 @@ class LoopRecord:
     chain_count: int
     max_gain: float              # peak z above the start height (0 for flat loops)
     drop_z: float                # total z dropped over descent pieces (static per-action geometry)
-    source: str                  # "scripted" | "harvest" | "harvest_cold" | "mined" | "imported"
+    source: str                  # "scripted" | "harvest" | "harvest_cold" | "harvest_primed"
+                                  # | "mined" | "imported"
     excitement: float = 0.0     # MEASURED ride excitement (0.0 = untested/legacy; P5 ratchet key)
     # Provenance (Aug-6): wall-clock seconds and the OpenRCT2 port that built it.
     # ts rather than a training-step counter: TB stamps wall_time on every scalar, so
@@ -336,6 +337,18 @@ class LoopLibrary:
                 return hills
         return fits
 
+    def family_pool(self, family, max_len):
+        """Records whose OWN footprint matches `family`, fitting the track budget --
+        the plain family-only view forced-exploration priming needs (Aug-15): no
+        structural degrade tiers, unlike pool() (an unstructured, chainless exemplar
+        must still come back if its shape matches -- priming only needs a family-correct
+        OPENING, not a structurally-qualifying scaffold). Deliberately does not touch
+        last_family_requested/last_family_narrowed: those describe pool()'s OWN
+        narrowing decision for the real warm-start scaffold, and a priming query must
+        not corrupt that diagnostic by piggybacking on the same instance state."""
+        return [r for r in self._records.values()
+                if r.family == family and r.length <= max_len - 2]
+
     def best_excitement(self, max_len, family=None):
         """Highest measured excitement among records fitting the track budget (0.0 for a
         legacy/untagged pool). Drives the P5/P6 self-imitation ratchet: the scaffold bar
@@ -381,6 +394,12 @@ class WarmStartPlan:
     cold: bool
     at_floor: bool = False       # k hit the per-record cap (len - min_prefix): this
                                  # episode's outcome feeds the PREFIX anneal, not k's
+    # Forced exploration (Aug-15): True only for a PRIMED episode -- an otherwise-cold
+    # draw whose opening was overridden with a family-correct exemplar prefix (see
+    # ImprovedPhasedCurriculumWrapper._sample_prime). cold is False for a primed plan
+    # (a prefix WAS replayed), but primed episodes are a third class distinct from both
+    # cold and warm-scaffolded: not evidence about the annealer's own frontier.
+    primed: bool = False
 
 
 class WarmStartAnnealer:

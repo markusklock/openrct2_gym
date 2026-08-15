@@ -1378,3 +1378,69 @@ def test_callback_logs_warm_family_narrowed_only_when_requested():
     assert _step(requested=3, narrowed=False)['curriculum/warm_family_narrowed'] == \
         pytest.approx(0.0)
     assert 'curriculum/warm_family_narrowed' not in _step(requested=None, narrowed=False)
+
+
+# ------------------------------------- forced exploration: --prime-frac wiring (Aug-15)
+
+def test_cli_exposes_prime_frac(monkeypatch):
+    import argparse
+    seen = []
+    real_add = argparse.ArgumentParser.add_argument
+
+    def spy(self, *a, **kw):
+        seen.append(a)
+        return real_add(self, *a, **kw)
+
+    monkeypatch.setattr(argparse.ArgumentParser, "add_argument", spy)
+    try:
+        T.parse_args(["--ports", "8080"])
+    except SystemExit:
+        pass
+    assert "--prime-frac" in [a[0] for a in seen if a and isinstance(a[0], str)]
+
+
+def test_cli_prime_frac_defaults_to_zero():
+    args = T.parse_args(["--ports", "8080"])
+    assert args.prime_frac == 0.0
+
+
+def test_env_factory_threads_prime_frac(monkeypatch, tmp_path):
+    """Must reach the wrapper's own prime_frac attribute, and default to 0.0 (off) so
+    every existing configuration is bit-identical without it."""
+    from openrct2_gym.envs.openrct2_env import OpenRCT2Env
+    monkeypatch.setattr(OpenRCT2Env, "_LOOP_LIBRARY_PATH", str(tmp_path / "lib.jsonl"))
+    monkeypatch.setattr(oe_mod, "APIController", FakeAPI)
+    env = T.create_curriculum_masked_env(8080, verbose=0, prime_frac=0.4)
+    w = env
+    while not hasattr(w, "prime_frac"):
+        w = w.env
+    assert w.prime_frac == pytest.approx(0.4)
+    env.close()
+    env2 = T.create_curriculum_masked_env(8080, verbose=0)
+    w2 = env2
+    while not hasattr(w2, "prime_frac"):
+        w2 = w2.env
+    assert w2.prime_frac == 0.0
+    env2.close()
+
+
+def test_callback_logs_primed_diagnostics():
+    """curriculum/primed_rate and curriculum/primed_family_hit -- the diagnostics the
+    forced-exploration mechanism streams (per the house rule: every new mechanism gets
+    its own tag)."""
+    from types import SimpleNamespace
+    cb = T.ParallelCurriculumMaskableCallback(n_envs=1)
+    cb.model = SimpleNamespace(target_kl=None, ent_coef=0.01, get_env=lambda: None)
+    store = {}
+    cb.model.logger = SimpleNamespace(
+        name_to_value={}, record=lambda k, v, *a, **kw: store.__setitem__(k, v))
+    cb.locals = {
+        'dones': [True],
+        'infos': [{'loop_completed': True, 'cold_start': False, 'primed': True,
+                   'learning_phase': 3, 'track_length': 12, 'current_distance': 0.0,
+                   'collision_count': 0, 'primed_rate': 0.4, 'primed_family_hit': 0.6,
+                   'episode_metrics': {'track_length': 12, 'min_distance': 0.0}}],
+    }
+    cb._on_step()
+    assert store['curriculum/primed_rate'] == pytest.approx(0.4)
+    assert store['curriculum/primed_family_hit'] == pytest.approx(0.6)

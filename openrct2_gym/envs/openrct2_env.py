@@ -315,6 +315,13 @@ class OpenRCT2Env(gym.Env):
         # reward weights default to inert, so nothing changes for phases 1-2.
         self.target_family = 0
         self._warm_cold = True
+        # Forced exploration (Aug-15): set by the curriculum wrapper before reset(), like
+        # target_family -- True only when THIS episode's opening came from the priming
+        # mechanism (a family-correct exemplar prefix on an otherwise-cold draw), not
+        # from the annealer's own warm-scaffold path. Read only at harvest time (see
+        # _harvest_completed_loop) to give a primed completion its own source tag; a bare
+        # env never sets it, so harvest tagging is unchanged there.
+        self._warm_primed = False
         self._warm_aborted = False       # prefix replay failed mid-way (infrastructure event)
         self._warm_track_cap = None      # scaffolded-episode piece budget (None = full budget)
         self._warm_step_cap = None       # scaffolded-episode step budget (None = full budget)
@@ -969,9 +976,13 @@ class OpenRCT2Env(gym.Env):
             self._loop_library.add(
                 LoopLibrary.record_from_history(
                     self.track_builder.history,
-                    # cold-vs-scaffolded provenance for inspection tooling
-                    # (build_gallery.py splits current UNAIDED behavior from warm work)
-                    source="harvest_cold" if self._warm_cold else "harvest",
+                    # cold-vs-scaffolded-vs-primed provenance for inspection tooling
+                    # (build_gallery.py splits current UNAIDED behavior from warm work).
+                    # Checked before _warm_cold: a primed episode's prefix makes
+                    # _warm_cold False too (a prefix WAS replayed), but it is not a
+                    # genuine warm-scaffold completion -- see _warm_primed's docstring.
+                    source=("harvest_primed" if self._warm_primed
+                           else "harvest_cold" if self._warm_cold else "harvest"),
                     excitement=excitement,
                     # when + which instance: ts joins to TB wall_time for the exact
                     # training step; port identifies the worker (a sick instance shows

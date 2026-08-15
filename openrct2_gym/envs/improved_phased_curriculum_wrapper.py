@@ -82,6 +82,11 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                  p_cold=0.25,
                  warm_k_init=3,
                  warm_min_prefix=None,
+                 # Forced exploration (Aug-15, see warm_start.py's family_pool and
+                 # _sample_prime below): fraction of otherwise-COLD draws to prime with a
+                 # family-correct opening instead. 0.0 = off, so every existing
+                 # configuration is bit-identical without it.
+                 prime_frac=0.0,
                  # Jul-19: a deep-P5/P6 policy cannot re-walk Phase 1 (its committed
                  # 90+ piece builds truncate inside the 40-piece budget -- live stall:
                  # cold completion 0.00 and active unlearning). Start the curriculum
@@ -133,12 +138,22 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
         # achieved rung while keeping the init=6 demote ceiling.
         self._warm_min_prefix_override = warm_min_prefix
         self._current_plan = WarmStartPlan(prefix=[], k=0, loop_len=0, cold=True)
+        # Forced exploration (Aug-15): own RNG, so prime_frac=0.0 (the default) never
+        # consumes a random draw at all -- every existing configuration stays bit-
+        # identical (see _sample_warm_start's short-circuit).
+        self.prime_frac = float(prime_frac)
+        self._prime_rng = random.Random()
 
         # Performance tracking. episode_results (and the qualified/phase-2 windows below)
         # see only COLD episodes -- a scaffolded win must never advance a phase gate.
         self.episode_results = deque(maxlen=window_size)
         self.scaffold_results = deque(maxlen=window_size)
         self._cold_flags = deque(maxlen=window_size)
+        # Forced exploration diagnostics (Aug-15): primed episodes are neither cold nor
+        # warm-scaffolded -- their own rolling windows, per the house rule (every
+        # mechanism streams its own diagnostic).
+        self._primed_flags = deque(maxlen=window_size)
+        self._primed_family_hit_flags = deque(maxlen=window_size)
         self.episode_qualified_results = deque(maxlen=window_size)
         # Per-phase family seed sampling (Aug-9) and its own cold-only measurement
         # window, one per family index (see PHASE_FAMILIES / _sample_target_family).
@@ -967,6 +982,8 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
         self.episode_results.clear()
         self.scaffold_results.clear()
         self._cold_flags.clear()
+        self._primed_flags.clear()
+        self._primed_family_hit_flags.clear()
         self.episode_qualified_results.clear()
         self.phase2_summit_results.clear()
         self.phase2_roundtrip_results.clear()
@@ -1108,11 +1125,58 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
             # exemplar the harvest tags. No persistent state; recomputed per episode.
             min_chains, min_len, min_drop_z, min_single_drop_z = 1, 40, 12, 12
             min_excitement = 0.8 * self._loop_library.best_excitement(budget, family=family)
-        return self._annealer.sample_plan(
+        plan = self._annealer.sample_plan(
             self._loop_library, self.current_phase, budget,
             min_chains=min_chains, min_len=min_len, min_drop_z=min_drop_z,
             min_steep_z=min_steep_z, min_single_drop_z=min_single_drop_z,
             min_excitement=min_excitement, min_turns=min_turns, family=family)
+        # Forced exploration (Aug-15): the reward machinery for seed-conditioned family
+        # variety is complete and verified, and unaided builds still land on an oval on
+        # ~100% of episodes -- the policy tries a non-oval on ~0.4% of them, so it never
+        # experiences the family payoff often enough to learn from it. On a fraction of
+        # episodes that would otherwise be COLD (unaided), replay a short family-correct
+        # OPENING instead and let the agent build the rest -- see _sample_prime. Only
+        # fires when the annealer's own draw came back cold (a genuine scaffold draw is
+        # left untouched); `family` is None in phases 1-2 (PHASE_FAMILIES empty there),
+        # so priming is a no-op there by construction; prime_frac<=0.0 short-circuits
+        # before any RNG draw, so --prime-frac 0.0 (the default) is bit-identical.
+        if plan.cold and family is not None and self.prime_frac > 0.0 \
+                and self._prime_rng.random() < self.prime_frac:
+            primed_plan = self._sample_prime(family, budget)
+            if primed_plan is not None:
+                return primed_plan
+            # No exemplar of the requested family exists yet: fall back to the normal
+            # cold episode rather than priming with the wrong family (which would teach
+            # the wrong seed-to-shape association) -- `plan` below is still `cold`, so
+            # this episode correctly reports NOT primed in every diagnostic.
+        return plan
+
+    # Opening length for a primed episode -- reuses warm_min_prefix (the --warm-min-prefix
+    # knob) rather than adding a second one; 6 matches the P6 opening-seed constant
+    # (_update_phase_settings) when no override is given.
+    PRIME_DEFAULT_PREFIX = 6
+
+    def _prime_prefix_len(self):
+        ov = self._warm_min_prefix_override
+        return self.PRIME_DEFAULT_PREFIX if ov is None else max(0, int(ov))
+
+    def _sample_prime(self, family, budget):
+        """Attempt to prime an otherwise-cold draw: pick an exemplar whose OWN footprint
+        matches `family` (LoopLibrary.family_pool -- no structural degrade tiers, unlike
+        pool(); priming only needs a family-correct OPENING) and replay its first
+        `_prime_prefix_len()` pieces, handing the rest of the episode to the agent (k=0:
+        no scaffold track/step cap, so the agent gets the FULL phase budget to close the
+        loop however it likes -- this is not the annealer's tight suffix practice).
+        Returns None when the pool holds no matching exemplar; the caller must fall back
+        to a normal cold episode."""
+        prefix_len = self._prime_prefix_len()
+        candidates = [r for r in self._loop_library.family_pool(family, budget)
+                     if r.length > prefix_len]
+        if not candidates:
+            return None
+        rec = candidates[self._prime_rng.randrange(len(candidates))]
+        return WarmStartPlan(prefix=list(rec.actions[:prefix_len]), k=0,
+                             loop_len=rec.length, cold=False, primed=True)
 
     def reset(self, **kwargs):
         """Reset environment and check for phase advancement"""
@@ -1132,11 +1196,16 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
         self._current_plan = self._sample_warm_start()
         base_env.warm_start_actions = list(self._current_plan.prefix) or None
         base_env.warm_start_suffix_k = self._current_plan.k or None
+        # Forced exploration (Aug-15): tell the env whether THIS episode's opening came
+        # from priming, not the annealer's own warm-scaffold path, so a completion tags
+        # "harvest_primed" instead of "harvest" (see OpenRCT2Env._harvest_completed_loop).
+        base_env._warm_primed = bool(self._current_plan.primed)
 
         obs, info = self.env.reset(**kwargs)
 
         # Add phase info
         info['learning_phase'] = self.current_phase
+        info['primed'] = bool(self._current_plan.primed)
         info['phase_name'] = {
             1: "Return Practice",
             2: f"Lift Hill Building {self.phase2_stage_name()}",
@@ -1188,17 +1257,25 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
             base_env = self._get_base_env()
             success = getattr(base_env, 'loop_completed', False)
             cold = bool(info.get('cold_start', getattr(base_env, '_warm_cold', True)))
+            # Forced exploration (Aug-15): the THIRD episode class. cold is already False
+            # for a primed episode (a prefix WAS replayed), but a primed episode is not
+            # real evidence about the scaffold's own frontier either -- its suffix is
+            # freely agent-built, not the record's own closing sequence the annealer is
+            # tracking. Both cold-only and warm-scaffold-only windows below exclude it.
+            primed = bool(getattr(self._current_plan, 'primed', False))
             self._cold_flags.append(cold)
+            self._primed_flags.append(primed)
             # Cold-only gating: every phase-gate window (success, qualified, phase-2 chain
             # diagnostics) sees only true-task episodes -- a scaffolded win must never
             # advance a gate. Scaffolded outcomes drive the annealer's frontier instead.
             if cold:
                 self.episode_results.append(success)
-            else:
+            elif not primed:
                 self.scaffold_results.append(success)
             # Aborted prefixes are infrastructure events, not agent outcomes: they must
-            # not feed the frontier (a burst of aborts would demote k_max on noise).
-            if not info.get('warm_aborted', False):
+            # not feed the frontier (a burst of aborts would demote k_max on noise). A
+            # primed episode must not feed it either -- see the primed comment above.
+            if not info.get('warm_aborted', False) and not primed:
                 # The prefix descent may only shrink the opening seed when the build had
                 # the SHAPE this phase is teaching, not merely when it closed -- see
                 # WarmStartAnnealer.record_outcome. What "shape" means is phase-dependent,
@@ -1276,6 +1353,22 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                 self.episode_family_results[z].append(bool(family_hit and qualified))
             info['target_family'] = z
             info['family_hit'] = float(family_hit)
+            # Forced exploration diagnostics (Aug-15): primed_rate (share of episodes
+            # primed) and primed_family_hit (share of PRIMED episodes whose finished
+            # track lands in the requested family -- the signal that priming is teaching
+            # something; a primed episode that still reverts to an oval is the failure
+            # mode). primed_family_hit is judged on the SAME whole-track family_hit as
+            # the cold gate above (already ANDed with loop_completed), never on the
+            # replayed prefix alone.
+            info['primed'] = primed
+            if primed:
+                self._primed_family_hit_flags.append(bool(family_hit))
+            info['primed_rate'] = (
+                sum(self._primed_flags) / len(self._primed_flags)
+                if self._primed_flags else 0.0)
+            info['primed_family_hit'] = (
+                sum(self._primed_family_hit_flags) / len(self._primed_family_hit_flags)
+                if self._primed_family_hit_flags else 0.0)
             # Emit the rate (+ its family_n_ sample count) only for families the current
             # phase actually draws from -- matching qualified_rate's convention (:1113)
             # of gating the KEY itself on applicability, not just its value. 0.0 is kept

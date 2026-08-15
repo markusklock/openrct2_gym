@@ -1718,6 +1718,8 @@ def test_phase2_substage_advancement_sequence():
     # warm-start state touched by _clear_phase_windows / _advance_* hooks
     w.scaffold_results = deque(maxlen=50)
     w._cold_flags = deque(maxlen=50)
+    w._primed_flags = deque(maxlen=50)
+    w._primed_family_hit_flags = deque(maxlen=50)
     w.episode_family_results = {z: deque(maxlen=50) for z in range(FAMILY_N)}
     from openrct2_gym.envs.warm_start import WarmStartAnnealer
     w._annealer = WarmStartAnnealer()

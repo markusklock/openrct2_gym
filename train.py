@@ -614,6 +614,11 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
                     'library_best_excitement',
                     # seed-conditioned footprint diagnostics (Aug-9 / Task 7)
                     'target_family',
+                    # Forced exploration (Aug-15): primed episodes are a third class,
+                    # distinct from both cold_* and scaffold/warm_* above -- their own
+                    # diagnostic per the house rule.
+                    'primed_rate',
+                    'primed_family_hit',
                 ):
                     if key in _info:
                         self.logger.record(f'curriculum/{key}', _info[key])
@@ -873,7 +878,8 @@ def create_curriculum_masked_env(port: int, verbose: int = 0,
                                  game_speed: int = 8,
                                  start_phase: int = 1,
                                  warm_k_init: int = 3,
-                                 warm_min_prefix: int = None) -> gym.Env:
+                                 warm_min_prefix: int = None,
+                                 prime_frac: float = 0.0) -> gym.Env:
     """Create an improved-curriculum environment with action masking for a port."""
     # A custom library path must redirect BOTH sides: the wrapper's read pool AND the
     # env's harvest destination (class attr; this runs inside each SubprocVecEnv worker).
@@ -922,6 +928,7 @@ def create_curriculum_masked_env(port: int, verbose: int = 0,
         p_cold=p_cold,
         warm_k_init=warm_k_init,
         warm_min_prefix=warm_min_prefix,
+        prime_frac=prime_frac,
     )
 
     # Add Monitor for logging
@@ -940,13 +947,15 @@ def make_env_factory(port: int, verbose: int = 0,
                      game_speed: int = 8,
                      start_phase: int = 1,
                      warm_k_init: int = 3,
-                     warm_min_prefix: int = None) -> Callable[[], gym.Env]:
+                     warm_min_prefix: int = None,
+                     prime_frac: float = 0.0) -> Callable[[], gym.Env]:
     """Create a factory function for an environment on a specific port"""
     def _init() -> gym.Env:
         try:
             env = create_curriculum_masked_env(port, verbose, warm_start_enabled,
                                                loop_library_path, p_cold, game_speed,
-                                               start_phase, warm_k_init, warm_min_prefix)
+                                               start_phase, warm_k_init, warm_min_prefix,
+                                               prime_frac)
             print(f"✅ Successfully connected to OpenRCT2 on port {port}")
             return env
         except Exception as e:
@@ -985,6 +994,7 @@ def train(
     start_phase: int = 1,
     warm_k_init: int = 3,
     warm_min_prefix: int = None,
+    prime_frac: float = 0.0,
 ):
     """Train agent with curriculum learning AND action masking on multiple parallel environments"""
 
@@ -1040,7 +1050,8 @@ def train(
     # Create environment factories for each port
     env_factories = [make_env_factory(port, verbose, warm_start_enabled,
                                       loop_library_path, p_cold, game_speed, start_phase,
-                                      warm_k_init, warm_min_prefix) for port in ports]
+                                      warm_k_init, warm_min_prefix, prime_frac)
+                     for port in ports]
 
     # Create vectorized environments
     print(f"\n🔌 Connecting to {n_envs} OpenRCT2 instances...")
@@ -1337,6 +1348,15 @@ def parse_args(argv=None):
                              "every resume otherwise re-anneals from 3 and spends most of "
                              "the chunk re-proving competence; the annealer's demote path "
                              "still corrects an overshoot honestly.")
+    parser.add_argument("--prime-frac", type=float, default=0.0,
+                        help="Fraction of otherwise-cold episodes to PRIME with a "
+                             "family-correct opening (the first --warm-min-prefix pieces "
+                             "of a matching library exemplar), forcing the policy to "
+                             "actually attempt non-oval shapes often enough to learn "
+                             "their payoff. Default 0.0 (off, bit-identical to before). "
+                             "Only applies in phases where families are active (3-6); "
+                             "primed episodes are a third class, excluded from every "
+                             "cold gate AND the warm-scaffold's own bookkeeping.")
     return parser.parse_args(argv)
 
 
@@ -1429,6 +1449,7 @@ def main():
         start_phase=args.start_phase,
         warm_k_init=args.warm_k_init,
         warm_min_prefix=args.warm_min_prefix,
+        prime_frac=args.prime_frac,
     )
     # Training function already evaluates between chunks and closes env.
     # No additional evaluation here to avoid interfering with API ports.
