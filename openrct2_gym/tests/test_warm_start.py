@@ -2943,61 +2943,129 @@ def test_first_piece_prefix_abort_reports_not_primed_end_to_end(monkeypatch, tmp
 # A fixed 6-piece opening does not carry family information for every family: measured on
 # the 91,639-record library, a spiral/oval opening's first 6 actions show the shape almost
 # immediately, but out_and_back's defining switch shows up in the first 6 actions only 0.7%
-# of the time, and winding/serpentine need even more. The fix: prime with the SHORTEST
-# prefix of the chosen exemplar that already contains the family's own turn_lo turns and
-# switch_lo switches (footprint.FAMILIES), floored at the configured warm_min_prefix and
-# capped at 40% of the phase's track budget.
+# of the time, and winding/serpentine need even more.
+#
+# Fix pass 2 (Aug-15, re-measured against the 280k-record DEPLOYMENT library): requiring
+# BOTH turn_lo turns AND switch_lo switches chases the wrong target -- oval is the only
+# family with switch_lo=0, so a single switch already rules oval out; the turns needed to
+# fill out the family's own band accumulate afterwards and don't need to gate the opening.
+# Only spiral (switch_lo=0, no switches ever allowed) still needs turns as its own
+# discriminator against oval. Median committing-opening length, old rule vs. the
+# discriminator-only rule now used:
+#   oval 2->2, spiral 51->51, out_and_back 59->34, winding 37->25, serpentine 43->35
+# The fix: prime with the SHORTEST prefix of the chosen exemplar that already clears the
+# family's discriminating axis (switch_lo switches when switch_lo>0, else turn_lo turns --
+# footprint.FAMILIES), floored at the configured warm_min_prefix and capped at 50% of the
+# phase's track budget (raised from 40%, see PRIME_MAX_BUDGET_FRACTION).
 
 def _assert_shortest_family_committing_prefix(prefix, family, floor):
-    """The returned prefix must clear its family's bounds, and -- whenever the family bound
-    (not the floor) is what's binding -- dropping the last piece must no longer clear both
-    bounds at once. This is a generic minimality check: it re-uses footprint's own counting
-    functions on the boundary, rather than hard-coding an independently hand-derived length,
-    so it can't be satisfied by a lucky guess at the expected number."""
+    """The returned prefix must clear its family's DISCRIMINATING axis (switch_lo switches
+    when switch_lo>0, else turn_lo turns -- see PRIME_MAX_BUDGET_FRACTION's comment for why),
+    and -- whenever that axis (not the floor) is what's binding -- dropping the last piece
+    must no longer clear it. This is a generic minimality check: it re-uses footprint's own
+    counting functions on the boundary, rather than hard-coding an independently hand-derived
+    length, so it can't be satisfied by a lucky guess at the expected number."""
     _, turn_lo, _, switch_lo, _ = FAMILIES[family]
-    assert len(turn_directions(prefix)) >= turn_lo
-    assert switch_count(prefix) >= switch_lo
+    if switch_lo > 0:
+        assert switch_count(prefix) >= switch_lo
+    else:
+        assert len(turn_directions(prefix)) >= turn_lo
     if len(prefix) > floor:
         shorter = prefix[:-1]
-        assert not (len(turn_directions(shorter)) >= turn_lo
-                    and switch_count(shorter) >= switch_lo), (
-            "prefix is one piece longer than necessary to commit to the family")
+        if switch_lo > 0:
+            assert switch_count(shorter) < switch_lo, (
+                "prefix is one piece longer than necessary to commit to the family")
+        else:
+            assert len(turn_directions(shorter)) < turn_lo, (
+                "prefix is one piece longer than necessary to commit to the family")
+
+
+def _old_rule_opening_len(actions, family, floor, cap):
+    """Reimplements the PRE-Fix-pass-2 commitment rule (turn_lo turns AND switch_lo
+    switches, both required) purely for comparison in tests -- production code
+    (_prime_opening_len) no longer contains this rule after the fix. Used to make the
+    "shorter opening" claim explicit rather than implied."""
+    _, turn_lo, _, switch_lo, _ = FAMILIES[family]
+    hi = min(cap, len(actions) - 1)
+    for length in range(floor, hi + 1):
+        prefix = actions[:length]
+        if len(turn_directions(prefix)) >= turn_lo and switch_count(prefix) >= switch_lo:
+            return length
+    return None
 
 
 def test_prime_opening_commits_to_spiral_family_bounds(monkeypatch, tmp_path):
+    # spiral has switch_lo=0 -- its discriminating axis against oval is turns, so it is
+    # the one non-oval family where the rule change makes no difference (median opening
+    # length measured unchanged at 51 both ways -- see the section-header table).
     spiral = [4] * 6 + [0] * 14
     assert classify_family(spiral) == 1
     wrapper, base = _wrapped(monkeypatch, tmp_path, seed_loops=(spiral,))
     plan = wrapper._sample_prime(1, budget=60)
     assert plan is not None
     _assert_shortest_family_committing_prefix(plan.prefix, 1, wrapper._prime_prefix_len())
-    assert len(plan.prefix) <= int(0.4 * 60)
+    # Test 2 (spec): spiral's opening still contains at least turn_lo turns.
+    _, turn_lo, _, switch_lo, _ = FAMILIES[1]
+    assert switch_lo == 0, "spiral must be the switch_lo==0 case for this test to be meaningful"
+    assert len(turn_directions(plan.prefix)) >= turn_lo
+    assert len(plan.prefix) <= int(wrapper.PRIME_MAX_BUDGET_FRACTION * 60)
 
 
 def test_prime_opening_commits_to_out_and_back_family_bounds(monkeypatch, tmp_path):
-    # The defining switch sits well past a 6-piece floor -- realistic per the review table
-    # (out_and_back's first-6-has-switch rate measured at 0.7% on the live library).
-    out_and_back = ([0, 0, 0, 4, 4] + [0] * 5 + [4, 4] + [0] * 8 + [3, 3] + [0] * 4)
+    # switch_lo=1 puts the single defining switch at position 21 (of 45), but the OLD
+    # rule additionally needed turn_lo=6 turns, which this record only reaches at
+    # position 40 (6 leading zeros, then two 3-piece turn blocks bracketing 30 straights)
+    # -- a synthetic stand-in for the review table's out_and_back finding (59 -> 34
+    # median on the live library): the switch commits the family early; the turns don't
+    # need to.
+    out_and_back = [0, 0, 0, 0] + [4, 4, 3] + [0] * 30 + [4, 4, 4] + [0] * 5
     assert classify_family(out_and_back) == 2
     wrapper, base = _wrapped(monkeypatch, tmp_path, seed_loops=(out_and_back,))
+    floor = wrapper._prime_prefix_len()
+    cap = int(wrapper.PRIME_MAX_BUDGET_FRACTION * 60)
     plan = wrapper._sample_prime(2, budget=60)
     assert plan is not None
-    _assert_shortest_family_committing_prefix(plan.prefix, 2, wrapper._prime_prefix_len())
-    assert len(plan.prefix) > wrapper._prime_prefix_len(), (
+    _assert_shortest_family_committing_prefix(plan.prefix, 2, floor)
+    _, turn_lo, _, switch_lo, _ = FAMILIES[2]
+    assert switch_lo > 0
+    # Test 1 (spec): the opening contains at least switch_lo switches...
+    assert switch_count(plan.prefix) >= switch_lo
+    assert len(plan.prefix) > floor, (
         "test is meaningless if the floor alone already carried the family")
-    assert len(plan.prefix) <= int(0.4 * 60)
+    assert len(plan.prefix) <= cap
+    # ...and is shorter than what the OLD turns-and-switches rule would have required for
+    # this same record -- the point of the change, asserted explicitly rather than implied.
+    old_len = _old_rule_opening_len(out_and_back, 2, floor, len(out_and_back) - 1)
+    assert old_len is not None
+    assert len(plan.prefix) < old_len
 
 
 def test_prime_opening_commits_to_winding_family_bounds(monkeypatch, tmp_path):
-    winding = [4, 4, 3, 3] * 3 + [0] * 20
+    # switch_lo=3 is reached at position 9 (2 leading zeros, then a 7-piece block already
+    # containing 3 alternations), but the OLD rule additionally needed turn_lo=10 turns,
+    # only reached at position 42 after 30 padding straights and 3 more same-direction
+    # turns -- a synthetic stand-in for the review table's winding finding (37 -> 25
+    # median on the live library).
+    winding = [0, 0] + [4, 4, 3, 3, 4, 4, 3] + [0] * 30 + [4, 4, 4] + [0] * 5
     assert classify_family(winding) == 3
     wrapper, base = _wrapped(monkeypatch, tmp_path, seed_loops=(winding,))
+    floor = wrapper._prime_prefix_len()
+    cap = int(wrapper.PRIME_MAX_BUDGET_FRACTION * 60)
     plan = wrapper._sample_prime(3, budget=60)
     assert plan is not None
-    _assert_shortest_family_committing_prefix(plan.prefix, 3, wrapper._prime_prefix_len())
-    assert len(plan.prefix) > wrapper._prime_prefix_len(), (
+    _assert_shortest_family_committing_prefix(plan.prefix, 3, floor)
+    _, turn_lo, _, switch_lo, _ = FAMILIES[3]
+    assert switch_lo > 0
+    # Test 1 (spec): the opening contains at least switch_lo switches...
+    assert switch_count(plan.prefix) >= switch_lo
+    assert len(plan.prefix) > floor, (
         "test is meaningless if the floor alone already carried the family")
-    assert len(plan.prefix) <= int(0.4 * 60)
+    assert len(plan.prefix) <= cap
+    # ...and is shorter than what the OLD turns-and-switches rule would have required for
+    # this same record -- the point of the change, asserted explicitly rather than implied.
+    old_len = _old_rule_opening_len(winding, 3, floor, len(winding) - 1)
+    assert old_len is not None
+    assert len(plan.prefix) < old_len
 
 
 def test_prime_opening_commits_to_serpentine_family_bounds(monkeypatch, tmp_path):
@@ -3007,9 +3075,12 @@ def test_prime_opening_commits_to_serpentine_family_bounds(monkeypatch, tmp_path
     plan = wrapper._sample_prime(4, budget=80)
     assert plan is not None
     _assert_shortest_family_committing_prefix(plan.prefix, 4, wrapper._prime_prefix_len())
+    _, turn_lo, _, switch_lo, _ = FAMILIES[4]
+    assert switch_lo > 0
+    assert switch_count(plan.prefix) >= switch_lo
     assert len(plan.prefix) > wrapper._prime_prefix_len(), (
         "test is meaningless if the floor alone already carried the family")
-    assert len(plan.prefix) <= int(0.4 * 80)
+    assert len(plan.prefix) <= int(wrapper.PRIME_MAX_BUDGET_FRACTION * 80)
 
 
 def test_prime_opening_oval_still_primes_at_the_configured_floor(monkeypatch, tmp_path):
@@ -3023,10 +3094,11 @@ def test_prime_opening_oval_still_primes_at_the_configured_floor(monkeypatch, tm
 
 
 def test_prime_skips_when_exemplar_cannot_commit_within_the_cap(monkeypatch, tmp_path):
-    """This exemplar's OWN footprint is winding (turns/switches in band), but every one of
-    its turns sits behind 30 leading straights -- the shortest family-committing prefix
-    (measured at 40 pieces) exceeds 40% of a 60-piece budget (24). Priming with a shorter,
-    uninformative prefix would teach nothing; priming with the full 40 would barely leave
+    """This exemplar's OWN footprint is winding (turns/switches in band), but its 3rd
+    switch (the discriminating axis, switch_lo=3) sits behind 30 leading straights plus
+    6 more turn pieces -- the shortest family-committing prefix (measured at 37 pieces,
+    uncapped) exceeds 50% of a 60-piece budget (30). Priming with a shorter,
+    uninformative prefix would teach nothing; priming with the full 37 would barely leave
     the agent a build. Neither is acceptable -- this exemplar must be skipped."""
     winding_block = [4, 4, 3, 3] * 3
     padded = [0] * 30 + winding_block + [0] * 10
@@ -3037,21 +3109,25 @@ def test_prime_skips_when_exemplar_cannot_commit_within_the_cap(monkeypatch, tmp
 
 def test_prime_realized_opening_length_never_exceeds_the_cap(monkeypatch, tmp_path):
     winding_block = [4, 4, 3, 3] * 3
-    padded = [0] * 20 + winding_block + [0] * 10   # shortest committing length: 30
+    padded = [0] * 20 + winding_block + [0] * 10   # shortest committing length: 27
     assert classify_family(padded) == 3
     wrapper, base = _wrapped(monkeypatch, tmp_path, seed_loops=(padded,))
     budget = 80
     plan = wrapper._sample_prime(3, budget)
     assert plan is not None
-    assert len(plan.prefix) <= int(0.4 * budget)
+    # Test 5 (spec): the cap is asserted as a relationship to the phase budget, not a
+    # literal, so a future budget (or PRIME_MAX_BUDGET_FRACTION) change surfaces here.
+    assert len(plan.prefix) <= int(wrapper.PRIME_MAX_BUDGET_FRACTION * budget)
 
 
 def test_prime_skip_counted_distinctly_from_primed_when_bounds_unreachable(monkeypatch, tmp_path):
     """The skip diagnostic must be its own signal, not folded into primed_rate (a 0%
     primed_rate is ambiguous between 'families aren't active' and 'every attempt was
-    skipped for lacking a committing exemplar')."""
+    skipped for lacking a committing exemplar'). Phase 4's budget is 80, so the 50% cap
+    is 40; this record's 3rd switch (the discriminating axis) sits at 35 leading
+    straights + 7 more turn pieces = 42, uncapped -- past the cap."""
     winding_block = [4, 4, 3, 3] * 3
-    padded = [0] * 30 + winding_block + [0] * 10   # shortest committing length: 40
+    padded = [0] * 35 + winding_block + [0] * 10   # shortest committing length: 42
     assert classify_family(padded) == 3
     wrapper, base = _wrapped(monkeypatch, tmp_path, seed_loops=(padded,),
                              p_cold=1.0, prime_frac=1.0)

@@ -1154,8 +1154,8 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                 self._primed_skip_flags.append(False)
                 return primed_plan
             # No exemplar of the requested family could be primed within the cap (either
-            # none exists yet, or none commits to the family's turn/switch bounds within
-            # 40% of the budget -- see _sample_prime): fall back to the normal cold
+            # none exists yet, or none commits to the family's discriminating axis within
+            # 50% of the budget -- see _sample_prime): fall back to the normal cold
             # episode rather than priming with the wrong family or an uninformative
             # opening. Counted distinctly from primed_rate (Fix 2/review) so a 0% primed
             # rate is diagnosable -- "families inactive" vs. "every attempt was skipped".
@@ -1170,10 +1170,16 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
     # _update_phase_settings's own `max(0, min(6, ov))` (Fix 4): an override above the
     # default must not hand more pieces to the "opening" floor than the constant intends.
     PRIME_DEFAULT_PREFIX = 6
-    # A cap of 40% of the phase's track budget (Fix 2, review Aug-15): beyond that the
-    # agent is no longer meaningfully building the coaster -- the prefix would BE the
-    # build. See _sample_prime.
-    PRIME_MAX_BUDGET_FRACTION = 0.4
+    # A cap of 50% of the phase's track budget (Fix pass 2, Aug-15 re-measurement against
+    # the 280k-record DEPLOYMENT library -- the earlier 40% cap was measured against the
+    # smaller local copy and against the wrong rule; see _prime_opening_len for the rule
+    # change). Median opening length needed per family, current rule (turns AND switches)
+    # vs. the discriminator-only rule now used:
+    #   oval 2->2, spiral 51->51, out_and_back 59->34, winding 37->25, serpentine 43->35
+    # At a 120-piece budget (P6), 50% = 60, which accommodates spiral's median of 51; 40%
+    # would still skip spiral outright. Beyond the cap the agent is no longer meaningfully
+    # building the coaster -- the prefix would BE the build. See _sample_prime.
+    PRIME_MAX_BUDGET_FRACTION = 0.5
 
     def _prime_prefix_len(self):
         ov = self._warm_min_prefix_override
@@ -1182,15 +1188,27 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
         return max(0, min(self.PRIME_DEFAULT_PREFIX, int(ov)))
 
     def _prime_opening_len(self, actions, family, cap):
-        """Shortest prefix length of `actions`, in [floor, cap], whose OWN turn/switch
-        counts already clear `family`'s FAMILIES lower bounds (turn_lo/switch_lo) --
-        the property review (Aug-15) found a fixed 6-piece opening does NOT carry for
-        out_and_back/winding/serpentine (measured on the 91,639-record library: their
-        first-6-actions-contain-a-switch rate is 0.7% / 99.3% / 100% respectively, i.e.
-        a fixed-length opening is statistically indistinguishable from an oval one for
-        out_and_back). None when no length in [floor, cap] clears the bounds -- the
-        caller must skip this exemplar rather than prime with an uninformative or
-        over-long opening.
+        """Shortest prefix length of `actions`, in [floor, cap], that clears `family`'s
+        DISCRIMINATING axis against footprint.FAMILIES' lower bounds.
+
+        Fix pass 2 (Aug-15, re-measured against the 280k-record DEPLOYMENT library):
+        requiring BOTH turn_lo turns AND switch_lo switches (the original rule) chases
+        the wrong target for most families -- oval is the only family with switch_lo=0,
+        so a single switch already rules oval out for every other family, and the turns
+        can accumulate afterwards. Requiring the full turn count too pushed the opening
+        out to the far end of the loop, where out_and_back/winding/serpentine only ever
+        reach their full turn tally. Median committing-opening length, old rule (turns
+        AND switches) vs. the discriminator-only rule below:
+            oval 2->2, spiral 51->51, out_and_back 59->34, winding 37->25, serpentine 43->35
+        Spiral is the one family with switch_lo=0 (no switches are ever allowed), so turns
+        remain its only discriminator against oval -- hence the branch: switch_lo>0 means
+        a single switch already separates the family from oval, so switches alone are the
+        test (and the turn requirement is dropped, since it doesn't discriminate); switch_lo
+        == 0 (oval, spiral) means turns are the only discriminating axis, so the turn_lo
+        requirement is kept (0 for oval, so oval falls through to the floor as before).
+
+        None when no length in [floor, cap] clears the test -- the caller must skip this
+        exemplar rather than prime with an uninformative or over-long opening.
 
         Floor-gated by the caller (`_sample_prime` returns None outright when the floor
         itself is <=0 -- Fix 1 part 3): a floor of 0 must disarm priming entirely, not
@@ -1201,7 +1219,10 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
         hi = min(cap, len(actions) - 1)      # >=1 piece must remain for the agent
         for length in range(floor, hi + 1):
             prefix = actions[:length]
-            if len(turn_directions(prefix)) >= turn_lo and switch_count(prefix) >= switch_lo:
+            if switch_lo > 0:
+                if switch_count(prefix) >= switch_lo:
+                    return length
+            elif len(turn_directions(prefix)) >= turn_lo:
                 return length
         return None
 
