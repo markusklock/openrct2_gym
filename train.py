@@ -18,6 +18,7 @@ from openrct2_gym.envs.improved_phased_curriculum_wrapper import ImprovedPhasedC
 from openrct2_gym.envs.wrappers import OpenRCT2Wrapper
 from openrct2_gym.envs.feature_extractor import BuildHistoryExtractor
 from openrct2_gym.envs.openrct2_env import RewardParams, OpenRCT2Env
+from openrct2_gym.envs import footprint
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.maskable.policies import MaskableMultiInputActorCriticPolicy
 from sb3_contrib.common.wrappers import ActionMasker
@@ -113,6 +114,31 @@ P5_QUALITY_ENT_COEF = 0.02
 QUALITY_EXC_TARGET_FLOOR = 4.0      # median excitement that releases the quality floor
 QUALITY_WINDOW = 200                # tested-episode window (pooled across envs)
 QUALITY_MIN_SAMPLES = 30            # min tested episodes before the median is trusted
+
+# Phase-6 VARIETY exploration floor (Aug-17). The quality floor above did its job -- cold
+# excitement went 2.4 -> 5.6 -- and then RELEASED, because it is keyed to quality. Entropy
+# has decayed ever since, and the unaided non-oval rate decayed with it, measured over six
+# days at a constant Phase 6 with one policy lineage:
+#
+#     08-11  0.97 nats  0.92% non-oval  (spiral 54, out_and_back 12, winding 2)
+#     08-12  0.89 nats  0.28%           (+ 1 serpentine)
+#     08-13  0.68 nats  0.03%
+#     08-15  0.56 nats  0.01%
+#     08-17  0.36 nats  0.04%
+#
+# So the agent CAN initiate four of the five families; that ability is entropy-dependent and
+# was trained away. Exploration was withdrawn as a reward for solving quality while VARIETY
+# -- the objective that needs it -- was still unsolved. This is the Jul-9 lesson ("a metric
+# can DRIVE training, not just report") with a now-correct metric keyed to the wrong
+# objective. The band is set from the table: variety lives at ~0.9-1.0 nats and is dead
+# below ~0.7, so the guard re-injects below VAR_ENT_LO and backs off above VAR_ENT_HI.
+P6_VARIETY_ENT_COEF = 0.03          # resting floor (vs the 0.015 that let entropy decay)
+VARIETY_TARGET_FLOOR = 0.10         # cold non-oval share that releases the floor
+VARIETY_WINDOW = 300                # cold-completion window (pooled across envs)
+VARIETY_MIN_SAMPLES = 50            # min cold completions before the rate is trusted
+VAR_ENT_LO = 0.85                   # below this, exploration is too low for variety
+VAR_ENT_HI = 1.10                   # recovered past this => restore the phase base
+VAR_ENT_BOOST = 0.045               # must exceed the 0.03 floor to be a boost at all
 
 # Fixed PPO hyperparameters, module-level so tests can pin them (n_steps/batch_size are
 # computed per run). Starts in the phase-1 config; the callback arms OPT_GUARDED later.
@@ -252,6 +278,11 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
         # holds cold-only excitement and is what any success/exploration decision must read.
         self._exc_window = deque(maxlen=QUALITY_WINDOW)
         self._exc_cold_window = deque(maxlen=QUALITY_WINDOW)
+        # Phase-6 variety floor: one bool per COLD COMPLETION -- did the finished track
+        # land in a named non-oval family. Cold-only and completion-only for the same
+        # reasons the excitement window is: a warm/primed episode replays someone else's
+        # shape, and an unfinished build has no shape to classify.
+        self._variety_cold_window = deque(maxlen=VARIETY_WINDOW)
         self._test_window = deque(maxlen=QUALITY_WINDOW)
 
     def _note_env_phase(self, env_idx, info):
@@ -322,15 +353,38 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
         med = self._median_excitement_cold()
         return med is None or med < QUALITY_EXC_TARGET_FLOOR
 
+    def _nonoval_rate_cold(self):
+        """Share of recent COLD COMPLETIONS whose footprint is a named non-oval family,
+        or None below VARIETY_MIN_SAMPLES (too little evidence to act on)."""
+        if len(self._variety_cold_window) < VARIETY_MIN_SAMPLES:
+            return None
+        return float(np.mean(self._variety_cold_window))
+
+    def _p6_variety_boost_active(self):
+        """Whether the Phase-6 variety floor is held: fleet in phase 6 and the cold non-oval
+        rate below VARIETY_TARGET_FLOOR (or unknown -- hold exploration until the telemetry
+        says variety is actually flowing, the same conservative direction the quality floor
+        takes). See the VARIETY_* constants for the entropy/variety measurements this is
+        calibrated from."""
+        if self._phase < 6:
+            return False
+        rate = self._nonoval_rate_cold()
+        return rate is None or rate < VARIETY_TARGET_FLOOR
+
     def _phase_base_ent_coef(self):
         """The ent_coef the entropy guard restores to: the raised bootstrap floor while phase 1
         still has ~zero cold completions, the proven phase-1 value once they flow, then the
-        guarded floor after the KL guard arms -- raised through the early Phase-2 chain stages
-        and again in Phase 5 while quality is still below the floor target."""
+        guarded floor after the KL guard arms -- raised through the early Phase-2 chain stages,
+        again in Phase 5 while quality is still below the floor target, and again in Phase 6
+        while variety is. Variety is checked FIRST because its floor is the higher of the two:
+        falling through to the quality floor's 0.02 would withdraw exactly the exploration the
+        variety floor exists to hold."""
         if not self._opt_guarded:
             if self._phase == 1 and self._ent_mode == "bootstrap":
                 return PHASE1_BOOTSTRAP_ENT_COEF
             return OPT_PHASE1['ent_coef']
+        if self._phase >= 6 and self._p6_variety_boost_active():
+            return P6_VARIETY_ENT_COEF
         if self._phase >= 5 and self._p5_quality_boost_active():
             return P5_QUALITY_ENT_COEF
         if self._phase == 2 and self._phase2_stage in (1, 2):
@@ -343,6 +397,10 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
         ~0.2 nats is itself a freeze in both), the proven band while exploiting."""
         if (not self._opt_guarded) and self._phase == 1 and self._ent_mode == "bootstrap":
             return BOOT_ENT_LO, BOOT_ENT_HI, BOOT_ENT_BOOST
+        # Variety first, same precedence as _phase_base_ent_coef: its band sits higher than
+        # the bootstrap band, at the entropy where non-oval builds were actually observed.
+        if self._phase >= 6 and self._p6_variety_boost_active():
+            return VAR_ENT_LO, VAR_ENT_HI, VAR_ENT_BOOST
         if self._phase >= 5 and self._p5_quality_boost_active():
             return BOOT_ENT_LO, BOOT_ENT_HI, BOOT_ENT_BOOST
         return ENT_COLLAPSE_LO, ENT_COLLAPSE_HI, ENT_COLLAPSE_BOOST
@@ -453,6 +511,7 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
                            float(self._phase2_stage or 0) if self._phase == 2 else 0.0)
         self.logger.record('optim/ent_floor_mode', 1.0 if self._ent_mode == "bootstrap" else 0.0)
         self.logger.record('optim/p5_quality_boost', 1.0 if self._p5_quality_boost_active() else 0.0)
+        self.logger.record('optim/p6_variety_boost', 1.0 if self._p6_variety_boost_active() else 0.0)
         cold_rate = self._cold_completion_rate()
         if cold_rate is not None:
             self.logger.record('success/cold_completion_rate', cold_rate)
@@ -514,6 +573,23 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
                 self._completion_window.append(bool(loop_completed))
                 if self.locals['infos'][env_idx].get('cold_start', False):
                     self._cold_window.append(bool(loop_completed))
+
+                # Phase-6 variety floor input: the footprint of each COLD COMPLETION.
+                # classify_counts is the same band table every family rate uses, so the
+                # floor and the reported rates cannot drift apart. A shape matching no
+                # band is not a non-oval win -- it matches no seed either.
+                _info_v = self.locals['infos'][env_idx]
+                _em_v = _info_v.get('episode_metrics') or {}
+                if (loop_completed and _info_v.get('cold_start', False)
+                        and 'turn_count' in _em_v and 'switch_count' in _em_v):
+                    _fam_v = footprint.classify_counts(int(_em_v['turn_count']),
+                                                       int(_em_v['switch_count']))
+                    self._variety_cold_window.append(_fam_v not in (None, 0))
+                    self.logger.record('structure/nonoval_cold_n',
+                                       len(self._variety_cold_window))
+                    _rate_v = self._nonoval_rate_cold()
+                    if _rate_v is not None:
+                        self.logger.record('structure/nonoval_rate_cold', _rate_v)
 
                 # Ride-quality telemetry (phase 4+ only: earlier phases skip testing and
                 # emit all-zero sentinels that must not pollute the windows). Untested

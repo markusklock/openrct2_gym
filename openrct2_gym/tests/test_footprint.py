@@ -99,3 +99,55 @@ def test_feature_extractor_consumes_the_target_family():
     from openrct2_gym.envs.obs_config import make_observation_space
     ex = BuildHistoryExtractor(make_observation_space())
     assert "target_family" in ex._cat_keys
+
+
+# --- classify_counts: the same bands, from counts the env already reports ------------
+# The Phase-6 variety exploration floor decides from per-episode telemetry
+# (turn_count / switch_count), not from the action list, so the band logic has to be
+# reachable without re-deriving turn directions. It must agree with classify_family
+# exactly -- two copies of the bands is precisely how this project has shipped a
+# mis-specified footprint four times.
+
+def test_classify_counts_matches_classify_family_on_every_family():
+    import itertools
+    from openrct2_gym.envs.footprint import (
+        FAMILIES, classify_counts, classify_family, turn_directions,
+    )
+    # exhaustive over the interesting range, via real action sequences
+    for turns in range(0, 20):
+        for switches in range(0, turns if turns else 1):
+            actions = _actions_with(turns, switches)
+            dirs = turn_directions(actions)
+            sw = sum(1 for x, y in zip(dirs, dirs[1:]) if x != y)
+            assert classify_counts(len(dirs), sw) == classify_family(actions), (
+                "disagreement at turns=%d switches=%d" % (len(dirs), sw))
+
+
+def test_classify_counts_returns_none_for_a_gap_in_the_bands():
+    from openrct2_gym.envs.footprint import classify_counts
+    # 11 turns with no alternation belongs to no family (the docstring's own example)
+    assert classify_counts(11, 0) is None
+
+
+def test_classify_counts_oval_and_open_ended_serpentine():
+    from openrct2_gym.envs.footprint import classify_counts
+    assert classify_counts(0, 0) == 0      # nothing built yet is trivially oval-shaped
+    assert classify_counts(5, 0) == 0
+    assert classify_counts(8, 2) == 2      # out_and_back
+    assert classify_counts(12, 4) == 3     # winding
+    assert classify_counts(40, 30) == 4    # serpentine band is open above
+
+
+def _actions_with(turns, switches):
+    """Action list with exactly `turns` turn pieces and `switches` direction changes."""
+    from openrct2_gym.envs.track_pieces import (
+        LEFT_TURN_ACTIONS as L, RIGHT_TURN_ACTIONS as R,
+    )
+    left, right = sorted(L)[0], sorted(R)[0]
+    out, cur, remaining = [], left, switches
+    for i in range(turns):
+        out.append(cur)
+        if remaining > 0 and i < turns - 1:
+            cur = right if cur == left else left
+            remaining -= 1
+    return out

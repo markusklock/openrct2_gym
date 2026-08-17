@@ -1482,3 +1482,126 @@ def test_cli_rejects_prime_frac_above_one():
 def test_cli_accepts_prime_frac_boundary_values():
     assert T.parse_args(["--ports", "8080", "--prime-frac", "0.0"]).prime_frac == 0.0
     assert T.parse_args(["--ports", "8080", "--prime-frac", "1.0"]).prime_frac == 1.0
+
+
+# --- Phase-6 VARIETY exploration floor -----------------------------------------------
+# Measured Aug-17: the unaided non-oval rate tracked policy entropy and collapsed with it
+# (0.92% at ~0.97 nats on 08-11 -> 0.01% at ~0.41 nats on 08-16, all Phase 6, same policy).
+# Entropy fell because the P5 floor is keyed to QUALITY, which is now solved -- so
+# exploration was withdrawn as a reward for solving quality while VARIETY, the objective
+# that needs exploration, was still unsolved. This floor keys the same machinery to the
+# variety rate instead.
+
+def _variety_step(cb, phase, turns, switches, cold_start, completed=True):
+    """One episode termination carrying the shape telemetry the floor reads."""
+    from types import SimpleNamespace
+    store = {}
+    cb.model.logger = SimpleNamespace(
+        name_to_value={}, record=lambda k, v, *a, **kw: store.__setitem__(k, v))
+    cb.locals = {
+        'dones': [True],
+        'infos': [{'loop_completed': completed, 'cold_start': cold_start,
+                   'learning_phase': phase, 'track_length': 40,
+                   'current_distance': 0.0, 'collision_count': 0,
+                   'episode_metrics': {'track_length': 40, 'turn_count': turns,
+                                       'switch_count': switches, 'min_distance': 0.0}}],
+    }
+    cb._on_step()
+    return store
+
+
+def _cb_at_phase6():
+    from types import SimpleNamespace
+    cb = T.ParallelCurriculumMaskableCallback(n_envs=1)
+    cb.model = SimpleNamespace(target_kl=0.04, ent_coef=0.015, get_env=lambda: None)
+    cb._opt_guarded = True
+    cb._ent_mode = "normal"
+    cb._phase = 6
+    return cb
+
+
+def test_variety_floor_holds_exploration_until_the_nonoval_rate_clears_the_bar():
+    cb = _cb_at_phase6()
+    assert cb._p6_variety_boost_active() is True         # no data yet -> hold exploration
+    assert cb._phase_base_ent_coef() == T.P6_VARIETY_ENT_COEF
+    assert cb._ent_band() == (T.VAR_ENT_LO, T.VAR_ENT_HI, T.VAR_ENT_BOOST)
+
+    for _ in range(T.VARIETY_MIN_SAMPLES):
+        cb._variety_cold_window.append(False)            # every build an oval
+    assert cb._nonoval_rate_cold() == 0.0
+    assert cb._p6_variety_boost_active() is True
+
+    cb._variety_cold_window.clear()
+    for i in range(T.VARIETY_MIN_SAMPLES):
+        cb._variety_cold_window.append(True)             # variety flowing -> hand back
+    assert cb._p6_variety_boost_active() is False
+    # The quality floor is still active here (this callback has no quality telemetry),
+    # so releasing variety alone correctly falls through to it, not to the guarded base.
+    assert cb._phase_base_ent_coef() == T.P5_QUALITY_ENT_COEF
+    for _ in range(T.QUALITY_MIN_SAMPLES):
+        cb._exc_cold_window.append(5.5)                  # both objectives satisfied
+    assert cb._phase_base_ent_coef() == T.OPT_GUARDED['ent_coef']
+    assert cb._ent_band() == (T.ENT_COLLAPSE_LO, T.ENT_COLLAPSE_HI, T.ENT_COLLAPSE_BOOST)
+
+
+def test_variety_rate_is_unknown_below_min_samples():
+    """Same conservative direction as the quality floor: too little evidence must hold
+    exploration, not release it."""
+    cb = _cb_at_phase6()
+    for _ in range(T.VARIETY_MIN_SAMPLES - 1):
+        cb._variety_cold_window.append(True)
+    assert cb._nonoval_rate_cold() is None
+    assert cb._p6_variety_boost_active() is True
+
+
+def test_variety_floor_inactive_below_phase6():
+    cb = _cb_at_phase6()
+    cb._phase = 5
+    assert cb._p6_variety_boost_active() is False
+
+
+def test_variety_floor_outranks_the_quality_floor_when_both_apply():
+    """Both can be active at once (phase 6 with quality unknown). The resting coefficient
+    must be the HIGHER of the two floors -- taking the quality floor's 0.02 would quietly
+    withdraw the exploration the variety floor exists to hold."""
+    cb = _cb_at_phase6()
+    assert cb._p5_quality_boost_active() is True         # no quality data either
+    assert cb._p6_variety_boost_active() is True
+    assert T.P6_VARIETY_ENT_COEF > T.P5_QUALITY_ENT_COEF
+    assert cb._phase_base_ent_coef() == T.P6_VARIETY_ENT_COEF
+
+
+def test_variety_window_counts_cold_completions_only():
+    """Warm and primed episodes replay someone else's shape, so their footprint is not
+    evidence about the policy -- the same cold-only rule the quality window follows.
+    A non-completion has no finished shape to classify at all."""
+    cb = _cb_at_phase6()
+    _variety_step(cb, phase=6, turns=12, switches=4, cold_start=True)    # winding, cold
+    _variety_step(cb, phase=6, turns=12, switches=4, cold_start=False)   # warm -> ignored
+    _variety_step(cb, phase=6, turns=2, switches=0, cold_start=True)     # oval, cold
+    _variety_step(cb, phase=6, turns=12, switches=4, cold_start=True,
+                  completed=False)                                       # DNF -> ignored
+    assert list(cb._variety_cold_window) == [True, False]
+
+
+def test_variety_window_classifies_via_the_shared_bands():
+    """turns/switches must be classified by footprint.classify_counts, so the floor and
+    every reported family rate agree by construction. An UNCLASSIFIED shape is not a
+    non-oval win -- it matches no seed."""
+    cb = _cb_at_phase6()
+    _variety_step(cb, phase=6, turns=8, switches=2, cold_start=True)    # out_and_back
+    _variety_step(cb, phase=6, turns=11, switches=0, cold_start=True)   # fits no band
+    assert list(cb._variety_cold_window) == [True, False]
+
+
+def test_variety_diagnostics_are_emitted():
+    """House rule: every new reward/exploration term streams its own diagnostic."""
+    cb = _cb_at_phase6()
+    for _ in range(T.VARIETY_MIN_SAMPLES):
+        cb._variety_cold_window.append(False)
+    store = _variety_step(cb, phase=6, turns=2, switches=0, cold_start=True)
+    assert store.get('structure/nonoval_rate_cold') == pytest.approx(0.0)
+    assert store.get('structure/nonoval_cold_n') == T.VARIETY_MIN_SAMPLES + 1
+    # the boost flag rides with the other optim diagnostics, at rollout end
+    cb._on_rollout_end()
+    assert store.get('optim/p6_variety_boost') == 1.0

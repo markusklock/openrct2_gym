@@ -65,6 +65,21 @@ def family_match(actions, family_index, turn_falloff, switch_falloff):
                   + _band_score(switches, slo, shi, switch_falloff))
 
 
+def classify_counts(turns, switches):
+    """Index of the family a (turn count, direction-switch count) pair lands in, or None.
+
+    Split out of classify_family so consumers holding only the counts -- the Phase-6
+    variety exploration floor reads them from per-episode telemetry, where the action
+    list is long gone -- classify against the SAME bands. A second copy of the bands is
+    exactly how this branch shipped a mis-specified footprint four times.
+    """
+    for i, (_, tlo, thi, slo, shi) in enumerate(FAMILIES):
+        if (turns >= tlo and (thi is None or turns <= thi)
+                and switches >= slo and (shi is None or switches <= shi)):
+            return i
+    return None
+
+
 def classify_family(actions):
     """Index of the family this build lands in, or None if it fits none.
 
@@ -75,8 +90,4 @@ def classify_family(actions):
     dirs = turn_directions(actions)
     turns = len(dirs)
     switches = sum(1 for x, y in zip(dirs, dirs[1:]) if x != y)
-    for i, (_, tlo, thi, slo, shi) in enumerate(FAMILIES):
-        if (turns >= tlo and (thi is None or turns <= thi)
-                and switches >= slo and (shi is None or switches <= shi)):
-            return i
-    return None
+    return classify_counts(turns, switches)
