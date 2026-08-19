@@ -694,6 +694,10 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
                     # distinct from both cold_* and scaffold/warm_* above -- their own
                     # diagnostic per the house rule.
                     'primed_rate',
+                    # Aug-19: how much of the committing opening priming still hands
+                    # over. Falls 1 -> 0 as the agent proves it can finish the family;
+                    # at 0 a primed draw becomes a genuinely COLD episode.
+                    'prime_scale',
                     'primed_family_hit',
                     'primed_prefix_len',
                     'primed_skip_rate',

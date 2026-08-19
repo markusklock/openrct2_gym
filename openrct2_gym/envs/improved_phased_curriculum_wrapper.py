@@ -156,6 +156,9 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
         # mechanism streams its own diagnostic).
         self._primed_flags = deque(maxlen=window_size)
         self._primed_family_hit_flags = deque(maxlen=window_size)
+        # Primed-opening anneal state (per worker, like the warm-start frontier).
+        self.prime_scale = 1.0
+        self._prime_anneal_flags = deque(maxlen=self.PRIME_ANNEAL_WINDOW)
         # Fix 2 (Aug-15 review): distinct from primed_rate -- a priming ATTEMPT (the
         # prime_frac roll fired) that found no exemplar it could commit to a family
         # within the budget cap. True = skipped, False = primed successfully.
@@ -1181,6 +1184,24 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
     # building the coaster -- the prefix would BE the build. See _sample_prime.
     PRIME_MAX_BUDGET_FRACTION = 0.5
 
+    # Primed-opening ANNEAL (Aug-19). Measured over 6,193 unaided builds: switch_count
+    # was 0 in 6,191 and turn_count was 4 in 6,170 -- the agent builds the minimal
+    # 4-turn zero-switch loop and essentially never switches direction, so every
+    # switch-requiring family stays at zero. Raising entropy only bought "more of the
+    # same turn" (spirals: 8 turns, still 0 switches), because that is the cheap
+    # neighbouring behaviour; a canceling turn PAIR is a coordinated multi-piece
+    # structure. Priming hands it over and the policy keeps it (8,981 primed harvests
+    # carry switches) but never initiates it.
+    #
+    # So shrink the handout as the agent proves it can finish: at scale 1 it gets the
+    # full committing opening, at scale 0 it gets none and the episode is a genuinely
+    # COLD one carrying only the seed -- which is both the behaviour we want and the
+    # only form that counts as unaided evidence.
+    PRIME_ANNEAL_WINDOW = 20      # primed outcomes per anneal decision
+    PRIME_ANNEAL_STEP = 0.1       # scale change per decision
+    PRIME_ANNEAL_DOWN_BAR = 0.7   # hit rate at/above which the handout shrinks
+    PRIME_ANNEAL_UP_BAR = 0.4     # ...and at/below which it is given back
+
     def _prime_prefix_len(self):
         ov = self._warm_min_prefix_override
         if ov is None:
@@ -1226,6 +1247,39 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                 return length
         return None
 
+    def _annealed_opening_len(self, actions, family, cap):
+        """The committing opening length scaled by `prime_scale`, or None when this
+        exemplar cannot commit within the cap at all.
+
+        0 is a meaningful result, not an error: it means the agent has earned the whole
+        opening back, and `_sample_prime` turns it into a normal cold episode.
+        """
+        full = self._prime_opening_len(actions, family, cap)
+        if full is None:
+            return None
+        return max(0, int(round(self.prime_scale * full)))
+
+    def record_primed_outcome(self, family_hit):
+        """Feed one primed episode's outcome to the anneal.
+
+        Decisions are taken a windowful at a time and the window is cleared after each,
+        so the scale moves at most one step per PRIME_ANNEAL_WINDOW episodes -- the same
+        anti-thrash shape the entropy guard's hysteresis uses. Inert when priming is off,
+        so prime_frac=0.0 stays bit-identical.
+        """
+        if self.prime_frac <= 0.0:
+            return
+        self._prime_anneal_flags.append(bool(family_hit))
+        if len(self._prime_anneal_flags) < self.PRIME_ANNEAL_WINDOW:
+            return
+        rate = sum(self._prime_anneal_flags) / len(self._prime_anneal_flags)
+        if rate >= self.PRIME_ANNEAL_DOWN_BAR:
+            self.prime_scale = max(0.0, self.prime_scale - self.PRIME_ANNEAL_STEP)
+            self._prime_anneal_flags.clear()
+        elif rate <= self.PRIME_ANNEAL_UP_BAR:
+            self.prime_scale = min(1.0, self.prime_scale + self.PRIME_ANNEAL_STEP)
+            self._prime_anneal_flags.clear()
+
     def _sample_prime(self, family, budget):
         """Attempt to prime an otherwise-cold draw: among exemplars whose OWN footprint
         matches `family` (LoopLibrary.family_pool -- no structural degrade tiers, unlike
@@ -1247,8 +1301,10 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
         cap = int(self.PRIME_MAX_BUDGET_FRACTION * budget)
         usable = []
         for r in self._loop_library.family_pool(family, budget):
-            length = self._prime_opening_len(r.actions, family, cap)
-            if length is not None:
+            length = self._annealed_opening_len(r.actions, family, cap)
+            # length == 0 means fully annealed: hand back a real cold episode rather
+            # than an empty "primed" one (the leak Fix 1 closed).
+            if length:
                 usable.append((r, length))
         if not usable:
             return None
@@ -1459,9 +1515,11 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
             info['primed'] = primed
             if primed:
                 self._primed_family_hit_flags.append(bool(family_hit))
+                self.record_primed_outcome(bool(family_hit))
             info['primed_rate'] = (
                 sum(self._primed_flags) / len(self._primed_flags)
                 if self._primed_flags else 0.0)
+            info['prime_scale'] = float(self.prime_scale)
             info['primed_family_hit'] = (
                 sum(self._primed_family_hit_flags) / len(self._primed_family_hit_flags)
                 if self._primed_family_hit_flags else 0.0)

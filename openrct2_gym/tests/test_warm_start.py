@@ -3160,3 +3160,104 @@ def test_primed_prefix_len_is_zero_when_not_primed(monkeypatch, tmp_path):
     info = _run_episode(wrapper)
     assert info['primed'] is False
     assert info['primed_prefix_len'] == 0
+
+
+# --- primed opening ANNEAL: a reverse curriculum for INITIATION -----------------------
+# Measured Aug-19 over 6,193 unaided builds: switch_count was 0 in 6,191 of them and
+# turn_count was 4 in 6,170. The agent builds the minimal 4-turn, zero-switch loop and
+# essentially never switches turn direction, so every switch-requiring family
+# (out_and_back / winding / serpentine) stays at zero. Raised entropy bought only "more
+# of the same turn" (spirals, 8 turns, still 0 switches) because that is the cheap
+# neighbouring behaviour; inserting a CANCELING TURN PAIR is a coordinated multi-piece
+# structure. Priming hands that structure over for free -- and the policy keeps it
+# (8,981 primed harvests carry switches) -- but never initiates it.
+#
+# So the opening is annealed toward zero: as the agent proves it can FINISH a primed
+# family, it is handed less and less of the opening, until at scale 0 the prime becomes
+# a genuine cold episode carrying only the seed. Same reverse-curriculum shape the
+# warm-start frontier already uses, aimed at initiation instead of docking.
+
+def _prime_wrapper(monkeypatch, tmp_path, **kw):
+    """Wrapper with priming armed, at a phase where families are active."""
+    w, _ = _wrapped(monkeypatch, tmp_path, seed_loops=(FLAT,),
+                    p_cold=1.0, prime_frac=1.0, **kw)
+    w.current_phase = 6
+    w._update_phase_settings()
+    return w
+
+
+def test_prime_scale_starts_at_one_and_opening_is_the_committing_length(monkeypatch, tmp_path):
+    w = _prime_wrapper(monkeypatch, tmp_path)
+    assert w.prime_scale == 1.0
+    actions = [1] * 10 + [2] * 10        # first direction switch at index 10
+    # out_and_back (switch_lo=1): the shortest COMMITTING prefix is 11 pieces, which is
+    # above the floor, so the floor is not what this asserts.
+    full = w._prime_opening_len(actions, 2, cap=40)
+    assert full == 11
+    assert w._annealed_opening_len(actions, 2, cap=40) == full
+
+
+def test_annealed_opening_shrinks_with_the_scale(monkeypatch, tmp_path):
+    w = _prime_wrapper(monkeypatch, tmp_path)
+    actions = [1] * 10 + [2] * 10
+    full = w._prime_opening_len(actions, 2, cap=40)
+    w.prime_scale = 0.5
+    assert w._annealed_opening_len(actions, 2, cap=40) == max(0, int(round(0.5 * full)))
+    w.prime_scale = 0.0
+    assert w._annealed_opening_len(actions, 2, cap=40) == 0
+
+
+def test_fully_annealed_prime_falls_back_to_a_genuinely_cold_episode(monkeypatch, tmp_path):
+    """At scale 0 the prime must not become a zero-length 'primed' episode that reports
+    primed=True while being bit-identical to cold -- the exact leak Fix 1 closed. It must
+    hand back a real cold episode so the build counts as unaided EVIDENCE."""
+    w = _prime_wrapper(monkeypatch, tmp_path)
+    # out_and_back is 6-9 turns AND 1-2 switches: 5 left + 3 right is 8 turns / 1 switch.
+    # (10+10 would be 20 turns -- outside the band, and classify_family returns None.)
+    oab = [1] * 5 + [2] * 3 + [0] * 10
+    assert classify_family(oab) == 2, "fixture must really be family 2"
+    w._loop_library.add(LoopRecord.from_actions(oab, source="scripted"))
+    # scale 1: this exemplar CAN be primed, so a None below is attributable to the anneal
+    w.prime_scale = 1.0
+    assert w._sample_prime(family=2, budget=80) is not None
+    w.prime_scale = 0.0
+    assert w._sample_prime(family=2, budget=80) is None
+
+
+def test_scale_anneals_down_only_on_sustained_success(monkeypatch, tmp_path):
+    w = _prime_wrapper(monkeypatch, tmp_path)
+    for _ in range(w.PRIME_ANNEAL_WINDOW - 1):
+        w.record_primed_outcome(True)
+    assert w.prime_scale == 1.0                  # not enough evidence yet
+    w.record_primed_outcome(True)
+    assert w.prime_scale == pytest.approx(1.0 - w.PRIME_ANNEAL_STEP)
+
+
+def test_scale_backs_off_when_the_agent_stops_landing_the_family(monkeypatch, tmp_path):
+    w = _prime_wrapper(monkeypatch, tmp_path)
+    w.prime_scale = 0.5
+    for _ in range(w.PRIME_ANNEAL_WINDOW):
+        w.record_primed_outcome(False)
+    assert w.prime_scale == pytest.approx(0.5 + w.PRIME_ANNEAL_STEP)
+
+
+def test_scale_is_clamped_to_the_unit_interval(monkeypatch, tmp_path):
+    w = _prime_wrapper(monkeypatch, tmp_path)
+    w.prime_scale = 0.02
+    for _ in range(w.PRIME_ANNEAL_WINDOW):
+        w.record_primed_outcome(True)
+    assert w.prime_scale == 0.0
+    w.prime_scale = 0.98
+    for _ in range(w.PRIME_ANNEAL_WINDOW):
+        w.record_primed_outcome(False)
+    assert w.prime_scale == 1.0
+
+
+def test_anneal_is_inert_when_priming_is_off(monkeypatch, tmp_path):
+    """prime_frac=0.0 must stay bit-identical: no anneal state changes, no scale drift."""
+    w, _ = _wrapped(monkeypatch, tmp_path, seed_loops=(FLAT,), p_cold=1.0, prime_frac=0.0)
+    w.current_phase = 6
+    w._update_phase_settings()
+    for _ in range(w.PRIME_ANNEAL_WINDOW * 2):
+        w.record_primed_outcome(True)
+    assert w.prime_scale == 1.0
