@@ -3261,3 +3261,16 @@ def test_anneal_is_inert_when_priming_is_off(monkeypatch, tmp_path):
     for _ in range(w.PRIME_ANNEAL_WINDOW * 2):
         w.record_primed_outcome(True)
     assert w.prime_scale == 1.0
+
+
+def test_prime_anneal_bars_form_valid_hysteresis():
+    """DOWN_BAR must sit strictly above UP_BAR. Inverted or equal bars would make every
+    windowful trigger BOTH branches' conditions in sequence (down, then up on the next
+    window), oscillating the handout instead of tracking competence -- and the retune
+    that moved these off 0.7/0.4 is exactly the kind of edit that can invert them."""
+    from openrct2_gym.envs.improved_phased_curriculum_wrapper import (
+        ImprovedPhasedCurriculumWrapper as W,
+    )
+    assert 0.0 < W.PRIME_ANNEAL_UP_BAR < W.PRIME_ANNEAL_DOWN_BAR < 1.0
+    assert 0.0 < W.PRIME_ANNEAL_STEP <= 0.25
+    assert W.PRIME_ANNEAL_WINDOW >= 5

@@ -1199,8 +1199,13 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
     # only form that counts as unaided evidence.
     PRIME_ANNEAL_WINDOW = 20      # primed outcomes per anneal decision
     PRIME_ANNEAL_STEP = 0.1       # scale change per decision
-    PRIME_ANNEAL_DOWN_BAR = 0.7   # hit rate at/above which the handout shrinks
-    PRIME_ANNEAL_UP_BAR = 0.4     # ...and at/below which it is given back
+    # These bars are a DIFFICULTY SETPOINT, not a mastery test. First set at 0.7/0.4,
+    # calibrated off the previous run where primed_family_hit had climbed to 0.72 over
+    # 4.4M steps -- but the rewound policy sits at 0.26 (max 0.63 over 114 samples), so
+    # 0.7 was never cleared and the anneal never started. A curriculum should hold the
+    # agent at the edge of its competence, not wait for mastery before easing off.
+    PRIME_ANNEAL_DOWN_BAR = 0.5   # hit rate at/above which the handout shrinks
+    PRIME_ANNEAL_UP_BAR = 0.3     # ...and at/below which it is given back
 
     def _prime_prefix_len(self):
         ov = self._warm_min_prefix_override
