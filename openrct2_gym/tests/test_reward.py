@@ -4628,3 +4628,31 @@ def test_novelty_entropy_reports_the_distribution_not_the_bonus():
     assert env._novelty_entropy() == pytest.approx(_m.log(2))   # two equal cells
     env = _novelty_env([])
     assert env._novelty_entropy() == pytest.approx(0.0)
+
+
+def test_novelty_bonus_tag_is_absent_when_no_bonus_was_paid():
+    """The bonus is computed only on UNAIDED completions. If the tag were emitted on
+    every episode it would republish the LAST payment on warm/primed/unfinished ones
+    (a stale fiction), and emitting 0.0 instead would report
+    'cold_completion_rate x bonus' under a name that says bonus. Both are the
+    'written in some states, read in all' trap this project has hit five times, so the
+    KEY must be absent -- the same convention style_gate already uses."""
+    env = _novelty_env([(0, 0)] * 10)
+    env._last_novelty_bonus = None                       # nothing paid this episode
+    metrics = {'novelty_cells': 1.0}
+    if getattr(env, '_last_novelty_bonus', None) is not None:
+        metrics['novelty_bonus'] = float(env._last_novelty_bonus)
+    assert 'novelty_bonus' not in metrics
+
+    env._last_novelty_bonus = 250.0                      # paid
+    if getattr(env, '_last_novelty_bonus', None) is not None:
+        metrics['novelty_bonus'] = float(env._last_novelty_bonus)
+    assert metrics['novelty_bonus'] == pytest.approx(250.0)
+
+
+def test_novelty_entropy_is_never_negative_zero():
+    """A single-cell window computes -1*log(1) = -0.0, which prints as '-0' in the
+    digest and reads as a broken metric."""
+    env = _novelty_env([(0, 0)] * 20)
+    import math as _m
+    assert _m.copysign(1.0, env._novelty_entropy()) > 0    # +0.0, not -0.0

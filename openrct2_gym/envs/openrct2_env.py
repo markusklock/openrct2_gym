@@ -333,6 +333,9 @@ class OpenRCT2Env(gym.Env):
         # reward weights default to inert, so nothing changes for phases 1-2.
         self.target_family = 0
         self._warm_cold = True
+        # None => 'no novelty payment this episode', so the tag can be omitted
+        # rather than reporting the previous episode's bonus.
+        self._last_novelty_bonus = None
         # Forced exploration (Aug-15): set by the curriculum wrapper before reset(), like
         # target_family -- True only when THIS episode's opening came from the priming
         # mechanism (a family-correct exemplar prefix on an otherwise-cold draw), not
@@ -733,7 +736,11 @@ class OpenRCT2Env(gym.Env):
                 # and novelty_entropy describe the recent unaided build DISTRIBUTION,
                 # which is the thing the mechanism is actually trying to change -- a
                 # bonus can look healthy while the policy still occupies one cell.
-                'novelty_bonus': float(getattr(self, '_last_novelty_bonus', 0.0)),
+                # novelty_bonus is written ONLY on unaided completions, so it is emitted
+                # only there too (see below) -- a tag written in some states and read in
+                # all reports a stale fiction, the trap that has bitten this project
+                # five times. Left out of this literal deliberately.
+
                 'novelty_cells': float(len(set(getattr(self, '_novelty_window', ()) or ()))),
                 'novelty_entropy': float(self._novelty_entropy()),
                 # P5 quality-economics diagnostics
@@ -757,6 +764,13 @@ class OpenRCT2Env(gym.Env):
             # when the key is present.
             if self.reward_params.completion_style_floor >= 1.0:
                 info['episode_metrics'].pop('style_gate', None)
+            # Same convention for the diversity bonus: it is computed only on UNAIDED
+            # completions, so the key exists only there. Emitting it unconditionally
+            # would republish the last payment on every warm/primed/unfinished episode
+            # (a stale fiction), and emitting 0.0 instead would report
+            # "cold_completion_rate x bonus" under a name that says bonus.
+            if getattr(self, '_last_novelty_bonus', None) is not None:
+                info['episode_metrics']['novelty_bonus'] = float(self._last_novelty_bonus)
             meas = getattr(self, '_last_measurements', None)
             if meas:
                 info['episode_metrics'].update({
@@ -1682,7 +1696,8 @@ class OpenRCT2Env(gym.Env):
         counts = {}
         for c in window:
             counts[c] = counts.get(c, 0) + 1
-        return -sum((k / n) * math.log(k / n) for k in counts.values())
+        # abs() so a single-cell window reports 0.0 rather than -0.0
+        return abs(-sum((k / n) * math.log(k / n) for k in counts.values()))
 
     def _record_novelty(self, cell):
         """Record a finished build's cell -- UNAIDED builds only. A warm or primed
