@@ -65,6 +65,32 @@ def family_match(actions, family_index, turn_falloff, switch_falloff):
                   + _band_score(switches, slo, shi, switch_falloff))
 
 
+# Behaviour-descriptor bin edges, taken from the FAMILIES bands above so the diversity
+# reward and every family metric share one source of truth. Upper edge of each band:
+# turns  5 | 9 | 13 | open      (oval | spiral+out_and_back | winding | serpentine)
+# switches 0 | 2 | 5  | open     (none | out_and_back | winding | serpentine)
+TURN_EDGES = (5, 9, 13)
+SWITCH_EDGES = (0, 2, 5)
+
+
+def _bin(value, edges):
+    for i, e in enumerate(edges):
+        if value <= e:
+            return i
+    return len(edges)
+
+
+def descriptor_cell(turns, switches):
+    """(turn_bin, switch_bin) — the behaviour cell a build occupies.
+
+    Coarser than an exact family match and deliberately so: the measured gap is that
+    6,191 of 6,193 unaided builds had ZERO direction switches, so gaining a SINGLE
+    switch must move the build to a new cell and pay, even though no family is matched
+    yet. Exact family match is the destination; this is the gradient toward it.
+    """
+    return (_bin(turns, TURN_EDGES), _bin(switches, SWITCH_EDGES))
+
+
 def classify_counts(turns, switches):
     """Index of the family a (turn count, direction-switch count) pair lands in, or None.
 

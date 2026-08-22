@@ -753,6 +753,13 @@ class ParallelCurriculumMaskableCallback(BaseCallback):
                             ('family_potential', 'rewards/family_potential'),
                             ('family_match', 'structure/family_match'),
                             ('switch_count', 'structure/switch_count'),
+                            # Diversity mechanism (Aug-22): the paid bonus, plus the two
+                            # tags that describe the build DISTRIBUTION it is meant to
+                            # change. novelty_entropy is the one that decides whether it
+                            # worked -- a healthy bonus alone can hide a degenerate policy.
+                            ('novelty_bonus', 'rewards/novelty_bonus'),
+                            ('novelty_cells', 'structure/novelty_cells'),
+                            ('novelty_entropy', 'structure/novelty_entropy'),
                             ('family_bonus', 'rewards/family_bonus'),
                         ):
                             if _mk in info_metrics:

@@ -354,6 +354,16 @@ class ImprovedPhasedCurriculumWrapper(gym.Wrapper):
                                                   # at any floor); only mismatched builds
                                                   # forfeit more.
                 R_family=200.0,
+                # Diversity reward (Aug-22). The entropy floor was measured to DELAY the
+                # variety collapse, not prevent it -- it held ~0.95 nats for two days
+                # then leaked to 0.74 with ent_coef pinned at max boost, and the unaided
+                # non-oval rate fell 0.353% -> 0.084% with it. 250 is deliberately the
+                # same order as R_family/R_struct_max and well under R_complete, so the
+                # completion-first invariant holds: a rare shape is worth chasing, but
+                # never worth failing to close a loop for. While ovals dominate, an oval
+                # pays ~0 here and anything else pays close to 250 -- and unlike entropy
+                # that does not erode as the policy converges.
+                R_novelty=250.0,
                 qualify_requires_family=True,
                 exc_gate_target=6.0,
                 R_struct_max=250.0,

@@ -1,5 +1,6 @@
 import gymnasium as gym
 import numpy as np
+import math
 import time
 import json
 import os
@@ -15,7 +16,15 @@ from .track_pieces import (
     CURVED_ACTIONS, LEFT_TURN_ACTIONS, RIGHT_TURN_ACTIONS,
     SBEND_ACTIONS, TURN_ACTIONS,
 )
-from .footprint import classify_family, family_match, switch_count
+from .footprint import (classify_family, descriptor_cell, family_match,
+                        switch_count)
+
+
+# Rolling window of recent UNAIDED build cells backing the diversity reward. 200 is
+# ~an hour of cold completions per worker: long enough that the dominant shape's
+# frequency is stable, short enough that the incentive tracks what the policy is doing
+# NOW rather than what it did yesterday.
+NOVELTY_WINDOW = 200
 
 
 @dataclass(frozen=True)
@@ -135,6 +144,15 @@ class RewardParams:
     # _qualifies). Makes crossing the gate itself a paid event instead of reward-invisible.
     # 0 disables (P1/P2/P5).
     R_qualify: float = 0.0
+    # Diversity reward (Aug-22). Entropy-based exploration was measured to DELAY the
+    # variety collapse, not prevent it: a fixed ent_coef has an equilibrium entropy that
+    # falls as the policy converges, so the floor held ~0.95 nats for two days and then
+    # leaked back to 0.74 with the guard pinned at max boost, taking the unaided non-oval
+    # rate from 0.353% to 0.084% with it. This pays for a build whose behaviour cell is
+    # RARE among recent unaided builds, so while ovals dominate an oval pays ~0 and
+    # anything else pays close to full -- a property of the build distribution, not of
+    # policy entropy, so convergence cannot erode it.
+    R_novelty: float = 0.0
     qualify_requires_energy: bool = False      # P3: cheap viability proxy (ride testing is off)
     qualify_requires_steep_drop: bool = False  # P4: a 60-degree descent segment is required
     qualify_requires_test: bool = False        # P4: the ride test must return real stats
@@ -590,6 +608,13 @@ class OpenRCT2Env(gym.Env):
             # Qualification bonus: the phase gate as a paid, discrete event. Sits with
             # R_viable (not in _calculate_reward) because P4's predicate needs the ride-test
             # verdict, which only settles here.
+            # Diversity: paid on UNAIDED completions only, scored against the recent
+            # build distribution BEFORE this build joins it.
+            if self.reward_params.R_novelty > 0.0 and getattr(self, "_warm_cold", False):
+                _cell = self._build_cell()
+                self._last_novelty_bonus = self._novelty_bonus(_cell)
+                reward += self._last_novelty_bonus
+                self._record_novelty(_cell)
             if self.reward_params.R_qualify > 0.0 and self._qualifies(self.reward_params):
                 reward += self.reward_params.R_qualify
                 self._last_qualify_bonus = self.reward_params.R_qualify
@@ -704,6 +729,13 @@ class OpenRCT2Env(gym.Env):
                 'family_bonus': float(getattr(self, '_last_family_bonus', 0.0)),
                 'target_family': float(getattr(self, 'target_family', 0)),
                 'switch_count': float(switch_count(self._history_actions())),
+                # Diversity diagnostics. novelty_bonus is what was PAID; novelty_cells
+                # and novelty_entropy describe the recent unaided build DISTRIBUTION,
+                # which is the thing the mechanism is actually trying to change -- a
+                # bonus can look healthy while the policy still occupies one cell.
+                'novelty_bonus': float(getattr(self, '_last_novelty_bonus', 0.0)),
+                'novelty_cells': float(len(set(getattr(self, '_novelty_window', ()) or ()))),
+                'novelty_entropy': float(self._novelty_entropy()),
                 # P5 quality-economics diagnostics
                 'exc_milestone_bonus': float(getattr(self, '_last_exc_milestone_bonus', 0.0)),
                 'single_drop_z': float(self._max_single_drop_z()),
@@ -1617,6 +1649,56 @@ class OpenRCT2Env(gym.Env):
         """Action ids of the removal-safe history, in build order."""
         hist = getattr(self.track_builder, "history", None) or []
         return [h.get("action") for h in hist]
+
+    def _novelty_bonus(self, cell):
+        """Reward for landing in `cell`, scaled by how RARE it is among recent unaided
+        builds: R_novelty * (1 - frequency). Read before the build is recorded, so a
+        build never dilutes its own rarity.
+
+        Unlike an entropy bonus this does not decay as the policy converges -- however
+        long the agent has built ovals, the first non-oval still pays full.
+        """
+        R = float(getattr(self.reward_params, "R_novelty", 0.0))
+        if R <= 0.0:
+            return 0.0
+        window = getattr(self, "_novelty_window", None)
+        if not window:
+            return R
+        freq = sum(1 for c in window if c == cell) / len(window)
+        return R * (1.0 - freq)
+
+    def _novelty_entropy(self):
+        """Shannon entropy (nats) of the recent unaided build cells.
+
+        The honest diversity measure: 0 means every recent build sat in one cell, and it
+        rises as the policy spreads. Reported beside the paid bonus because a healthy
+        bonus alone proves nothing -- if the agent builds one oval and one rare shape
+        alternately the bonus is large while the distribution is still nearly degenerate.
+        """
+        window = getattr(self, "_novelty_window", None)
+        if not window:
+            return 0.0
+        n = len(window)
+        counts = {}
+        for c in window:
+            counts[c] = counts.get(c, 0) + 1
+        return -sum((k / n) * math.log(k / n) for k in counts.values())
+
+    def _record_novelty(self, cell):
+        """Record a finished build's cell -- UNAIDED builds only. A warm or primed
+        episode replays someone else's shape, so recording it would let the scaffold
+        fill the rare cells and starve the agent's own incentive."""
+        if not getattr(self, "_warm_cold", False):
+            return
+        window = getattr(self, "_novelty_window", None)
+        if window is None:
+            window = self._novelty_window = deque(maxlen=NOVELTY_WINDOW)
+        window.append(cell)
+
+    def _build_cell(self):
+        """This build's behaviour cell, from the same bands every family metric uses."""
+        actions = self._history_actions()
+        return descriptor_cell(self._turn_count(), switch_count(actions))
 
     def _family_match(self, params):
         """How well this build matches the family the seed asked for, in [0, 1]. Backs

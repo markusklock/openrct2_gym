@@ -4540,3 +4540,91 @@ def test_validate_completion_first_holds_for_every_phase_after_w_family_doubled(
         W._validate_completion_first(p, f"phase {phase}.{stage}")   # must not raise
     p6 = W._phase_reward_params(6)
     assert p6.w_family == 12.0
+
+
+# --- diversity (novelty) reward: an incentive that does NOT decay ---------------------
+# Measured Aug-18..22: the entropy floor held ~0.95 nats for two days and then leaked
+# back to 0.74 with ent_coef pinned at its maximum boost, and the unaided non-oval rate
+# fell 0.353% -> 0.084% with it. A fixed ent_coef has an EQUILIBRIUM entropy that falls
+# as the policy converges, so entropy-based exploration postpones the collapse rather
+# than preventing it. This term makes difference part of the objective instead: while
+# ovals dominate recent builds, an oval pays ~nothing and a rare shape pays full -- which
+# stays true no matter how converged the policy becomes.
+
+def _novelty_env(cells, R_novelty=250.0, cold=True):
+    from openrct2_gym.envs.openrct2_env import NOVELTY_WINDOW
+    env = _bare_env()
+    env.reward_params = RewardParams(R_novelty=R_novelty)
+    env._novelty_window = deque(cells, maxlen=NOVELTY_WINDOW)
+    env._warm_cold = cold
+    return env
+
+
+def test_novelty_pays_nothing_for_the_dominant_shape_and_full_for_an_unseen_one():
+    env = _novelty_env([(0, 0)] * 100)
+    # the shape everything already is: frequency 1.0 -> no bonus
+    assert env._novelty_bonus((0, 0)) == pytest.approx(0.0)
+    # a cell never seen: frequency 0 -> the whole bonus
+    assert env._novelty_bonus((1, 1)) == pytest.approx(250.0)
+
+
+def test_novelty_bonus_scales_with_rarity():
+    env = _novelty_env([(0, 0)] * 90 + [(1, 1)] * 10)
+    assert env._novelty_bonus((0, 0)) == pytest.approx(250.0 * 0.10)
+    assert env._novelty_bonus((1, 1)) == pytest.approx(250.0 * 0.90)
+
+
+def test_novelty_does_not_decay_as_the_policy_converges():
+    """The property the entropy floor lacked. However long the agent has been building
+    ovals, the FIRST non-oval still pays full -- the incentive is a function of the
+    recent build distribution, not of policy entropy, so convergence cannot erode it."""
+    from openrct2_gym.envs.openrct2_env import NOVELTY_WINDOW
+    env = _novelty_env([(0, 0)] * NOVELTY_WINDOW)
+    assert env._novelty_bonus((2, 2)) == pytest.approx(250.0)
+    assert env._novelty_bonus((0, 0)) == pytest.approx(0.0)
+
+
+def test_novelty_is_inert_at_zero_weight():
+    env = _novelty_env([(0, 0)] * 50, R_novelty=0.0)
+    assert env._novelty_bonus((1, 1)) == pytest.approx(0.0)
+
+
+def test_novelty_window_is_empty_at_the_start_and_pays_full():
+    env = _novelty_env([])
+    assert env._novelty_bonus((0, 0)) == pytest.approx(250.0)
+
+
+def test_novelty_counts_only_unaided_builds():
+    """A warm or primed episode replays someone else's shape, so recording it would let
+    the SCAFFOLD fill the rare cells and starve the agent's own incentive -- the same
+    warm/cold conflation that has bitten this project five times."""
+    env = _novelty_env([(0, 0)] * 10, cold=False)
+    env._record_novelty((3, 3))
+    assert list(env._novelty_window) == [(0, 0)] * 10      # unchanged
+    env._warm_cold = True
+    env._record_novelty((3, 3))
+    assert list(env._novelty_window)[-1] == (3, 3)
+
+
+def test_novelty_frequency_excludes_the_build_being_scored():
+    """Scoring must read the distribution BEFORE this build joins it, or a build would
+    dilute its own rarity and the first visit to a cell would underpay."""
+    env = _novelty_env([(0, 0)] * 99)
+    before = env._novelty_bonus((1, 1))
+    env._record_novelty((1, 1))
+    after = env._novelty_bonus((1, 1))
+    assert before == pytest.approx(250.0)
+    assert after < before
+
+
+def test_novelty_entropy_reports_the_distribution_not_the_bonus():
+    """A large paid bonus does not imply a diverse policy: alternating between one oval
+    and one rare shape pays well while the distribution is still nearly degenerate.
+    novelty_entropy is the honest measure and must be 0 for a single-cell window."""
+    import math as _m
+    env = _novelty_env([(0, 0)] * 100)
+    assert env._novelty_entropy() == pytest.approx(0.0)
+    env = _novelty_env([(0, 0)] * 50 + [(1, 1)] * 50)
+    assert env._novelty_entropy() == pytest.approx(_m.log(2))   # two equal cells
+    env = _novelty_env([])
+    assert env._novelty_entropy() == pytest.approx(0.0)

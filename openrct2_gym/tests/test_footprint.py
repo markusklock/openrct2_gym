@@ -151,3 +151,40 @@ def _actions_with(turns, switches):
             cur = right if cur == left else left
             remaining -= 1
     return out
+
+
+# --- behaviour descriptor cells for the diversity reward ------------------------------
+# Entropy-based exploration was measured to DELAY the collapse, not prevent it: a fixed
+# ent_coef has an equilibrium that falls as the policy converges, so the floor held
+# ~0.95 nats for two days and then leaked back to 0.74 with the guard pinned at max
+# boost. A diversity term instead makes difference part of the OBJECTIVE, which does not
+# decay with convergence. It needs a behaviour descriptor: reuse the family bands'
+# own boundaries so the reward and every family metric stay one source of truth, and so
+# a build that gains its first direction switch moves cell even if no family matches.
+
+def test_descriptor_cell_uses_the_family_band_boundaries():
+    from openrct2_gym.envs.footprint import descriptor_cell
+    assert descriptor_cell(0, 0) == (0, 0)     # oval territory
+    assert descriptor_cell(5, 0) == (0, 0)     # last turn count still in the low band
+    assert descriptor_cell(6, 0) == (1, 0)     # spiral territory
+    assert descriptor_cell(8, 2) == (1, 1)     # out_and_back
+    assert descriptor_cell(12, 4) == (2, 2)    # winding
+    assert descriptor_cell(20, 9) == (3, 3)    # serpentine, both bands open-ended
+
+
+def test_descriptor_cell_separates_the_first_direction_switch():
+    """The measured gap: 6,191 of 6,193 unaided builds had ZERO switches. Gaining one
+    switch must change cell even when turn count does not, so the diversity reward pays
+    for the missing skill directly rather than only for a completed family."""
+    from openrct2_gym.envs.footprint import descriptor_cell
+    assert descriptor_cell(4, 0) != descriptor_cell(4, 1)
+
+
+def test_descriptor_cell_is_defined_for_every_family_exemplar():
+    from openrct2_gym.envs.footprint import FAMILIES, descriptor_cell
+    for _, tlo, thi, slo, shi in FAMILIES:
+        t = tlo if thi is None else (tlo + thi) // 2
+        sw = slo if shi is None else (slo + shi) // 2
+        cell = descriptor_cell(t, sw)
+        assert isinstance(cell, tuple) and len(cell) == 2
+        assert all(isinstance(x, int) and x >= 0 for x in cell)
